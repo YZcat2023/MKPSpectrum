@@ -274,7 +274,6 @@ class BedPreview {
             this.isDraggingModel = event.value;
         });
         this.transformControls.addEventListener('change', () => {
-            this.lockZAxis();
             this.updateTransformInputs();
         });
         this.transformControls.addEventListener('mouseDown', () => {
@@ -1640,9 +1639,16 @@ class BedPreview {
             const minZ = box.min.z;
             if (Math.abs(minZ) > 0.001) {
                 if (model._transformProxy && model.selected) {
-                    model._transformProxy.position.z -= minZ;
+                    // 调整 mesh 子级偏移而非 _transformProxy.position，
+                    // 避免被 TransformControls 的矩阵分解覆盖
+                    const s = model._transformProxy.scale.z || 1;
+                    model.mesh.position.z -= minZ / s;
+                    model.mesh.updateMatrix();
+                    model.mesh.updateMatrixWorld(true);
                 } else {
                     model.mesh.position.z -= minZ;
+                    model.mesh.updateMatrix();
+                    model.mesh.updateMatrixWorld(true);
                 }
             }
         });
@@ -7119,6 +7125,8 @@ class BedPreview {
     animate() {
         requestAnimationFrame(() => this.animate());
         this.orbitControls.update();
+        // 渲染前统一矫正Z轴，确保与渲染原子化，无任何时序间隙
+        this.lockZAxis();
         this.renderer.render(this.scene, this.camera);
         this.updateCameraInfo();
     }
