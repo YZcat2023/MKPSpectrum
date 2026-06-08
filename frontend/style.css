@@ -2305,6 +2305,22 @@ input[type="number"] {
     margin: 0 auto;
 }
 
+.slice-image-zoom-wrapper {
+    overflow: hidden;
+    cursor: default;
+    position: relative;
+}
+
+.slice-image-zoom-wrapper img {
+    display: block;
+    width: 100%;
+    height: auto;
+    transform-origin: center center;
+    will-change: transform;
+    user-select: none;
+    -webkit-user-drag: none;
+}
+
 .slice-image-item .slice-image-label {
     padding: 6px 12px;
     font-size: 11px;

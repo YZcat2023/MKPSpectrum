@@ -391,9 +391,15 @@ def run_slice(obj_path, output_dir, layer_height=0.2, resolution=4000,
 
     os.makedirs(output_dir, exist_ok=True)
 
-    # Clean up old PNGs from previous runs
-    for old in glob.glob(os.path.join(output_dir, "*.png")):
-        os.remove(old)
+    # Clean up entire output directory from previous runs
+    for old in glob.glob(os.path.join(output_dir, "*")):
+        try:
+            if os.path.isfile(old):
+                os.remove(old)
+            elif os.path.isdir(old):
+                shutil.rmtree(old)
+        except Exception:
+            pass
 
     # Parse OBJ + MTL
     obj_dir = os.path.dirname(obj_path)

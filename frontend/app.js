@@ -1836,11 +1836,16 @@ class BedPreview {
 
         this.saveState('粘贴模型');
 
-        // 克隆源模型
+        // 克隆源模型（深拷贝 geometry 避免共享引用导致变换相互影响）
         const newMesh = sourceModel.mesh.clone();
         newMesh.traverse((child) => {
-            if (child.isMesh && child.material) {
-                child.material = child.material.clone();
+            if (child.isMesh) {
+                if (child.geometry) {
+                    child.geometry = child.geometry.clone();
+                }
+                if (child.material) {
+                    child.material = child.material.clone();
+                }
             }
         });
 
@@ -3486,15 +3491,24 @@ class BedPreview {
 
         this.saveState();
 
-        // 获取源模型的世界位置（避免选中状态下的代理偏移问题）
+        // 获取源模型的世界变换（避免选中状态下 _transformProxy 导致的丢失缩放/旋转问题）
         const srcWorldPos = new THREE.Vector3();
         model.mesh.getWorldPosition(srcWorldPos);
+        const srcWorldQuat = new THREE.Quaternion();
+        model.mesh.getWorldQuaternion(srcWorldQuat);
+        const srcWorldScale = new THREE.Vector3();
+        model.mesh.getWorldScale(srcWorldScale);
 
         for (let i = 1; i <= count; i++) {
             const newMesh = model.mesh.clone();
             newMesh.traverse((child) => {
-                if (child.isMesh && child.material) {
-                    child.material = child.material.clone();
+                if (child.isMesh) {
+                    if (child.geometry) {
+                        child.geometry = child.geometry.clone();
+                    }
+                    if (child.material) {
+                        child.material = child.material.clone();
+                    }
                 }
             });
 
@@ -3509,12 +3523,12 @@ class BedPreview {
                 }
             });
 
-            // 使用源模型的世界坐标 + 偏移（源模型已在正确位置，直接偏移即可）
+            // 应用源模型的世界变换到克隆体（位置 + 偏移、旋转、缩放）
             newMesh.position.copy(srcWorldPos);
+            newMesh.quaternion.copy(srcWorldQuat);
+            newMesh.scale.copy(srcWorldScale);
             newMesh.position.x += 20 * i;
             newMesh.position.y += 20 * i;
-            // Z 保持与源模型一致（源模型已贴地）
-            // （不用包围盒重算，因为用户可能有意调整了 Z）
 
             this.models.set(newModelId, newModelObj);
             this.scene.add(newMesh);
@@ -4403,10 +4417,13 @@ class BedPreview {
 
         slider.addEventListener('input', updateLayerDisplay);
 
-        // 鼠标滚轮控制滑块 - 监听整个预览页面
+        // 鼠标滚轮控制滑块 - 监听整个预览页面（图片区域除外）
         const previewPage = document.getElementById('preview-page');
         if (previewPage) {
             previewPage.addEventListener('wheel', (e) => {
+                // 鼠标在切片图片区域内时，滚轮用于缩放图片，不切换层
+                if (e.target.closest('#slice-images-container')) return;
+
                 const step = parseFloat(slider.step) || 1;
                 const min = parseFloat(slider.min) || 1;
                 const max = parseFloat(slider.max) || 100;
@@ -5691,6 +5708,15 @@ class BedPreview {
         this._sliceCancelled = false;
         this._pollTimer = null;
 
+        // 清空上一次切片的预览缓存
+        this._sliceImages = [];
+        this._previewImageCount = 0;
+        const imgContainer = document.getElementById('slice-images-container');
+        if (imgContainer) {
+            imgContainer.innerHTML = '<div class="slice-images-empty">切片进行中，请稍候...</div>';
+        }
+        this._updateLayerSlider();
+
         // 锁定预览选项卡
         this._setPreviewTabDisabled(true);
 
@@ -6970,13 +6996,110 @@ class BedPreview {
         label.className = 'slice-image-label';
         label.textContent = `切片层 ${i + 1}`;
 
+        // 缩放/平移包装层
+        const zoomWrapper = document.createElement('div');
+        zoomWrapper.className = 'slice-image-zoom-wrapper';
+
         const img = document.createElement('img');
         img.src = imgData;
         img.alt = `切片层 ${i + 1}`;
+        img.draggable = false;
 
+        zoomWrapper.appendChild(img);
         item.appendChild(label);
-        item.appendChild(img);
+        item.appendChild(zoomWrapper);
         container.appendChild(item);
+
+        // 绑定缩放/平移事件
+        this._setupImageZoom(zoomWrapper, img);
+    }
+
+    _setupImageZoom(wrapper, img) {
+        let scale = 1;
+        let panX = 0;
+        let panY = 0;
+        let isDragging = false;
+        let startX = 0;
+        let startY = 0;
+        let lastPanX = 0;
+        let lastPanY = 0;
+
+        const MIN_SCALE = 1;
+        const MAX_SCALE = 10;
+        const ZOOM_STEP = 0.15;
+
+        const applyTransform = () => {
+            const tr = isDragging ? 'none' : 'transform 0.12s ease-out';
+            img.style.transform = `scale(${scale}) translate(${panX}px, ${panY}px)`;
+            img.style.transition = tr;
+        };
+
+        // 滚轮缩放
+        wrapper.addEventListener('wheel', (e) => {
+            e.stopPropagation();
+            e.preventDefault();
+            const delta = e.deltaY > 0 ? -ZOOM_STEP : ZOOM_STEP;
+            const newScale = Math.max(MIN_SCALE, Math.min(MAX_SCALE, scale + delta));
+
+            // 以鼠标位置为缩放中心
+            if (newScale !== scale && scale >= MIN_SCALE) {
+                const rect = wrapper.getBoundingClientRect();
+                const mx = e.clientX - rect.left - rect.width / 2;
+                const my = e.clientY - rect.top - rect.height / 2;
+                const ratio = newScale / scale;
+                panX = mx * (1 - ratio) / newScale + panX * ratio;
+                panY = my * (1 - ratio) / newScale + panY * ratio;
+            }
+            scale = newScale;
+
+            // 缩放到 1 时重置平移
+            if (scale <= MIN_SCALE) {
+                scale = MIN_SCALE;
+                panX = 0;
+                panY = 0;
+                wrapper.style.cursor = 'default';
+            } else {
+                wrapper.style.cursor = 'grab';
+            }
+
+            applyTransform();
+        });
+
+        // 鼠标拖拽平移
+        wrapper.addEventListener('mousedown', (e) => {
+            if (scale <= MIN_SCALE || e.button !== 0) return;
+            isDragging = true;
+            startX = e.clientX;
+            startY = e.clientY;
+            lastPanX = panX;
+            lastPanY = panY;
+            wrapper.style.cursor = 'grabbing';
+            img.style.transition = 'none';
+            e.preventDefault();
+        });
+
+        const onMouseMove = (e) => {
+            if (!isDragging) return;
+            panX = lastPanX + (e.clientX - startX) / scale;
+            panY = lastPanY + (e.clientY - startY) / scale;
+            img.style.transform = `scale(${scale}) translate(${panX}px, ${panY}px)`;
+        };
+
+        const onMouseUp = () => {
+            if (!isDragging) return;
+            isDragging = false;
+            wrapper.style.cursor = scale > MIN_SCALE ? 'grab' : 'default';
+            img.style.transition = 'transform 0.12s ease-out';
+        };
+
+        window.addEventListener('mousemove', onMouseMove);
+        window.addEventListener('mouseup', onMouseUp);
+
+        // 保存引用以便清理（可选）
+        wrapper._zoomCleanup = () => {
+            window.removeEventListener('mousemove', onMouseMove);
+            window.removeEventListener('mouseup', onMouseUp);
+        };
     }
 
     async _saveGcodeToProject(gcode) {

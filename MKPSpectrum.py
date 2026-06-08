@@ -1205,17 +1205,12 @@ class ModelAPI:
                 if k in config:
                     motion_params[k] = float(config[k])
 
-            # 3. 输出目录
+            # 3. 输出目录（先删后建，确保彻底清空旧切片）
+            import shutil
             output_dir = os.path.expanduser('~/Documents/MKPSpectrum/Temp/Texture/Preview')
+            if os.path.exists(output_dir):
+                shutil.rmtree(output_dir)
             os.makedirs(output_dir, exist_ok=True)
-
-            # 4. 清空旧切片
-            for fname in os.listdir(output_dir):
-                if fname.lower().endswith('.png'):
-                    try:
-                        os.remove(os.path.join(output_dir, fname))
-                    except:
-                        pass
 
             self._slice_output_dir = output_dir
 
