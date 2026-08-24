@@ -48,16 +48,16 @@ Modify_Config_Flag=False
 CCkcheck_flag = False
 try:
     parser = argparse.ArgumentParser(description='MKP loading')
-    parser.add_argument('--Toml', type=str, help='TOML配置文件路径')
+    parser.add_argument('--Json', type=str, help='JSON喷墨配置文件名称')
     parser.add_argument('--Gcode', type=str, help='Gcode文件路径')
     args = parser.parse_args()
     Modify_Config_Flag = True
-    if args.Toml:
-        TomlName = args.Toml
+    if args.Json:
+        TomlName = args.Json
         Modify_Config_Flag = False
     if args.Gcode:
         GSourceFile = args.Gcode
-    print(args.Gcode,args.Toml,Modify_Config_Flag)
+    print(args.Gcode, args.Json, Modify_Config_Flag)
 
 except:
     Modify_Config_Flag=True
@@ -197,7 +197,7 @@ def check_for_updates():
                         None,      # 父窗口句柄
                         "open",    # 操作
                         updater_path,  # 可执行文件路径
-                        f'--Toml {TomlName} --Gcode {GSourceFile}',  # 参数
+                        f'--Json {TomlName} --Gcode {GSourceFile}',  # 参数
                         None,      # 工作目录
                         0          # 0 = 隐藏窗口（相当于 start /b）
                     )
@@ -1484,7 +1484,7 @@ def copy_user_command():
     root1.after(201, lambda: root1.iconbitmap(mkpicon_path))
     def copy_curr_exe_path():
         root1.clipboard_clear()
-        command = f'"{os.path.abspath(sys.executable)}" --Toml "{para.Preset_Name}" --Gcode'
+        command = f'"{os.path.abspath(sys.executable)}" --Json "{para.Preset_Name}" --Gcode'
         root1.clipboard_append(command)
         if lang_setting!="EN":
             MKPMessagebox.show_info("完成", "路径已复制到剪贴板。")
@@ -1519,7 +1519,7 @@ def copy_user_command():
     path_text.pack(fill='x', padx=5, pady=5)
     
     # 插入默认文本
-    command = f'"{os.path.abspath(sys.executable)}" --Toml "{para.Preset_Name}" --Gcode'
+    command = f'"{os.path.abspath(sys.executable)}" --Json "{para.Preset_Name}" --Gcode'
     path_text.insert('1.0', command)
     
     # 复制按钮

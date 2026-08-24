@@ -19,28 +19,68 @@ frontend_files = [
     ('frontend/lib/three/addons/loaders/MTLLoader.js', 'frontend/lib/three/addons/loaders'),
     ('frontend/lib/three/addons/loaders/FBXLoader.js', 'frontend/lib/three/addons/loaders'),
     ('frontend/lib/three/addons/utils/BufferGeometryUtils.js', 'frontend/lib/three/addons/utils'),
+    ('frontend/lib/three/addons/utils/TextureUtils.js', 'frontend/lib/three/addons/utils'),
+    ('frontend/lib/three/addons/exporters/GLTFExporter.js', 'frontend/lib/three/addons/exporters'),
     # FBXLoader 依赖
     ('frontend/lib/three/addons/libs/fflate.module.js', 'frontend/lib/three/addons/libs'),
+    ('frontend/lib/three/addons/geometries/ConvexGeometry.js', 'frontend/lib/three/addons/geometries'),
+    ('frontend/lib/three/addons/math/ConvexHull.js', 'frontend/lib/three/addons/math'),
     ('frontend/lib/three/addons/curves/NURBSCurve.js', 'frontend/lib/three/addons/curves'),
     ('frontend/lib/three/addons/curves/NURBSUtils.js', 'frontend/lib/three/addons/curves'),
+    ('frontend/lib/three/addons/lines/Line2.js', 'frontend/lib/three/addons/lines'),
+    ('frontend/lib/three/addons/lines/LineGeometry.js', 'frontend/lib/three/addons/lines'),
+    ('frontend/lib/three/addons/lines/LineMaterial.js', 'frontend/lib/three/addons/lines'),
+    ('frontend/lib/three/addons/lines/LineSegments2.js', 'frontend/lib/three/addons/lines'),
+    ('frontend/lib/three/addons/lines/LineSegmentsGeometry.js', 'frontend/lib/three/addons/lines'),
 ]
+
+# 图标文件 — 使用 SPECPATH（PyInstaller 内置变量，指向 spec 文件所在目录）
+ico_path = os.path.join(SPECPATH, 'MKPSpectrum.ico')
+print(f'[spec] 程序图标: {ico_path}  存在: {os.path.exists(ico_path)}')
+if not os.path.exists(ico_path):
+    raise FileNotFoundError(f'找不到程序图标: {ico_path}')
+mkp_ico_path = os.path.join(SPECPATH, 'MKPProgram.ico')
+print(f'[spec] 项目图标: {mkp_ico_path}  存在: {os.path.exists(mkp_ico_path)}')
+if not os.path.exists(mkp_ico_path):
+    raise FileNotFoundError(f'找不到项目图标: {mkp_ico_path}')
 
 # 额外的 Python 数据文件（子进程调用或动态导入）
 extra_datas = [
     ('slice_standalone.py', '.'),
     ('strip_processor.py', '.'),
+    ('GCodeGenerator.py', '.'),
+    ('_tower_plan.py', '.'),
+    ('_tower_writer.py', '.'),
+    ('_tower_templates.py', '.'),
+    ('fluidd_tray_monitor.py', '.'),
+    ('fluidd_console_monitor.py', '.'),
+    # 图标：MKPSpectrum.ico（程序窗口/EXE）+ MKPProgram.ico（.mkp 项目文件）
+    (ico_path, '.'),
+    (mkp_ico_path, '.'),
+    # MBC WASM PNG→MBD 转换管线（对齐 mbrush_tools/png2mbd.py）
+    ('mbrush_tools/mbc/mbc-head-node.js', 'mbc'),
+    ('mbrush_tools/mbc/mbc-head-persistent.js', 'mbc'),
+    ('mbrush_tools/mbc/mbc.js', 'mbc'),
+    ('mbrush_tools/mbc/mbc.wasm', 'mbc'),
+    # Node.js 独立版（PNG→MBD 转换必须依赖）
+    ('node_portable/node.exe', 'node_portable'),
+    # Klipper 插件（可通过 GUI 一键安装到打印机）
+    ('gcode_shell_command.py', '.'),
+    # 校准模型
+    ('calibe.glb', '.'),
 ]
 
-# 图标文件 — 使用 SPECPATH（PyInstaller 内置变量，指向 spec 文件所在目录）
-ico_path = os.path.join(SPECPATH, 'MKPSpectrum.ico')
-print(f'[spec] 图标路径: {ico_path}  存在: {os.path.exists(ico_path)}')
-if not os.path.exists(ico_path):
-    raise FileNotFoundError(f'找不到图标文件: {ico_path}')
-
+conda_bin = os.path.join(os.path.dirname(sys.executable), 'Library', 'bin')
+# 方案 B：显式收集 conda 的 ffi/libexpat/liblzma/LIBBZ2，解决 _ctypes/pyexpat/_lzma/_bz2 在 onedir 下找不到 DLL 导致 pythonnet 报错的问题
+_conda_dlls = []
+for _dll in ('ffi.dll', 'libexpat.dll', 'liblzma.dll', 'LIBBZ2.dll', 'libcrypto-3-x64.dll', 'libssl-3-x64.dll'):
+    _p = os.path.join(conda_bin, _dll)
+    if os.path.exists(_p):
+        _conda_dlls.append((_p, '.'))
 a = Analysis(
     ['MKPSpectrum.py'],
-    pathex=[],
-    binaries=[],
+    pathex=[conda_bin],
+    binaries=_conda_dlls,
     datas=frontend_files + extra_datas,
     hiddenimports=[
         'webview',
@@ -48,11 +88,24 @@ a = Analysis(
         'webview.platforms.winforms',
         'slice_standalone',
         'strip_processor',
+        'GCodeGenerator',
+        '_tower_plan',
+        '_tower_writer',
+        '_tower_templates',
         'clr',
         'PIL',
         'PIL.Image',
         'PIL.ImageDraw',
         'numpy',
+        'pystray',
+        'pystray._win32',
+        'PIL.ImageTk',
+        'websocket',
+        'websocket._app',
+        'fluidd_tray_monitor',
+        # fluidd_tray_monitor.py 内联动态导入（PyInstaller 可能漏掉）
+        'http.client',  # _handle_upload() 上传 MBD 到 mBrush
+        'ctypes',       # _restore_main_window() / _show_status()
     ],
     hookspath=[],
     hooksconfig={},
@@ -69,21 +122,28 @@ pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
-    [],
+    exclude_binaries=True,
     name='MKPSpectrum',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,
     upx_exclude=[],
-    runtime_tmpdir=None,
     console=False,
     disable_windowed_traceback=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
     icon=ico_path,
+)
+
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
+    strip=False,
+    upx=False,
+    upx_exclude=[],
+    name='MKPSpectrum',
 )

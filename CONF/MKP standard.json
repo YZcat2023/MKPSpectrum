@@ -1,0 +1,40 @@
+{
+  "inkjet": {
+    "offset": {
+      "x": 4.200000000000002,
+      "y": 39.6
+    },
+    "step": 0.1,
+    "imageOffset": {
+      "x": "X: ---",
+      "y": "Y: ---"
+    },
+    "density": 0.5,
+    "speed": 20,
+    "repeat_count": 1,
+    "dry_time": 3,
+    "contrast": 1.1,
+    "shear_mm": 0.12,
+    "grab_macro": "G1 E-10\nG1 Y135 F20000 \nG1 X251 F20000\nG1 Y50 F2000\nG1 Y8 F2000\nZUPADJUST\nG1 Y90 F2000\nM106 S0\nM106 P2 S0",
+    "release_macro": "G1 X251 F20000\nG1 Y135 F20000 \nG1 Y50 F2000\nG1 Y8 F2000\nG1 Z20\nG1 Y50 F2000\nZRESTOREADJUST\nM106 P2 S255\nG4 P5000\nG1 E10",
+    "overlay_offset": {
+      "x": 38.7,
+      "y": 37,
+      "z": 63.800000000000004,
+      "speed": 160
+    },
+    "pen_deploy_macro": "G1 Y75 F20000\nG1 Y14 F5000\nG1 Y75 F5000\nG1 Y135 F20000",
+    "pen_retract_macro": "G1 X251 Y75 F20000\nG1 Y8 F3000\nG1 Y20 F5000\nG1 Y8 F3000\nG1 Y75 F5000",
+    "cmy": {
+      "c": 1,
+      "m": 1,
+      "y": 1,
+      "saturation": 0,
+      "brightness": 0
+    }
+  },
+  "wipe_tower": {
+    "x": 10,
+    "y": 220
+  }
+}

@@ -30,11 +30,19 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { TransformControls } from 'three/addons/controls/TransformControls.js';
+import { Line2 } from 'three/addons/lines/Line2.js';
+import { LineGeometry } from 'three/addons/lines/LineGeometry.js';
+import { LineMaterial } from 'three/addons/lines/LineMaterial.js';
+import { LineSegments2 } from 'three/addons/lines/LineSegments2.js';
+import { LineSegmentsGeometry } from 'three/addons/lines/LineSegmentsGeometry.js';
 import { STLLoader } from 'three/addons/loaders/STLLoader.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { OBJLoader } from 'three/addons/loaders/OBJLoader.js';
 import { MTLLoader } from 'three/addons/loaders/MTLLoader.js';
 import { FBXLoader } from 'three/addons/loaders/FBXLoader.js';
+import { ConvexHull } from 'three/addons/math/ConvexHull.js';
+import { ConvexGeometry } from 'three/addons/geometries/ConvexGeometry.js';
+import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js';
 
 class ModelObject {
     constructor(mesh, name, id) {
@@ -46,6 +54,8 @@ class ModelObject {
         this.printable = true;
         this.selectionBox = null;
         this._transformProxy = null;
+        this.plateId = null; // 所属盘 id，null 表示未归属任何盘（默认归入默认盘）
+        this._accumRotation = new THREE.Euler(0, 0, 0, 'XYZ');
     }
 }
 
@@ -155,6 +165,7 @@ class HistoryManager {
 
 class BedPreview {
     constructor() {
+        this._startupMkpPath = this._getStartupMkpPath();
         this.container = document.getElementById('canvas-container');
         this.scene = null;
         this.camera = null;
@@ -176,6 +187,7 @@ class BedPreview {
         this.isDraggingModel = false;
         this.isLayOnFaceMode = false;
         this.highlightedFace = null;
+        this._triangulationOverlay = null; // 按面放平模式下整条模型的明亮三角面层
 
         this.models = new Map();
         this.groups = new Map();
@@ -183,6 +195,13 @@ class BedPreview {
         this.selectedModels = new Set();
         this.nextModelId = 1;
         this.nextGroupId = 1;
+        this.plates = new Map();      // Map<plateId, {id,name,locked,order}>
+        this.nextPlateId = 1;
+        this.currentPlateId = null;   // 当前显示的盘 id，null 表示默认盘
+        this.plateActions = null;     // 当前激活盘对应的 3D 悬浮按钮组（THREE.Group）
+        this.plateBoards = new Map(); // Map<plateId, THREE.Group> 每块盘的 3D 盘板组
+        this.freePlateId = 0;         // 盘间自由区当作一个特殊盘
+        this.freePlateGroup = null;   // 自由区模型容器（全局坐标，无偏移）
         this.clipboard = null;
         this.mouseDownPosition = null;
 
@@ -198,6 +217,8 @@ class BedPreview {
         this.isFreeDragging = false;
         this.freeDragModel = null;
         this.justFinishedTransform = false;
+        this._selectedTower = null;   // 当前选中的擦料塔 mesh
+        this._towerDrag = null;       // { tower, plateId } 正在拖拽的擦料塔
         this._extractDir = null;
 
         this.calibrateStep = 0.1;
@@ -207,8 +228,35 @@ class BedPreview {
         this.snapmakerOrcaPath = '';
         this.gcodeSlicerType = 'orcaslicer';
         this.textureResolution = 4000;
+        this._rescaleDialogOpen = false;   // 尺寸过小放大询问框是否已打开（避免批量导入叠弹）
+        this._savedPrintMaterials = new WeakMap(); // 材质 → 其可打印时的原始材质（避免经 userData JSON 序列化被破坏）
         this._sliceRunning = false;
-        this._testGcodePath = 'C:\\Users\\Administrator\\Desktop\\plane_PLA_5m42s.gcode';
+        this._sliceCompleted = false;
+        this._testGcodePath = '';
+        this._gcode3DViewSwitching = false;  // 防止重入 switchToPreview
+        this._previewImagesLoading = false;   // 防止重入 _loadPreviewFolderImages
+        this._previewImagesCache = null;      // 懒加载缓存 {index: base64}
+        this._headlessPollTimer = null;       // 轮询头样子进程进度的定时器
+        this._headlessDone = false;           // 头样子进程已完成，防止重复处理
+        this._sliceImagesCache = {};          // 切片预览图懒加载缓存 {index: base64_url}
+        this._sliceLoadRequestId = 0;         // 递增请求 ID，防止过期异步回调覆盖最新视图
+        this._sliceImagesCount = 0;           // 切片图片总数（用于懒加载模式）
+        this._sliceImages = [];               // 切片图片文件名列表（懒加载模式）
+        this._sliceFullImagesCache = {};      // 原图缓存 {index: base64_url}（缩放查看时加载）
+        this._currentSliceImageIndex = 0;     // 当前显示的切片图片索引
+        this._sliceZoomState = { scale: 1, panX: 0, panY: 0 };  // 缩放/平移视口状态（切层时保持不变）
+        this._sliceFullLoadDebounce = null;   // 60ms 停稳后加载完整原图的定时器
+        this._sliceFocusRect = null;          // 后端返回的聚焦归一化矩形（预放大缩放指导）
+        this._sliceFocusApplied = false;      // 聚焦缩放是否已应用到当前预览
+
+        // 平面打印
+        // 平面打印
+        this._flatImages = [];              // [{img:Image, x, y, rot, scale}]
+        this._flatActiveIdx = -1;           // 当前选中图的索引
+        this._flatSizeLocked = true;        // 长宽比锁定状态
+        this._flatGridOn = false;           // 网格显示开关
+        this._flatCanvasCtx = null;         // canvas 2D 上下文
+        this._flatCtrlEl = null;            // 当前图片的角控件 DOM
 
         this.init();
         this.setupEventListeners();
@@ -219,17 +267,59 @@ class BedPreview {
         this.setupPrinterDialog();
         this.renderer.domElement.addEventListener('mousemove', (e) => this.onMouseMove(e));
         this.animate();
-        // 默认显示首页
+        // 默认显示首页；双击 .mkp 启动时直接进入准备页并加载项目，避免先闪首页。
         document.getElementById('main-container')?.classList.add('hidden');
         document.getElementById('preview-page')?.classList.add('hidden');
         document.getElementById('calibrate-page')?.classList.add('hidden');
-        setTimeout(() => {
-            this.switchToHome();
-        }, 50);
+        if (this._startupMkpPath) {
+            this.switchToPrepare();
+            this._loadStartupMkpProject(this._startupMkpPath);
+        } else {
+            setTimeout(() => {
+                this.switchToHome();
+            }, 50);
+        }
         // 自动检测外部工具路径（方法内部有重试机制等待 pywebview API 就绪）
         this._autoDetectExternalTools();
         // 从配置文件加载已保存的偏好设置（相机模式、网格配色等）
         this._loadAndApplySettings();
+    }
+
+    _getStartupMkpPath() {
+        try {
+            if (window.__STARTUP_MKP_PATH) return window.__STARTUP_MKP_PATH;
+            const params = new URLSearchParams(window.location.search);
+            return params.get('startup_mkp') || '';
+        } catch (e) {
+            return '';
+        }
+    }
+
+    async _loadStartupMkpProject(filePath) {
+        for (let retry = 0; retry < 20; retry++) {
+            if (window.pywebview && window.pywebview.api && typeof window.pywebview.api.load_mkp_project === 'function') break;
+            await new Promise(r => setTimeout(r, 100));
+        }
+        if (!window.pywebview || !window.pywebview.api || typeof window.pywebview.api.load_mkp_project !== 'function') {
+            console.error('启动 MKP 加载失败: 后端 API 未就绪');
+            return;
+        }
+        try {
+            const result = await window.pywebview.api.load_mkp_project(filePath);
+            if (!result || !result.success) {
+                this.showToast('打开项目失败: ' + ((result && result.error) || '未知错误'), 'error');
+                return;
+            }
+            this.switchToPrepare();
+            this.loadProject(result.project);
+            this._currentMkpPath = filePath;
+            window.pywebview.api.add_recent_project(filePath).catch(() => {});
+        } catch (e) {
+            console.error('启动 MKP 加载异常:', e);
+            this.showToast('打开项目异常: ' + e.message, 'error');
+        } finally {
+            document.documentElement.classList.remove('startup-mkp');
+        }
     }
 
     init() {
@@ -269,6 +359,8 @@ class BedPreview {
         this.orbitControls.update();
 
         this.transformControls = new TransformControls(this.camera, this.renderer.domElement);
+        // 缩放灵敏度系数（0-1）：调低到 0.25 让缩放更慢更易细调
+        this.transformControls.scaleSpeed = 0.25;
         this.transformControls.addEventListener('dragging-changed', (event) => {
             this.orbitControls.enabled = !event.value;
             this.isDraggingModel = event.value;
@@ -276,32 +368,39 @@ class BedPreview {
         this.transformControls.addEventListener('change', () => {
             this.updateTransformInputs();
         });
+        // 拖拽开始只标记，不存历史（历史改为在 mouseUp 烘焙后存稳定快照）
         this.transformControls.addEventListener('mouseDown', () => {
-            this.saveState('变换模型');
+            this._transformDragActive = true;
         });
         this.transformControls.addEventListener('mouseUp', () => {
+            this._transformDragActive = false;
             this.justFinishedTransform = true;
             setTimeout(() => {
                 this.justFinishedTransform = false;
             }, 100);
 
-            // X/Y 轴旋转后烘焙变换，避免边界框漂移（组合体跳过）
-            if (this.currentMode === 'rotate') {
-                this.selectedModels.forEach(id => {
-                    const model = this.models.get(id);
-                    if (!model || !model.mesh || model._groupData) return;
-                    const src = model._transformProxy || model.mesh;
-                    if (Math.abs(src.rotation.x) > 0.001 || Math.abs(src.rotation.y) > 0.001) {
-                        this.bakeTransform(model);
-                    }
-                });
-            }
+            // 任何变换结束后统一烘焙，把变换写进几何体顶点、proxy 重置为恒等，
+            // 避免变换链累积与边界框漂移；组合体跳过烘焙保持现有行为
+            this.selectedModels.forEach(id => {
+                const model = this.models.get(id);
+                if (!model || !model.mesh || model._groupData) return;
+                this.bakeTransform(model);
+            });
+
+            // 烘焙完成后存一次稳定快照，撤销/重做都回到几何体与变换一致的状态
+            this.saveState('变换模型');
         });
         this.scene.add(this.transformControls);
 
         this.setupLights();
         this.createBed();
         this.createGrid();
+
+        this.initDefaultPlate();
+        // 首次进入即构建当前激活盘的 3D 悬浮操作按钮组
+        this.buildActivePlateActions();
+        // 构建所有盘的 3D 盘板（平方布局平铺显示）
+        this.rebuildAllPlateBoards();
 
         window.addEventListener('resize', () => this.onWindowResize());
     }
@@ -362,10 +461,11 @@ class BedPreview {
         if (oldPos) {
             this.camera.position.copy(oldPos);
         } else {
-            // 初始位置：从斜上方俯视热床，避免 Z-up 与视线平行导致万向锁
+            // 初始位置：从斜上方俯视热床，X 对齐床中心，仅沿 Y 负方向偏移，
+            // 使视口地平线与底面 X 轴（Y=0 线）平行，且方向与 fitCameraToModel 一致
             const cx = this.bedSize.x / 2;
             const cy = this.bedSize.y / 2;
-            this.camera.position.set(cx * 1.3, cy * 1.3, 400);
+            this.camera.position.set(cx, cy - this.bedSize.y * 0.3, 400);
         }
 
         // 首次初始化时也调用 lookAt，确保相机正确朝向
@@ -411,80 +511,23 @@ class BedPreview {
     }
 
     createBed() {
+        // 单块底层已由各盘的立体板取代：不再创建单独的 bedMesh/bedEdges，避免与盘1板重复重叠
         if (this.bedMesh) {
             this.scene.remove(this.bedMesh);
+            this.bedMesh = null;
         }
         if (this.bedEdges) {
             this.scene.remove(this.bedEdges);
+            this.bedEdges = null;
         }
-
-        const isLight = this.gridTheme === 'light';
-        const isOrtho = this.camera && this.camera.isOrthographicCamera;
-
-        const geometry = new THREE.BoxGeometry(this.bedSize.x, this.bedSize.y, 5);
-        const material = new THREE.MeshStandardMaterial({
-            color: isLight ? 0x333333 : 0x000000,
-            metalness: isOrtho ? 0.1 : 0.3,
-            roughness: isOrtho ? 0.8 : 0.65,
-        });
-
-        this.bedMesh = new THREE.Mesh(geometry, material);
-        this.bedMesh.position.set(this.bedSize.x / 2, this.bedSize.y / 2, -2.5);
-        this.bedMesh.receiveShadow = true;
-        this.scene.add(this.bedMesh);
-
-        const edgeGeometry = new THREE.EdgesGeometry(geometry);
-        const edgeMaterial = new THREE.LineBasicMaterial({ color: isLight ? 0xaaaaaa : 0x555555 });
-        const edges = new THREE.LineSegments(edgeGeometry, edgeMaterial);
-        edges.position.set(this.bedSize.x / 2, this.bedSize.y / 2, -2.5);
-        this.scene.add(edges);
-        this.bedEdges = edges;
     }
 
     createGrid() {
+        // 每块盘板已自带网格线：不再创建单独的 gridHelper
         if (this.gridHelper) {
             this.scene.remove(this.gridHelper);
+            this.gridHelper = null;
         }
-        if (!this.showGrid) return;
-
-        const isLight = this.gridTheme === 'light';
-        const gridColor = isLight ? 0x999999 : 0x444444;
-        const borderColor = isLight ? 0x777777 : 0x666666;
-
-        const divisionsX = Math.ceil(this.bedSize.x / this.gridSize);
-        const divisionsY = Math.ceil(this.bedSize.y / this.gridSize);
-        const gridGroup = new THREE.Group();
-
-        for (let i = 0; i <= divisionsY; i++) {
-            const y = (i / divisionsY) * this.bedSize.y;
-            const points = [new THREE.Vector3(0, y, 0), new THREE.Vector3(this.bedSize.x, y, 0)];
-            const geometry = new THREE.BufferGeometry().setFromPoints(points);
-            const material = new THREE.LineBasicMaterial({ color: gridColor });
-            gridGroup.add(new THREE.Line(geometry, material));
-        }
-
-        for (let i = 0; i <= divisionsX; i++) {
-            const x = (i / divisionsX) * this.bedSize.x;
-            const points = [new THREE.Vector3(x, 0, 0), new THREE.Vector3(x, this.bedSize.y, 0)];
-            const geometry = new THREE.BufferGeometry().setFromPoints(points);
-            const material = new THREE.LineBasicMaterial({ color: gridColor });
-            gridGroup.add(new THREE.Line(geometry, material));
-        }
-
-        const borderPoints = [
-            new THREE.Vector3(0, 0, 0),
-            new THREE.Vector3(this.bedSize.x, 0, 0),
-            new THREE.Vector3(this.bedSize.x, this.bedSize.y, 0),
-            new THREE.Vector3(0, this.bedSize.y, 0),
-            new THREE.Vector3(0, 0, 0)
-        ];
-        const borderGeometry = new THREE.BufferGeometry().setFromPoints(borderPoints);
-        const borderMaterial = new THREE.LineBasicMaterial({ color: borderColor });
-        gridGroup.add(new THREE.Line(borderGeometry, borderMaterial));
-
-        this.gridHelper = gridGroup;
-        this.gridHelper.position.z = 0.1;
-        this.scene.add(this.gridHelper);
     }
 
     updateBedSize() {
@@ -529,6 +572,23 @@ class BedPreview {
         } catch (e) {
             console.error('加载模型异常:', e);
             this.showToast('加载异常: ' + e.message, 'error');
+        }
+    }
+
+    async loadGcodeFromBackend() {
+        if (!window.pywebview || !window.pywebview.api) {
+            this.showToast('后端API不可用', 'error');
+            return;
+        }
+        try {
+            const fileInfo = await window.pywebview.api.open_file_dialog(
+                ['GCode Files (*.gcode)', 'All files (*.*)']
+            );
+            if (!fileInfo) return;
+            await this._onGcodeDropped(fileInfo.path);
+        } catch (e) {
+            console.error('导入 GCode 异常:', e);
+            this.showToast('导入异常: ' + e.message, 'error');
         }
     }
 
@@ -587,7 +647,11 @@ class BedPreview {
         geometry.computeBoundingBox();
         const minZ = geometry.boundingBox.min.z;
         const center = geometry.boundingBox.getCenter(new THREE.Vector3());
-        geometry.translate(-center.x + this.bedSize.x / 2, -center.y + this.bedSize.y / 2, -minZ);
+        // 放在所盘板的中心（局部原点），模型站到该盘板正中央
+        geometry.translate(-center.x, -center.y, -minZ);
+        // translate 后包围盒已过期，必须重算，否则后续 Box3.setFromObject 会用错旧包围盒
+        geometry.computeBoundingBox();
+        if (geometry.computeBoundingSphere) geometry.computeBoundingSphere();
 
         const material = new THREE.MeshStandardMaterial({
             color: 0x4a9eff,
@@ -605,24 +669,59 @@ class BedPreview {
         const modelName = name || `模型 ${modelId}`;
         const modelObj = new ModelObject(mesh, modelName, modelId);
 
+        modelObj.plateId = this.currentPlateId;
         this.models.set(modelId, modelObj);
+        // 模型 = 项目全局子节点（scene），保持唯一 ID 与全局坐标；
+        // plateId 仅标记它归属哪个盘（逻辑），显示时按归属盘定位。
         this.scene.add(mesh);
+        // 放到所属盘中心，局部原点 = 盘左下角，居中于 (halfW, halfD)
+        const centre = this._getPlateWorldPos(modelObj.plateId || this.freePlateId);
+        mesh.position.set(centre.x, centre.y, 0);
+        mesh.updateMatrix();
+        mesh.updateMatrixWorld(true);
+        // 计算该盘容器把世界中心映射回局部（用于局部显示参照）——模型本身保持 scene 全局
+        modelObj.worldAnchor = { x: centre.x, y: centre.y };
 
         if (filePath) {
             this.modelFilePaths.set(modelId, filePath);
         }
 
+        this._invalidateHullCache(modelObj);
         this.updateObjectList();
         this.saveState('导入模型');
-        this.fitCameraToModel(mesh);
+        // 不自动移动视口（保持用户当前视角）
+        this.updatePlateTowerHeights();
+
+        // 导入即烘焙一次（等价“缩放 ×1”）：把世界变换锁定进几何，
+        // 避免后续“按面放平”在未烘焙/position 飘逸时以全局原点为旋转枢轴而失效。
+        // 烘焙后必须再把模型水平居中到所属盘中心并贴床，否则模型会停在不居中的位置。
+        if (!modelObj._groupData && modelObj.mesh) {
+            this.bakeTransform(modelObj);
+            this._seatModelInBed(modelObj);
+        }
+        // 若尺寸过小，自动询问是否放大
+        this.askRescaleSmallModel(modelId);
     }
 
-    addModelObject(object, name, filePath = null) {
-        const box = new THREE.Box3().setFromObject(object);
-        const center = box.getCenter(new THREE.Vector3());
-        object.position.x = this.bedSize.x / 2 - center.x;
-        object.position.y = this.bedSize.y / 2 - center.y;
-        object.position.z = (box.max.z - box.min.z) / 2 - center.z;
+    addModelObject(object, name, filePath = null, options = {}) {
+        const preserveProjectTransform = !!options.preserveProjectTransform;
+        const projectLoad = !!options.projectLoad;
+        let target = this._getPlateWorldPos(this.currentPlateId || this.freePlateId);
+
+        if (!preserveProjectTransform) {
+            // 先刷新待导入对象的世界矩阵，保证 Box3 计算准确（特别是大尺寸/远离原点的模型）
+            object.updateMatrixWorld(true);
+            const box = new THREE.Box3().setFromObject(object);
+            // 居中：对象根置于所属盘中心（场景全局坐标）
+            const centre = box.getCenter(new THREE.Vector3());
+            object.position.x = target.x - centre.x;
+            object.position.y = target.y - centre.y;
+            object.position.z = (box.max.z - box.min.z) / 2 - centre.z;
+            object.updateMatrix();
+            object.updateMatrixWorld(true);
+        } else {
+            object.updateMatrixWorld(true);
+        }
 
         const modelId = this.nextModelId++;
 
@@ -653,42 +752,64 @@ class BedPreview {
         const modelName = name || `模型 ${modelId}`;
         const modelObj = new ModelObject(object, modelName, modelId);
 
+        modelObj.plateId = this.currentPlateId;
         this.models.set(modelId, modelObj);
+        // 模型 = 项目全局子节点（scene），保持唯一 ID 与全局坐标；plateId 为逻辑归属。
         this.scene.add(object);
+        modelObj.worldAnchor = { x: target.x, y: target.y };
 
         if (filePath) {
             this.modelFilePaths.set(modelId, filePath);
         }
 
+        // 确保新导入对象的几何包围与世界矩阵已就绪，再清凸包缓存并排盘
+        object.updateMatrixWorld(true);
+        this._invalidateHullCache(modelObj);
         this.updateObjectList();
-        this.saveState('导入模型');
-        this.fitCameraToModel(object);
+        if (!preserveProjectTransform && !projectLoad) this.saveState('导入模型');
+        // 不自动移动视口（保持用户当前视角）
+        this.updatePlateTowerHeights();
+
+        // 普通导入才做自动烘焙/贴床；项目加载已有保存位姿，不能再次自动摆放。
+        if (!preserveProjectTransform && !modelObj._groupData && modelObj.mesh) {
+            this.bakeTransform(modelObj);
+            this._seatModelInBed(modelObj);
+        }
+        // 若尺寸过小，自动询问是否放大
+        if (!preserveProjectTransform && !projectLoad) this.askRescaleSmallModel(modelId);
     }
 
-    updateObjectList() {
+updateObjectList() {
         const listContainer = document.getElementById('objects-list');
         const countElement = document.getElementById('object-count');
         const modelCountElement = document.getElementById('model-count');
         const selectionCountElement = document.getElementById('selection-count');
 
         const total = this.models.size;
-        if (countElement) countElement.textContent = `${total} 个对象`;
+        // 当前盘上的对象数（用于对象列表计数与展示）
+        const onPlate = Array.from(this.models.entries()).filter(([, m]) =>
+            this._isOnCurrentPlate(m)
+        );
+        const curPlateName = this.currentPlateId ? (this.plates.get(this.currentPlateId)?.name || '默认盘') : '默认盘';
+        if (countElement) countElement.textContent = `${onPlate.length} 个对象`;
         if (modelCountElement) modelCountElement.textContent = this.models.size;
         if (selectionCountElement) selectionCountElement.textContent = this.selectedModels.size;
 
         listContainer.innerHTML = '';
         
-        if (total === 0) {
-            listContainer.innerHTML = '<div class="objects-empty">暂无对象</div>';
+        if (onPlate.length === 0) {
+            listContainer.innerHTML = `<div class="objects-empty">${curPlateName} 暂无对象</div>`;
             return;
         }
 
-        // 渲染所有模型（包括组合体）
-        this.models.forEach((model) => {
+        // 仅渲染当前盘上的模型（包括组合体）
+        onPlate.forEach(([, model]) => {
             const isGroup = !!model._groupData;
             const item = document.createElement('div');
             item.className = `object-item ${isGroup ? 'object-group' : ''} ${model.selected ? 'selected' : ''}`;
             item.dataset.id = model.id;
+            // 锁定盘上的对象显示只读样式
+            if (this.isModelLocked(model.id)) item.classList.add('locked');
             
             if (isGroup) {
                 // 组合体：显示组图标和解组按钮
@@ -746,19 +867,25 @@ class BedPreview {
                 this.selectModelById(model.id, !e.ctrlKey && !e.metaKey);
             });
 
-            // 点击打印按钮切换可打印状态
+            // 点击打印按钮切换可打印状态（锁定盘不可操作）
             const printBtn = item.querySelector('.object-printable-btn');
             if (printBtn) {
-                printBtn.addEventListener('click', (e) => {
-                    e.stopPropagation();
-                    this.toggleModelPrintable(model.id);
-                });
+                if (this.isModelLocked(model.id)) {
+                    printBtn.style.opacity = '0.4';
+                    printBtn.style.pointerEvents = 'none';
+                } else {
+                    printBtn.addEventListener('click', (e) => {
+                        e.stopPropagation();
+                        this.toggleModelPrintable(model.id);
+                    });
+                }
             }
 
             // 右键菜单
             item.addEventListener('contextmenu', (e) => {
                 e.preventDefault();
                 e.stopPropagation();
+                if (this.isModelLocked(model.id)) return;
                 // 选中该模型
                 this.selectModelById(model.id, true);
                 this._showListContextMenu(e, model);
@@ -767,8 +894,6 @@ class BedPreview {
             item.querySelector('.object-delete').addEventListener('click', () => {
                 this.deleteModelById(model.id);
             });
-
-            // 解组按钮（仅组合体）
             const ungroupBtn = item.querySelector('.object-ungroup-btn');
             if (ungroupBtn) {
                 ungroupBtn.addEventListener('click', (e) => {
@@ -780,6 +905,9 @@ class BedPreview {
                     this.ungroupSelected();
                 });
             }
+
+            // 先追加组合体大标签，其零件列表显示在下方
+            listContainer.appendChild(item);
 
             // 组合体下方显示零件列表
             if (isGroup && model._groupData && model._groupData.parts) {
@@ -804,14 +932,23 @@ class BedPreview {
                     listContainer.appendChild(childItem);
                 });
             }
-
-            listContainer.appendChild(item);
         });
     }
 
     selectModelById(modelId, clearOthers = true) {
         const model = this.models.get(modelId);
         if (!model) return;
+
+        // 锁定盘上的对象不可选中/编辑
+        if (this.isModelLocked(modelId)) {
+            if (model.selected) {
+                this.selectedModels.delete(modelId);
+                model.selected = false;
+                this.deselectModelInternal(model);
+            }
+            this.showToast('该对象所在盘已锁定，无法编辑', 'warning');
+            return;
+        }
 
         if (clearOthers) {
             this.selectedModels.forEach(id => {
@@ -938,7 +1075,13 @@ class BedPreview {
 
         model._transformProxy.updateMatrixWorld(true);
 
-        if (this.selectedModels.size === 1 && this.currentMode !== null) {
+        if (this.selectedModels.size === 1 && this.currentMode !== null && !this.isModelLocked(model.id)) {
+            // 校准模型只允许旋转，若当前为非旋转模式则强制切换
+            if (model._isCalibration && this.currentMode !== 'rotate') {
+                this.currentMode = 'rotate';
+                this.transformControls.setMode('rotate');
+                this.updateModeButtons();
+            }
             this.transformControls.attach(model._transformProxy);
         } else {
             this.transformControls.detach();
@@ -957,8 +1100,8 @@ class BedPreview {
             model.mesh.getWorldScale(worldScale);
 
             model._transformProxy.remove(model.mesh);
+            // 模型是场景全局子节点，回到 scene（保持世界坐标）
             this.scene.add(model.mesh);
-
             model.mesh.position.copy(worldPosition);
             model.mesh.quaternion.copy(worldQuaternion);
             model.mesh.scale.copy(worldScale);
@@ -977,14 +1120,48 @@ class BedPreview {
 
         model.mesh.updateMatrixWorld(true);
         const box = new THREE.Box3().setFromObject(model.mesh);
-        const size = box.getSize(new THREE.Vector3());
+        const min = box.min, max = box.max;
         const center = box.getCenter(new THREE.Vector3());
+        const size = box.getSize(new THREE.Vector3());
+        // 角部短线的长度：取长方体最短边的 16%（只画角部三叉，不整圈框选）
+        const len = Math.min(size.x, size.y, size.z) * 0.16;
 
-        const geometry = new THREE.BoxGeometry(size.x, size.y, size.z);
-        const edges = new THREE.EdgesGeometry(geometry);
-        const material = new THREE.LineBasicMaterial({ color: 0xffaa00, linewidth: 2 });
+        // 坐标用相对中心的局部坐标，这样 selectionBox.position = center 时正好贴合模型，
+        // 不会因为几何已是世界坐标 + 再 set position 而把框挪到远离模型的地方。
+        const positions = [];
+        const corners = [
+            [min.x, min.y, min.z], [max.x, min.y, min.z],
+            [max.x, max.y, min.z], [min.x, max.y, min.z],
+            [min.x, min.y, max.z], [max.x, min.y, max.z],
+            [max.x, max.y, max.z], [min.x, max.y, max.z]
+        ];
+        for (const c of corners) {
+            const cx = c[0] - center.x, cy = c[1] - center.y, cz = c[2] - center.z;
+            // 该角在 x/y/z 上是 min 还是 max，决定三条棱向外延伸的方向
+            const dx = Math.abs(c[0] - min.x) < 1e-6 ? 1 : -1;
+            const dy = Math.abs(c[1] - min.y) < 1e-6 ? 1 : -1;
+            const dz = Math.abs(c[2] - min.z) < 1e-6 ? 1 : -1;
+            for (const [vx, vy, vz] of [[dx, 0, 0], [0, dy, 0], [0, 0, dz]]) {
+                positions.push(cx, cy, cz, cx + vx * len, cy + vy * len, cz + vz * len);
+            }
+        }
 
-        model.selectionBox = new THREE.LineSegments(edges, material);
+        // 用 LineSegments2：每对 start/end 作为独立线段，不会把各角连成奇怪线条
+        const geometry = new LineSegmentsGeometry();
+        geometry.setPositions(positions);
+        const material = new LineMaterial({
+            color: 0xffffff,
+            linewidth: 4,
+            transparent: true,
+            opacity: 0.9,
+            depthWrite: false
+        });
+        if (this.renderer) {
+            const c = this.renderer.domElement;
+            material.resolution.set(c.width, c.height);
+        }
+
+        model.selectionBox = new LineSegments2(geometry, material);
         model.selectionBox.position.copy(center);
         this.scene.add(model.selectionBox);
     }
@@ -1023,7 +1200,28 @@ class BedPreview {
         const model = this.models.get(modelId);
         if (!model) return;
 
+        // 锁定盘上的对象不可删除
+        if (this.isModelLocked(modelId)) {
+            this.showToast('该对象所在盘已锁定，无法删除', 'warning');
+            return;
+        }
+
         this.saveState();
+        this._deleteModelUnchecked(modelId);
+        this.updateObjectList();
+        this.updateTransformPanel();
+    }
+
+    // 无任何守卫/确认的内部删除，供删除盘时批量调用
+    _deleteModelUnchecked(modelId) {
+        const model = this.models.get(modelId);
+        if (!model) return;
+
+        // 如果删除的是校准模型，恢复按钮状态
+        if (model._isCalibration) {
+            const btn = document.getElementById('btn-calibrate');
+            btn?.classList.remove('calib-active');
+        }
 
         if (model.selected) {
             this.selectedModels.delete(modelId);
@@ -1033,12 +1231,14 @@ class BedPreview {
         this.removeSelectionBox(model);
         if (model._transformProxy) {
             this.scene.remove(model._transformProxy);
+            model._transformProxy = null;
         }
-        this.scene.remove(model.mesh);
+        if (model.mesh) {
+            if (model.mesh.parent) model.mesh.parent.remove(model.mesh);
+            else this.scene.remove(model.mesh);
+        }
         this.models.delete(modelId);
-
-        this.updateObjectList();
-        this.updateTransformPanel();
+        this.updatePlateTowerHeights();
     }
 
     clearAllModels() {
@@ -1047,22 +1247,1141 @@ class BedPreview {
             this.removeSelectionBox(model);
             if (model._transformProxy) {
                 this.scene.remove(model._transformProxy);
+                model._transformProxy = null;
             }
-            this.scene.remove(model.mesh);
+            if (model.mesh) {
+                if (model.mesh.parent) model.mesh.parent.remove(model.mesh);
+                else this.scene.remove(model.mesh);
+            }
         });
         this.models.clear();
         this.selectedModels.clear();
         this.transformControls.detach();
         this.updateObjectList();
         this.updateTransformPanel();
-        this.historyManager.clear();
+        // 不再调用 historyManager.clear()：开头的 saveState 已记录清空前状态，
+        // 清空本身应可撤销；clear() 会把刚存的快照一起抹掉，导致无法撤销
         this.updateUndoRedoButtons();
+
+        // 清除校准按钮状态
+        const calibBtn = document.getElementById('btn-calibrate');
+        calibBtn?.classList.remove('calib-active');
 
         // 清理 MKP 临时目录
         this._cleanupExtractDir();
 
+        // 清理分组/路径/交互残留，避免切新项目后仍带旧状态
+        if (this.groups) {
+            this.groups.forEach((g) => {
+                if (g.mesh && g.mesh.parent) g.mesh.parent.remove(g.mesh);
+                else if (g.mesh) this.scene.remove(g.mesh);
+            });
+            this.groups.clear();
+        }
+        if (this.selectedGroups) this.selectedGroups.clear();
+        if (this.modelFilePaths) this.modelFilePaths.clear();
+        this.clipboard = null;
+        this._selectedTower = null;
+        this._towerDrag = null;
+        this._hideTowerSelection();
+        if (this.freePlateGroup) {
+            // 自由区容器仅为逻辑容器，不带模型时可一并清理以确保重建
+            if (this.freePlateGroup.parent) this.freePlateGroup.parent.remove(this.freePlateGroup);
+            this.freePlateGroup = null;
+        }
+        this.nextModelId = 1;
+        this.nextGroupId = 1;
+
+        // 清理切片 / 预览残留，避免新建/打开新项目后仍显示旧 GCode
+        this._lastGcode = null;
+        this._sliceImages = [];
+        this._sliceImagesCache = {};
+        this._sliceImagesCount = 0;
+        this._sliceFullImagesCache = {};
+        this._sliceCompleted = false;
+        this._testGcodePath = '';
+        this._hideSliceProgress();
+        this._disposeGcode3DView();
+
+        // 清理平面打印残留
+        this._flatImages = [];
+        this._flatActiveIdx = -1;
+        this._flatDrag = null;
+
+        // 重置盘（新建默认盘并设为当前盘）
+        this.resetPlates();
+        if (this.scene) this.rebuildAllPlateBoards();
+        this.renderPlates();
+        this.buildActivePlateActions();
+        this.updatePlateBoardOpacity();
+
         // 重置项目路径，下次保存时弹出保存对话框
         this._currentMkpPath = null;
+    }
+
+    newProject() {
+        const hasContent = this.models.size > 0 || this.plates.size > 1 || !!this._currentMkpPath || !!this._lastGcode;
+        const doReset = () => {
+            this.clearAllModels();
+            this.switchToPrepare();
+        };
+        if (hasContent) {
+            this.showConfirm('新建项目', '当前项目将被清空且不可撤销地回到默认盘，是否继续？', () => doReset(), '新建');
+        } else {
+            doReset();
+        }
+    }
+
+    // ---------- 盘（构建板）管理 ----------
+
+    initDefaultPlate() {
+        this.resetPlates();
+        this.renderPlates();
+    }
+
+    resetPlates() {
+        this.plates.clear();
+        this.removePlateActions();
+        this.clearPlateBoards();
+        const defaultId = this.nextPlateId++;
+        this.plates.set(defaultId, { id: defaultId, name: '盘 1', locked: false, order: 1 });
+        this.currentPlateId = defaultId;
+    }
+
+    // ---------- 3D 盘板（每块盘一块矩形网格板，平方布局平铺） ----------
+
+    clearPlateBoards() {
+        if (!this.scene) return;
+        this.plateBoards.forEach((group) => {
+            // 先把误挂在盘板模型容器下的模型子节点移回 scene（保持世界坐标），
+            // 否则清空盘板会把模型一起带走，导致模型消失（点侧边栏选中又重新出现）
+            const container = group.userData && group.userData.modelContainer;
+            if (container) {
+                const toRescue = [];
+                container.children.forEach((obj) => {
+                    if (obj.userData && obj.userData.isModel) toRescue.push(obj);
+                });
+                toRescue.forEach((obj) => this._rescueModelToScene(obj));
+            }
+            this.scene.remove(group);
+            // 释放网格板几何
+            group.traverse((o) => {
+                if (o.geometry) o.geometry.dispose();
+                if (o.material) o.material.dispose();
+            });
+        });
+        this.plateBoards.clear();
+    }
+
+    // 把误挂在盘板容器下的模型恢复为 scene 全局子节点，保持世界坐标不变
+    _rescueModelToScene(obj) {
+        if (!this.scene || !obj) return;
+        if (obj.parent) obj.parent.remove(obj);
+        const wp = new THREE.Vector3();
+        const wq = new THREE.Quaternion();
+        const ws = new THREE.Vector3();
+        obj.getWorldPosition(wp);
+        obj.getWorldQuaternion(wq);
+        obj.getWorldScale(ws);
+        this.scene.add(obj);
+        obj.position.copy(wp);
+        obj.quaternion.copy(wq);
+        obj.scale.copy(ws);
+        obj.updateMatrixWorld(true);
+    }
+
+    // 计算平方布局：第 index 个盘(从0)应放的列/行格位
+    _plateGridPos(index) {
+        const total = this.plates.size;
+        const cols = Math.max(1, Math.ceil(Math.sqrt(total)));
+        const col = index % cols;
+        const row = Math.floor(index / cols);
+        return { cols, col, row };
+    }
+
+    // 计算某盘的世界中心坐标（按 order 定位其在平方布局中的格位）
+    _getPlateWorldPos(plateId) {
+        if (!this.plates.has(plateId)) return { x: this.bedSize.x / 2, y: this.bedSize.y / 2 };
+        const sorted = Array.from(this.plates.values()).sort((a, b) => a.order - b.order);
+        const index = sorted.findIndex((p) => p.id === plateId);
+        if (index < 0) return { x: this.bedSize.x / 2, y: this.bedSize.y / 2 };
+        const g = this._plateGridPos(index);
+        const gap = 40;
+        const cellW = this.bedSize.x + gap;
+        const cellD = this.bedSize.y + gap;
+        const centerX = this.bedSize.x / 2;
+        const centerD = this.bedSize.y / 2;
+        return {
+            x: centerX + g.col * cellW,
+            y: centerD - g.row * cellD,
+        };
+    }
+
+    // 返回某盘（或自由区）的模型容器；自由区 = 全局坐标、无偏移
+    _plateContainerFor(plateId) {
+        if (plateId && this.plateBoards && this.plateBoards.has(plateId)) {
+            const g = this.plateBoards.get(plateId);
+            if (g && g.userData.modelContainer) return g.userData.modelContainer;
+        }
+        // 自由区（或未找到盘）：放入全局自由区容器
+        if (!this.freePlateGroup) {
+            this.freePlateGroup = new THREE.Group();
+            this.scene.add(this.freePlateGroup);
+        }
+        return this.freePlateGroup;
+    }
+
+    // 新建盘后把视口居中并缩放到所有盘的整体范围（视角方向保持），以便看清全部盘
+    _centerViewportOnAllPlates() {
+        if (!this.camera || !this.orbitControls) return;
+        if (!this.plates || this.plates.size === 0) return;
+        let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+        const halfW = this.bedSize.x / 2;
+        const halfD = this.bedSize.y / 2;
+        this.plates.forEach((_, pid) => {
+            const c = this._getPlateWorldPos(pid);
+            minX = Math.min(minX, c.x - halfW);
+            maxX = Math.max(maxX, c.x + halfW);
+            minY = Math.min(minY, c.y - halfD);
+            maxY = Math.max(maxY, c.y + halfD);
+        });
+        const width = Math.max((maxX - minX), (maxY - minY));
+        const newCenter = new THREE.Vector3((minX + maxX) / 2, (minY + maxY) / 2, 0);
+        const target = this.orbitControls.target;
+
+        // 平移：相机与 target 一起移动，保持角度与方向
+        const dx = newCenter.x - target.x;
+        const dy = newCenter.y - target.y;
+        this.camera.position.x += dx;
+        this.camera.position.y += dy;
+        target.copy(newCenter);
+
+        if (this.camera.isOrthographicCamera) {
+            // 正交：把 orthoHalfSize 调到能容纳全部盘
+            const aspect = this.container ? this.container.clientWidth / this.container.clientHeight : 1;
+            this._orthoHalfSize = (width / 2) * 1.1;
+            this.camera.left = -this._orthoHalfSize * aspect;
+            this.camera.right = this._orthoHalfSize * aspect;
+            this.camera.top = this._orthoHalfSize;
+            this.camera.bottom = -this._orthoHalfSize;
+            this.camera.updateProjectionMatrix();
+        } else {
+            // 透视：沿当前视线方向重新定距
+            const dir = new THREE.Vector3().subVectors(this.camera.position, target).normalize();
+            const fov = this.camera.fov * Math.PI / 180;
+            const fitted = (width / 2) / Math.tan(fov / 2) * 1.15;
+            const lookDir = dir.clone();
+            this.camera.position.copy(target).add(lookDir.multiplyScalar(fitted));
+            this.camera.lookAt(target);
+        }
+        this.orbitControls.update();
+    }
+
+    // 把模型从当前父节点（可能是 scene/proxy）重挂到目标盘容器，保持世界坐标不变（转为局部坐标）
+    _reparentModelToPlate(model, plateId) {
+        const container = this._plateContainerFor(plateId);
+        const obj = model.mesh;
+        // 若在 proxy 下，先解出代理，保持世界位姿
+        if (model._transformProxy && obj.parent === model._transformProxy) {
+            model._transformProxy.remove(obj);
+        }
+        const worldPos = new THREE.Vector3();
+        const worldQuat = new THREE.Quaternion();
+        const worldScl = new THREE.Vector3();
+        obj.getWorldPosition(worldPos);
+        obj.getWorldQuaternion(worldQuat);
+        obj.getWorldScale(worldScl);
+        if (obj.parent) obj.parent.remove(obj);
+        container.add(obj);
+        // 保持世界位姿不变：position 转为容器局部坐标
+        container.updateMatrixWorld(true);
+        const localPos = container.worldToLocal(worldPos.clone());
+        obj.position.copy(localPos);
+        obj.quaternion.copy(worldQuat);
+        obj.scale.copy(worldScl);
+        model.plateId = plateId;
+        obj.updateMatrixWorld(true);
+    }
+
+    _reparentAllModelsToPlates() {
+        this.models.forEach((model) => {
+            const target = model.plateId || this.freePlateId;
+            // 若已经在正确容器则跳过
+            const cur = model.mesh.parent;
+            const container = this._plateContainerFor(model.plateId || this.freePlateId);
+            let ok = false;
+            if (cur && container) {
+                // 检查 cur 是否等于 container（通过 userData 或引用）
+                ok = cur === container ||
+                    (cur.userData && cur.userData.isContainer && container.userData && container.userData.isContainer && cur === container);
+            }
+            if (!ok) {
+                this._reparentModelToPlate(model, model.plateId || this.freePlateId);
+            }
+        });
+    }
+
+    // 当前激活盘的擦料塔位置 = 该盘中心 ＋ 已拖拽的塔偏移（方块位置即擦嘴塔位置）
+    _getCurrentPlateTowerPos() {
+        const p = this._getPlateWorldPos(this.currentPlateId);
+        let ox = 0, oy = 0;
+        const g = this.plateBoards && this.plateBoards.get(this.currentPlateId);
+        const towerMesh = g && g.userData && g.userData.towerMesh;
+        if (towerMesh && towerMesh.userData && towerMesh.userData.offset) {
+            ox = towerMesh.userData.offset.x || 0;
+            oy = towerMesh.userData.offset.y || 0;
+        }
+        return { x: p.x + ox, y: p.y + oy };
+    }
+
+    // 根据模型世界中心的位置归属：落在某个盘范围内→归属该盘；否则→自由区
+    _assignModelToPlateByPosition(model) {
+        if (!model || !model.mesh) return;
+        model.mesh.updateMatrixWorld(true);
+        const box = new THREE.Box3().setFromObject(model.mesh);
+        const c = box.getCenter(new THREE.Vector3());
+        // 计算所有盘世界包围盒，找模型中心所在的盘
+        let target = this.freePlateId;
+        if (this.plateBoards && this.plates) {
+            const sorted = Array.from(this.plates.values()).sort((a, b) => a.order - b.order);
+            for (let i = 0; i < sorted.length; i++) {
+                const plate = sorted[i];
+                const centre = this._getPlateWorldPos(plate.id);
+                const halfW = this.bedSize.x / 2;
+                const halfD = this.bedSize.y / 2;
+                if (c.x >= centre.x - halfW && c.x <= centre.x + halfW &&
+                    c.y >= centre.y - halfD && c.y <= centre.y + halfD) {
+                    target = plate.id;
+                    break;
+                }
+            }
+        }
+        const cur = model.plateId || this.freePlateId;
+        if (target !== cur) {
+            model.plateId = target;
+            // 模型是世界坐标+全局ID，归属只改逻辑 plateId，不重挂父节点（避免坐标崩溃）
+            this.updateObjectList();
+        }
+    }
+
+    // 为第 index 个盘创建底部立体板：每块盘就是一块与底部黑色立体板一模一样的板子，
+    // 板面上带有网格线，按平方布局沿地面平铺。选中盘的外勾线为白色高亮。
+    _createPlateBoard(plateId, index) {
+        const plate = this.plates.get(plateId);
+        if (!plate || !this.scene) return;
+        const g = this._plateGridPos(index);
+
+        const boardW = this.bedSize.x;
+        const boardD = this.bedSize.y;
+        const thickness = 5;
+        const gap = 40;
+        const cellW = boardW + gap;
+        const cellD = boardD + gap;
+
+        // 第 0 块板居中于床面中心，其余按平方布局向右/向下铺开
+        const centerX = this.bedSize.x / 2;
+        const centerD = this.bedSize.y / 2;
+        const worldX = centerX + g.col * cellW;
+        const worldD = centerD - g.row * cellD; // 行往下，y 减小
+
+        const group = new THREE.Group();
+        group.userData.plateId = plateId;
+        // 该盘的模型容器：模型作为其子节点，局部坐标 = 相对盘板【左下角】；容器世界位置 = 盘左下角。
+        const modelContainer = new THREE.Group();
+        modelContainer.userData.isContainer = true;
+        modelContainer.position.set(worldX - boardW / 2, worldD - boardD / 2, 0);
+        group.add(modelContainer);
+        group.userData.modelContainer = modelContainer;
+
+        // 黑色立体板（与 createBed 样式一致）。未激活的板带透明度，激活板不透明，无高光。
+        const isLight = this.gridTheme === 'light';
+        const isOrtho = this.camera && this.camera.isOrthographicCamera;
+        const isCurrent = plateId === this.currentPlateId;
+        const geometry = new THREE.BoxGeometry(boardW, boardD, thickness);
+        const material = new THREE.MeshStandardMaterial({
+            color: isLight ? 0x333333 : 0x000000,
+            metalness: isOrtho ? 0.1 : 0.3,
+            roughness: isOrtho ? 0.8 : 0.65,
+            transparent: !isCurrent,
+            opacity: isCurrent ? 1 : 0.45,
+        });
+        const board = new THREE.Mesh(geometry, material);
+        board.position.set(worldX, worldD, -2.5);
+        // 标记为盘板本体，供点击切换盘使用
+        board.userData.isPlate = true;
+        board.userData.plateId = plateId;
+        board.userData.isLight = isLight;
+        board.receiveShadow = true;
+        group.add(board);
+        group.userData.boardMesh = board;
+
+        // 板面上网格线（略高于板顶面，浮在板上）
+        const gridColor = isLight ? 0x888888 : 0x3a3a42;
+        const divisionsX = Math.ceil(boardW / this.gridSize);
+        const divisionsY = Math.ceil(boardD / this.gridSize);
+        const topZ = 0.2;
+        const gx0 = worldX - boardW / 2;
+        const gd0 = worldD - boardD / 2;
+        for (let i = 0; i <= divisionsY; i++) {
+            const dd = gd0 + (i / divisionsY) * boardD;
+            const pts = [new THREE.Vector3(gx0, dd, topZ), new THREE.Vector3(gx0 + boardW, dd, topZ)];
+            group.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts),
+                new THREE.LineBasicMaterial({ color: gridColor })));
+        }
+        for (let i = 0; i <= divisionsX; i++) {
+            const xx = gx0 + (i / divisionsX) * boardW;
+            const pts = [new THREE.Vector3(xx, gd0, topZ), new THREE.Vector3(xx, gd0 + boardD, topZ)];
+            group.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts),
+                new THREE.LineBasicMaterial({ color: gridColor })));
+        }
+
+        // 边框：所有盘统一简单灰细线（无白色高亮亮片）
+        const edgeGeo = new THREE.EdgesGeometry(geometry);
+        const edgeMat = new THREE.LineBasicMaterial({
+            color: isLight ? 0xaaaaaa : 0x555555,
+        });
+        const edges = new THREE.LineSegments(edgeGeo, edgeMat);
+        edges.position.copy(board.position);
+        group.add(edges);
+
+        // 擦料塔：两个半块拼成，垂直切开分色——左侧浅绿、右侧白
+        // 32×32mm 底面，高度＝该盘最高模型高度（无模型则 10mm）
+        const towerH = this._getPlateTowerHeight(plateId);
+        const towerSize = 32;
+        // 默认位于盘左上角、距边缘 padding=15（塔中心相对盘中心偏移）
+        if (!plate.towerOffset) {
+            plate.towerOffset = {
+                x: -boardW / 2 + 15 + towerSize / 2,
+                y: boardD / 2 - 15 - towerSize / 2,
+            };
+        }
+        const tOff = plate.towerOffset;
+        const h = Math.max(towerH, 1);
+
+        const mkHalf = (color, opacity) => {
+            const mat = new THREE.MeshStandardMaterial({
+                color, transparent: true, opacity, roughness: 0.6, metalness: 0.1,
+            });
+            return { mat, mesh: new THREE.Mesh(new THREE.BoxGeometry(towerSize / 2, towerSize, 1), mat) };
+        };
+        const halfGreen = mkHalf(0x9ad6a0, 0.45);   // 浅绿
+        const halfWhite = mkHalf(0xffffff, 0.45);   // 白
+
+        const tower = new THREE.Group();
+        // 垂直切开：沿 X 各占一半（左绿右白）
+        halfGreen.mesh.position.set(-towerSize / 4, 0, 0);
+        halfWhite.mesh.position.set(towerSize / 4, 0, 0);
+        halfGreen.mesh.scale.z = h;
+        halfWhite.mesh.scale.z = h;
+        tower.add(halfGreen.mesh);
+        tower.add(halfWhite.mesh);
+        tower.position.set(worldX + tOff.x, worldD + tOff.y, h / 2); // 底部贴板面
+
+        tower.userData.isTower = true;
+        tower.userData.plateId = plateId;
+        tower.userData.offset = { x: tOff.x, y: tOff.y };
+        // towerMesh 存储引用，供透明度/高度更新；两个半块也带 isTower 供点击识别
+        halfGreen.mesh.userData.isTower = true;
+        halfGreen.mesh.userData.plateId = plateId;
+        halfGreen.mesh.userData.towerGroup = tower;
+        halfWhite.mesh.userData.isTower = true;
+        halfWhite.mesh.userData.plateId = plateId;
+        halfWhite.mesh.userData.towerGroup = tower;
+        tower.userData.towerMeshes = [halfGreen.mesh, halfWhite.mesh];
+        group.add(tower);
+        group.userData.towerMesh = tower;
+
+        this.scene.add(group);
+        this.plateBoards.set(plateId, group);
+    }
+
+    // 计算某盘擦料塔高度：该盘所有模型（plateId 匹配）中最高的 z 尺寸；无模型返回 10mm
+    _getPlateTowerHeight(plateId) {
+        let maxH = 0;
+        this.models.forEach((model) => {
+            if (model.plateId !== plateId) return;
+            if (!model.mesh) return;
+            const box = new THREE.Box3().setFromObject(model.mesh);
+            const size = box.getSize(new THREE.Vector3());
+            if (size.z > maxH) maxH = size.z;
+        });
+        return maxH > 0 ? maxH : 10;
+    }
+
+    // 有模型变化后原地更新各盘擦料塔高度
+    updatePlateTowerHeights() {
+        if (!this.plateBoards) return;
+        this.plateBoards.forEach((group) => {
+            const tower = group.userData.towerMesh;
+            if (!tower) return;
+            const h = Math.max(this._getPlateTowerHeight(group.userData.plateId), 1);
+            const halves = tower.userData.towerMeshes || [];
+            halves.forEach((m) => { m.scale.z = h; });
+            tower.position.z = h / 2;
+        });
+    }
+
+    // 擦料塔选中：增加透明度值（更实、更亮眼），不强加高亮框
+    _showTowerSelection(tower) {
+        this._hideTowerSelection();
+        if (!tower) return;
+        const halves = tower.userData.towerMeshes || [tower];
+        halves.forEach((m) => {
+            if (m.material) {
+                m.material.transparent = true;
+                m.material.opacity = 0.85;
+                m.material.needsUpdate = true;
+            }
+        });
+    }
+
+    _hideTowerSelection() {
+        // 恢复默认透明度
+        if (this.plateBoards) {
+            this.plateBoards.forEach((group) => {
+                const t = group.userData.towerMesh;
+                if (!t) return;
+                const halves = t.userData.towerMeshes || [t];
+                halves.forEach((m) => {
+                    if (m.material) {
+                        m.material.transparent = true;
+                        m.material.opacity = 0.45;
+                        m.material.needsUpdate = true;
+                    }
+                });
+            });
+        }
+    }
+
+    // 重建所有盘的 3D 盘板（创建/删除盘、切换盘后调用）
+    rebuildAllPlateBoards() {
+        if (!this.scene) return;
+        this.clearPlateBoards();
+        const sorted = Array.from(this.plates.values()).sort((a, b) => a.order - b.order);
+        sorted.forEach((plate, index) => {
+            this._createPlateBoard(plate.id, index);
+        });
+    }
+
+    // 切换盘后原地更新各板透明度：当前盘不透明，其余半透明
+    updatePlateBoardOpacity() {
+        if (!this.plateBoards) return;
+        const cur = this.currentPlateId;
+        this.plateBoards.forEach((group) => {
+            const board = group.userData.boardMesh;
+            if (board && board.material) {
+                const isCur = group.userData.plateId === cur;
+                board.material.transparent = !isCur;
+                board.material.opacity = isCur ? 1 : 0.45;
+                board.material.needsUpdate = true;
+            }
+        });
+    }
+
+    getPlate(id) {
+        return this.plates.get(id);
+    }
+
+    getPlateForModel(modelId) {
+        const model = this.models.get(modelId);
+        if (!model) return null;
+        return model.plateId ? this.plates.get(model.plateId) : null;
+    }
+
+    isPlateLocked(id) {
+        const plate = this.plates.get(id);
+        return !!plate && plate.locked;
+    }
+
+    isModelLocked(modelId) {
+        const model = this.models.get(modelId);
+        if (!model || !model.plateId) return false;
+        return this.isPlateLocked(model.plateId);
+    }
+
+    // 当前显示的盘设为指定的盘
+    setCurrentPlate(plateId) {
+        if (!this.plates.has(plateId)) return;
+        this.currentPlateId = plateId;
+        // 切换盘时清空选中，防止跨盘选中
+        this.clearSelection();
+        // 取消擦料塔选中
+        this._selectedTower = null;
+        this._hideTowerSelection();
+        // 所有模型保持可见，仅刷新列表
+        this.applyCurrentPlateVisibility();
+        // 重建当前激活盘的 3D 操作按钮组
+        this.buildActivePlateActions();
+        this.renderPlates();
+        // 原地更新各板透明度（当前盘不透明，其余半透明）
+        this.updatePlateBoardOpacity();
+    }
+
+    defaultPlateId() {
+        // 排序后取 order 最小（最早创建）的盘作为默认盘
+        let def = null;
+        let minOrder = Infinity;
+        this.plates.forEach((p) => {
+            if (p.order < minOrder) { minOrder = p.order; def = p.id; }
+        });
+        return def;
+    }
+
+    _isOnCurrentPlate(model) {
+        const cur = this.currentPlateId;
+        if (!cur) return true;
+        return model.plateId === cur || (model.plateId == null && cur === this.defaultPlateId());
+    }
+
+    // 当前盘在平方网格中的序号（按 order 排序后的下标）
+    _activePlateIndex() {
+        const sorted = Array.from(this.plates.values()).sort((a, b) => a.order - b.order);
+        const idx = sorted.findIndex((p) => p.id === this.currentPlateId);
+        return idx < 0 ? 0 : idx;
+    }
+
+    // 把当前盘原点对齐到床面原点所需的平移量：其他盘的模型在导出时要减去这一偏移，
+    // 使模型与四角定位平面（固定于床面原点坐标）对齐，且不把其它盘的模型带进本次导出。
+    _getPlateExportOffset() {
+        const index = this._activePlateIndex();
+        if (index <= 0) return { x: 0, y: 0 };
+        const g = this._plateGridPos(index);
+        const gap = 40;
+        return {
+            x: -g.col * (this.bedSize.x + gap),
+            y: +g.row * (this.bedSize.y + gap),
+        };
+    }
+
+    addPlate() {
+        const id = this.nextPlateId++;
+        const order = this.plates.size + 1;
+        // 用自增 id 命名，避免与现有盘号碰撞（如已有"盘 1"时不会再生"盘 1"）
+        this.plates.set(id, { id, name: `盘 ${id}`, locked: false, order });
+        // 板数变化需重建布局
+        this.setCurrentPlate(id);
+        this.rebuildAllPlateBoards();
+        // 新建盘后平移视口到所有盘的整体中心，照顾到新盘
+        this._centerViewportOnAllPlates();
+        this.saveState('新建盘');
+        return id;
+    }
+
+    deletePlate(plateId) {
+        const plate = this.plates.get(plateId);
+        if (!plate) return;
+        if (this.plates.size <= 1) {
+            this.showToast('至少需要保留一个盘', 'warning');
+            return;
+        }
+        if (plate.locked) {
+            this.showToast('请先解锁该盘再删除', 'warning');
+            return;
+        }
+        // 统计该盘上的对象
+        const onPlate = [];
+        this.models.forEach((model, modelId) => {
+            if (model.plateId === plateId || (!model.plateId && plateId === this.defaultPlateId())) {
+                onPlate.push(modelId);
+            }
+        });
+        const doDelete = () => {
+            this.saveState();
+            // 删除盘上的所有对象
+            onPlate.forEach((mid) => this._deleteModelUnchecked(mid));
+            this.plates.delete(plateId);
+            // 如果删除的是当前盘，切到剩余的第一个盘
+            if (this.currentPlateId === plateId) {
+                const firstId = this.defaultPlateId();
+                this.currentPlateId = firstId;
+                this.setCurrentPlate(firstId);
+                this.rebuildAllPlateBoards();
+            } else {
+                this.updateObjectList();
+                this.renderPlates();
+                this.rebuildAllPlateBoards();
+            }
+            this.saveState('删除盘');
+        };
+        if (onPlate.length > 0) {
+            this.showConfirm(
+                `删除盘「${plate.name}」`,
+                `此盘包含 ${onPlate.length} 个对象，删除后这些对象将一并移除。确定删除？`,
+                doDelete
+            );
+        } else {
+            doDelete();
+        }
+    }
+
+    _lockPlateInternal(plateId) {
+        const plate = this.plates.get(plateId);
+        if (!plate || plate.locked) return false;
+        plate.locked = true;
+        this.models.forEach((model, mid) => {
+            if (model.plateId === plateId && model.selected) {
+                this.selectedModels.delete(mid);
+                model.selected = false;
+                this.deselectModelInternal(model);
+            }
+        });
+        if (this._selectedTower && this._selectedTower.userData && this._selectedTower.userData.plateId === plateId) {
+            this._selectedTower = null;
+            this._hideTowerSelection();
+        }
+        this.updateObjectList();
+        this.renderPlates();
+        if (plateId === this.currentPlateId) this.buildActivePlateActions();
+        try { this.saveState('锁定盘'); } catch (_) {}
+        return true;
+    }
+
+    toggleLockPlate(plateId) {
+        const plate = this.plates.get(plateId);
+        if (!plate) return;
+        if (!plate.locked) {
+            this._lockPlateInternal(plateId);
+            return;
+        }
+        plate.locked = false;
+        this.updateObjectList();
+        this.renderPlates();
+        if (plateId === this.currentPlateId) this.buildActivePlateActions();
+    }
+
+    movePlateToFront(plateId) {
+        const plate = this.plates.get(plateId);
+        if (!plate) return;
+        const sorted = Array.from(this.plates.values()).sort((a, b) => a.order - b.order);
+        if (sorted.length > 0 && sorted[0].id === plateId) {
+            return;
+        }
+        // 目标：被操作盘变为第 1 盘（最前），原第 1 变第 2，依次顺延；重排后盘板格位变化，模型随各自盘板平移对齐
+        const oldCenters = new Map();
+        this.plates.forEach((p) => { oldCenters.set(p.id, this._getPlateWorldPos(p.id)); });
+        // 重新编号：被操作盘 -> 1，其余依次顺延
+        let next = 1;
+        const assign = [{ id: plateId, order: next++ }];
+        sorted.forEach((p) => { if (p.id !== plateId) assign.push({ id: p.id, order: next++ }); });
+        assign.forEach(({ id, order }) => { this.plates.get(id).order = order; });
+        // 每个盘按其新旧格位差平移其上所有模型，保持模型与盘板对齐
+        this.models.forEach((model) => {
+            const oldC = oldCenters.get(model.plateId);
+            if (!oldC) return; // 自由区模型不移动
+            const newC = this._getPlateWorldPos(model.plateId);
+            const dx = newC.x - oldC.x;
+            const dy = newC.y - oldC.y;
+            if (dx === 0 && dy === 0) return;
+            // 若该模型正被变换(proxy 携带 mesh)，平移 proxy 即可；否则直接平移 scene 下的 mesh
+            const target = (model._transformProxy && model.mesh.parent === model._transformProxy)
+                ? model._transformProxy : model.mesh;
+            if (target) {
+                target.position.x += dx;
+                target.position.y += dy;
+                target.updateMatrixWorld(true);
+            }
+        });
+        // 重建 3D 盘板（含擦料塔）与列表
+        this.rebuildAllPlateBoards();
+        this.updatePlateBoardOpacity();
+        this.applyCurrentPlateVisibility();
+        this.renderPlates();
+        // 若被操作盘是当前盘，重建其 3D 操作按钮组以跟随新位置
+        if (plateId === this.currentPlateId) this.buildActivePlateActions();
+        this.saveState('盘移到最前');
+    }
+
+    renderPlates() {
+        const container = document.getElementById('plates-list');
+        if (!container) return;
+        container.innerHTML = '';
+        const total = this.plates.size;
+        if (total === 0) return;
+
+        // 平方网格布局：cols = ceil(sqrt(N))
+        const cols = Math.ceil(Math.sqrt(total));
+        container.style.display = 'grid';
+        container.style.gridTemplateColumns = `repeat(${cols}, 1fr)`;
+        container.style.gap = '6px';
+
+        const sorted = Array.from(this.plates.values()).sort((a, b) => a.order - b.order);
+        sorted.forEach((plate) => {
+            const tab = document.createElement('div');
+            tab.className = `plate-tab ${plate.id === this.currentPlateId ? 'active' : ''} ${plate.locked ? 'locked' : ''}`;
+            tab.dataset.plateId = plate.id;
+
+            const name = document.createElement('span');
+            name.className = 'plate-name';
+            name.textContent = plate.name;
+            name.title = plate.locked ? `${plate.name}（已锁定）` : plate.name;
+
+            tab.appendChild(name);
+
+            tab.addEventListener('click', () => this.setCurrentPlate(plate.id));
+            // 双击盘 tab 重命名
+            tab.addEventListener('dblclick', (e) => {
+                e.stopPropagation();
+                this.renamePlate(plate.id);
+            });
+            container.appendChild(tab);
+        });
+    }
+
+    // 双击盘改名：不弹浏览器询问框，直接在原位置把盘名变成输入框
+    renamePlate(plateId) {
+        const plate = this.plates.get(plateId);
+        if (!plate) return;
+        const tab = document.querySelector(`.plate-tab[data-plate-id="${plateId}"] .plate-name`);
+        if (!tab) return;
+        const old = plate.name;
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.value = old;
+        input.className = 'plate-rename-input';
+        input.style.width = '100%';
+        input.style.fontSize = '12px';
+        input.style.padding = '2px 4px';
+        input.style.boxSizing = 'border-box';
+        input.style.border = '1px solid #4a9eff';
+        input.style.borderRadius = '4px';
+        input.style.background = '#1e1e2e';
+        input.style.color = '#fff';
+
+        // 用输入框替换原盘名
+        const parent = tab.parentNode;
+        parent.replaceChild(input, tab);
+        input.focus();
+        input.select();
+
+        const commit = () => {
+            const val = input.value.trim();
+            if (val && val !== old) {
+                plate.name = val;
+            }
+            this.renderPlates();
+        };
+        const cancel = () => {
+            this.renderPlates();
+        };
+        input.addEventListener('keydown', (e) => {
+            e.stopPropagation();
+            if (e.key === 'Enter') { commit(); input.blur(); }
+            else if (e.key === 'Escape') { cancel(); }
+        });
+        input.addEventListener('blur', () => {
+            // 失焦提交（若值有效）
+            const val = input.value.trim();
+            if (val && val !== old) plate.name = val;
+            this.renderPlates();
+        });
+    }
+
+    // ---------- 3D 悬浮盘操作按钮（仅当前激活盘一组） ----------
+
+    // 在网格右侧靠上创建当前激活盘的 3D 操作按钮（悬浮网格外侧，与网格同高度）
+    buildActivePlateActions() {
+        // 移除旧按钮
+        this.removePlateActions();
+        if (!this.currentPlateId || !this.scene) return;
+
+        const plate = this.plates.get(this.currentPlateId);
+        if (!plate) return;
+
+        // 按钮大小与间距（世界单位）
+        const size = 18;
+        const spacing = 24;
+
+        // 按钮放在当前盘的板子上（板右侧、略高于板面）
+        const center = this._getPlateWorldPos(this.currentPlateId);
+        const x = center.x + this.bedSize.x / 2 + 16;
+        let y = center.y + this.bedSize.y * 0.30;
+        const z = 1.0;
+
+        const defs = ['lock', 'front', 'del', 'add'];
+
+        const meshes = [];
+        for (const action of defs) {
+            const btn = this._makePlateButton(action, size, this.currentPlateId);
+            btn.position.set(x, y, z);
+            y -= spacing;
+            this.scene.add(btn);
+            meshes.push(btn);
+        }
+        this.plateActions = meshes;
+    }
+
+    // 生成单个 3D 按钮（白色半透明圆角方块 + 图标）
+    _makePlateButton(action, size, plateId) {
+        const texture = this._renderPlateButtonTexture(action, plateId);
+        const material = new THREE.MeshBasicMaterial({
+            map: texture,
+            transparent: true,
+            depthWrite: false,
+            side: THREE.DoubleSide,
+        });
+        const geo = new THREE.PlaneGeometry(size, size);
+        const mesh = new THREE.Mesh(geo, material);
+        mesh.renderOrder = 5;
+        mesh.userData.action = action;
+        mesh.userData.plateId = plateId;
+        return mesh;
+    }
+
+    // 用 Canvas 绘制白色半透明圆角方块 + 图标
+    _renderPlateButtonTexture(action, plateId) {
+        const dpr = 2;
+        const px = 48 * dpr;
+        const canvas = document.createElement('canvas');
+        canvas.width = px;
+        canvas.height = px;
+        const ctx = canvas.getContext('2d');
+        const s = px;
+
+        // 按钮底：默认统一白色半透明圆角方块；仅"上锁"的这一颗在盘上锁时更亮（高光）
+        const isLocked = action === 'lock' && plateId != null && this.isPlateLocked(plateId);
+        const bgAlpha = isLocked ? 0.90 : 0.55;
+
+        const r = s * 0.22;
+        ctx.save();
+        ctx.globalAlpha = bgAlpha;
+        ctx.fillStyle = '#ffffff';
+        ctx.beginPath();
+        this._roundedRect(ctx, s * 0.06, s * 0.06, s * 0.88, s * 0.88, r);
+        ctx.fill();
+        ctx.restore();
+
+        // 图标颜色（锁定态统一用深色，删除用红，其余深灰）
+        let iconColor = '#444';
+        if (isLocked) iconColor = '#222';
+        if (action === 'del') iconColor = '#c0392b';
+        ctx.strokeStyle = iconColor;
+        ctx.fillStyle = iconColor;
+        ctx.lineWidth = s * 0.06;
+        ctx.lineCap = 'round';
+        ctx.lineJoin = 'round';
+
+        const box = s * 0.62;
+        const cx = s / 2, cy = s / 2;
+        if (action === 'lock') {
+            this._drawLockIcon(ctx, cx, cy, box * 0.5, isLocked);
+        } else if (action === 'front') {
+            this._drawFrontIcon(ctx, cx, cy, box * 0.42);
+        } else if (action === 'del') {
+            this._drawTrashIcon(ctx, cx, cy, box * 0.5);
+        } else if (action === 'add') {
+            this._drawPlusIcon(ctx, cx, cy, box * 0.34);
+        }
+        return new THREE.CanvasTexture(canvas);
+    }
+
+    _roundedRect(ctx, x, y, w, h, r) {
+        ctx.moveTo(x + r, y);
+        ctx.arcTo(x + w, y, x + w, y + h, r);
+        ctx.arcTo(x + w, y + h, x, y + h, r);
+        ctx.arcTo(x, y + h, x, y, r);
+        ctx.arcTo(x, y, x + w, y, r);
+        ctx.closePath();
+    }
+
+    _drawLockIcon(ctx, cx, cy, r, locked) {
+        ctx.save();
+        ctx.lineWidth = r * 0.14;
+        ctx.lineCap = 'round';
+        ctx.lineJoin = 'round';
+
+        const col = '#444';   // 锁体统一深色，与其它按钮图标一致，保证在浅底上清晰
+
+        const bw = r * 1.25, bh = r * 0.9;
+        const bx = cx - bw / 2;
+        const by = cy - r * 0.28;   // 垂直居中
+
+        // 锁体（圆角矩形，深色描边 + 很淡的深色填充，轮廓分明）
+        ctx.strokeStyle = col;
+        ctx.fillStyle = 'rgba(68,68,68,0.12)';
+        this._roundedRect(ctx, bx, by, bw, bh, r * 0.16);
+        ctx.fill();
+        ctx.stroke();
+
+        // 锁梁：默认(解锁)翘起弹开；锁定则贴紧扣合，均为深色
+        ctx.strokeStyle = col;
+        ctx.lineWidth = r * 0.14;
+        const arcR = r * 0.40;
+        if (locked) {
+            ctx.beginPath();
+            ctx.arc(cx, by - r * 0.02, arcR, Math.PI, 0);
+            ctx.stroke();
+        } else {
+            ctx.beginPath();
+            ctx.arc(cx + r * 0.08, by - r * 0.34, arcR, Math.PI * 1.12, Math.PI * -0.12);
+            ctx.stroke();
+        }
+
+        // 锁孔：统一深色
+        ctx.fillStyle = col;
+        ctx.strokeStyle = col;
+        ctx.beginPath();
+        ctx.arc(cx, by + bh * 0.50, r * 0.11, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.beginPath();
+        ctx.moveTo(cx, by + bh * 0.46);
+        ctx.lineTo(cx, by + bh * 0.68);
+        ctx.stroke();
+        ctx.restore();
+    }
+
+
+    // 向上箭头 + 上方一条横线（移到最前）——箭头加长
+    _drawFrontIcon(ctx, cx, cy, r) {
+        ctx.save();
+        ctx.strokeStyle = '#444';
+        ctx.fillStyle = '#444';
+        ctx.lineWidth = r * 0.16;
+        ctx.lineCap = 'round';
+        ctx.lineJoin = 'round';
+        const h = r * 1.6; // 加长 33%
+        // 上方横线（表示"顶部"边界）
+        const lw = r * 1.0;
+        ctx.beginPath();
+        ctx.moveTo(cx - lw, cy - h * 0.44);
+        ctx.lineTo(cx + lw, cy - h * 0.44);
+        ctx.stroke();
+        // 箭头杆（显著加长）
+        ctx.beginPath();
+        ctx.moveTo(cx, cy - h * 0.34);
+        ctx.lineTo(cx, cy + h * 0.38);
+        ctx.stroke();
+        // 箭头（三角，加长）
+        const aw = r * 0.55;
+        const ah = r * 0.55;
+        ctx.beginPath();
+        ctx.moveTo(cx, cy - h * 0.34);
+        ctx.lineTo(cx - aw, cy - h * 0.34 + ah);
+        ctx.lineTo(cx + aw, cy - h * 0.34 + ah);
+        ctx.closePath();
+        ctx.fill();
+        ctx.restore();
+    }
+
+    // 更干净的垃圾桶
+    _drawTrashIcon(ctx, cx, cy, r) {
+        ctx.strokeStyle = '#c0392b';
+        ctx.fillStyle = 'rgba(192,57,43,0.12)';
+        ctx.lineWidth = r * 0.16;
+        ctx.lineCap = 'round';
+        ctx.lineJoin = 'round';
+        const tw = r * 1.3, th = r * 1.5;
+        // 盖子横条
+        const lidW = tw * 0.65;
+        ctx.beginPath();
+        ctx.moveTo(cx - lidW, cy - th * 0.30);
+        ctx.lineTo(cx + lidW, cy - th * 0.30);
+        ctx.stroke();
+        // 盖子把手（小凸起）
+        ctx.beginPath();
+        ctx.moveTo(cx - r * 0.28, cy - th * 0.30);
+        ctx.lineTo(cx - r * 0.28, cy - th * 0.44);
+        ctx.lineTo(cx + r * 0.28, cy - th * 0.44);
+        ctx.lineTo(cx + r * 0.28, cy - th * 0.30);
+        ctx.stroke();
+        // 桶身（梯形）
+        const topW = tw * 0.50, botW = tw * 0.38;
+        ctx.beginPath();
+        ctx.moveTo(cx - topW, cy - th * 0.28);
+        ctx.lineTo(cx - botW, cy + th * 0.50);
+        ctx.lineTo(cx + botW, cy + th * 0.50);
+        ctx.lineTo(cx + topW, cy - th * 0.28);
+        ctx.closePath();
+        ctx.fill();
+        ctx.stroke();
+        // 桶身竖纹（两条竖线）
+        for (let i = -1; i <= 1; i += 2) {
+            ctx.beginPath();
+            ctx.moveTo(cx + i * r * 0.22, cy - th * 0.18);
+            ctx.lineTo(cx + i * r * 0.18, cy + th * 0.36);
+            ctx.stroke();
+        }
+    }
+
+    _drawPlusIcon(ctx, cx, cy, r) {
+        ctx.strokeStyle = '#444';
+        ctx.lineWidth = r * 0.24;
+        ctx.lineCap = 'round';
+        const h = r * 1.1;
+        ctx.beginPath();
+        ctx.moveTo(cx - h / 2, cy); ctx.lineTo(cx + h / 2, cy);
+        ctx.moveTo(cx, cy - h / 2); ctx.lineTo(cx, cy + h / 2);
+        ctx.stroke();
+    }
+
+    // 更新当前激活盘按钮组（锁定态变化/切盘后调用）
+    refreshActivePlateActions() {
+        // 重建当前激活盘的按钮组，保证图标状态（锁定）与归属正确
+        this.buildActivePlateActions();
+    }
+
+    // 移除激活盘按钮组（清空/重置时调用）
+    removePlateActions() {
+        if (this.plateActions) {
+            for (const btn of this.plateActions) {
+                this.scene.remove(btn);
+                if (btn.material) {
+                    if (btn.material.map) btn.material.map.dispose();
+                    btn.material.dispose();
+                }
+                if (btn.geometry) btn.geometry.dispose();
+            }
+            this.plateActions = null;
+        }
+    }
+
+
+    async loadCalibrationModel() {
+        const btn = document.getElementById('btn-calibrate');
+
+        try {
+            // 1. 获取校准模型路径（兼容开发环境和打包环境）
+            if (!window.pywebview?.api) {
+                this.showToast('后端API不可用', 'error');
+                return;
+            }
+
+            const calibPath = await window.pywebview.api.get_calibration_model_path();
+
+            // 2. 清空热床上所有模型
+            this.clearAllModels();
+
+            // 3. 切换至准备页面
+            this.switchToPrepare();
+
+            // 4. 通过后端 API 加载校准模型
+            const result = await window.pywebview.api.load_model_by_path(calibPath);
+            if (!result?.success) {
+                this.showToast('加载校准模型失败: ' + (result?.error || '未知错误'), 'error');
+                return;
+            }
+
+            // 5. 加载到场景并命名
+            this.loadGLTF(result.data, '校准模型', calibPath);
+
+            // 5. 延迟标记：等待 addModelObject 将模型注册到 this.models 后
+            //    将校准模型标记，限制其只能旋转
+            setTimeout(() => {
+                let calibModelId = null;
+                this.models.forEach((model, id) => {
+                    if (model.name === '校准模型') {
+                        model._isCalibration = true;
+                        calibModelId = id;
+                    }
+                });
+                if (calibModelId) {
+                    this.showToast('校准模型已加载', 'success');
+                    btn?.classList.add('calib-active');
+                }
+            }, 100);
+        } catch (e) {
+            console.error('加载校准模型异常:', e);
+            this.showToast('加载校准模型异常: ' + e.message, 'error');
+        }
     }
 
     _cleanupExtractDir() {
@@ -1097,8 +2416,125 @@ class BedPreview {
         }, duration);
     }
 
+    // 通用确认对话框：title 标题、message 内容、okLabel 确认按钮文字；用户点击确认后执行 onConfirm
+    showConfirm(title, message, onConfirm, okLabel = '删除') {
+        const overlay = document.createElement('div');
+        overlay.className = 'dialog-overlay';
+        overlay.style.zIndex = '9999';
+        overlay.innerHTML = `
+            <div class="dialog-box" style="min-width:360px; text-align:center;">
+                <h3 class="dialog-title"></h3>
+                <p class="dialog-desc" style="font-size:14px; line-height:1.8;"></p>
+                <div class="dialog-buttons" style="justify-content:center; gap:12px;">
+                    <button class="dialog-btn dialog-cancel">取消</button>
+                    <button class="dialog-btn dialog-confirm"></button>
+                </div>
+            </div>
+        `;
+        overlay.querySelector('.dialog-title').textContent = title;
+        overlay.querySelector('.dialog-desc').textContent = message;
+        overlay.querySelector('.dialog-confirm').textContent = okLabel;
+        document.body.appendChild(overlay);
+
+        const cleanup = () => overlay.remove();
+        overlay.querySelector('.dialog-cancel').addEventListener('click', () => { cleanup(); });
+        overlay.querySelector('.dialog-confirm').addEventListener('click', () => { cleanup(); onConfirm(); });
+        overlay.addEventListener('click', (e) => {
+            if (e.target === overlay) cleanup();
+        });
+    }
+
+    // 导入的模型若三个维度都 < 10mm，弹出尺寸倍数调整对话框（复用 dialog 样式，但不带全局灰化背景）
+    askRescaleSmallModel(modelId) {
+        const model = this.models.get(modelId);
+        if (!model) return;
+        // 若已有一个缩放询问框打开，则跳过，避免批量导入时叠弹多个
+        if (this._rescaleDialogOpen) return;
+
+        model.mesh.updateWorldMatrix(true, true);
+        const size = new THREE.Box3().setFromObject(model.mesh).getSize(new THREE.Vector3());
+        if (size.x >= 10 || size.y >= 10 || size.z >= 10) return;
+
+        // 默认建议倍数：把最大尺寸拉到 ≥10mm，取整到 1 位小数（至少 2 倍）
+        const maxDim = Math.max(size.x, size.y, size.z);
+        const divisor = maxDim > 0.01 ? maxDim : 10;
+        const defaultMult = Math.max(2, Math.round((10 / divisor) * 10) / 10);
+
+        const overlay = document.createElement('div');
+        overlay.className = 'dialog-overlay';
+        overlay.style.background = 'transparent'; // 不带全局灰化
+        overlay.style.pointerEvents = 'none';     // 除对话框区域外点击穿透，不遮挡交互
+        overlay.innerHTML = `
+            <div class="dialog-box" style="pointer-events:auto; text-align:center;">
+                <h3 class="dialog-title">模型尺寸过小</h3>
+                <p class="dialog-desc" style="font-size:14px; line-height:1.8; white-space:pre-line;"></p>
+                <input class="dialog-input" type="number" step="0.1" min="1" placeholder="输入放大倍数" style="text-align:center;" autocomplete="off">
+                <div class="dialog-buttons" style="justify-content:center; gap:12px; margin-top:14px;">
+                    <button class="dialog-btn dialog-cancel">跳过</button>
+                    <button class="dialog-btn dialog-confirm">确认放大</button>
+                </div>
+            </div>
+        `;
+        const sizeTxt = size.x.toFixed(1) + ' x ' + size.y.toFixed(1) + ' x ' + size.z.toFixed(1) + ' mm';
+        overlay.querySelector('.dialog-desc').textContent =
+            `${sizeTxt}。是否按倍数调整？`;
+        const inputEl = overlay.querySelector('.dialog-input');
+        inputEl.value = String(defaultMult);
+        document.body.appendChild(overlay);
+        this._rescaleDialogOpen = true;
+
+        const cleanup = () => {
+            overlay.remove();
+            this._rescaleDialogOpen = false;
+        };
+        const applyRescale = () => {
+            const mult = parseFloat(inputEl.value);
+            if (!mult || mult <= 0) {
+                this.showToast('请输入有效的放大倍数', 'warning');
+                return;
+            }
+            cleanup();
+            model.mesh.scale.multiplyScalar(mult);
+            model.mesh.updateWorldMatrix(true, true);
+            this.bakeTransform(model);
+            // 放大后的包围盒中心对齐到所属打印板中心，保持居中
+            {
+                const plateCenter = this._getPlateWorldPos(model.plateId || this.freePlateId);
+                const target = model._transformProxy || model.mesh;
+                const box = new THREE.Box3().setFromObject(target);
+                const center = box.getCenter(new THREE.Vector3());
+                const dx = plateCenter.x - center.x;
+                const dy = plateCenter.y - center.y;
+                if (target === model._transformProxy) {
+                    target.position.x += dx;
+                    target.position.y += dy;
+                    target.updateMatrixWorld(true);
+                } else {
+                    model.mesh.position.x += dx;
+                    model.mesh.position.y += dy;
+                    model.mesh.updateMatrixWorld(true);
+                }
+                this.updateSelectionBoxes();
+                this.updateTransformInputs();
+            }
+            this.updatePlateTowerHeights();
+            this.saveState('导入后放大');
+        };
+
+        overlay.querySelector('.dialog-confirm').addEventListener('click', applyRescale);
+        overlay.querySelector('.dialog-cancel').addEventListener('click', () => { cleanup(); });
+        overlay.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') applyRescale();
+            else if (e.key === 'Escape') cleanup();
+        });
+        // 焦点置于输入框并全选，方便直接改倍数
+        inputEl.addEventListener('click', () => inputEl.select());
+        inputEl.focus();
+        inputEl.select();
+    }
+
     _updateSidebarActive(activeId) {
-        const ids = ['sidebar-nav-home', 'sidebar-nav-prepare', 'sidebar-nav-calibrate', 'sidebar-import-file', 'sidebar-open-project', 'sidebar-settings', 'sidebar-about'];
+        const ids = ['sidebar-nav-home', 'sidebar-nav-prepare', 'sidebar-nav-flat', 'sidebar-nav-calibrate', 'sidebar-import-file', 'sidebar-open-project', 'sidebar-settings', 'sidebar-about'];
         for (const id of ids) {
             const el = document.getElementById(id);
             if (!el) continue;
@@ -1108,18 +2544,26 @@ class BedPreview {
     }
 
     switchToHome() {
+        this._stopHeadlessPolling();
         document.getElementById('nav-home')?.classList.add('active');
         document.getElementById('nav-prepare')?.classList.remove('active');
         document.getElementById('nav-preview')?.classList.remove('active');
+        document.getElementById('nav-flat')?.classList.remove('active');
+        document.getElementById('nav-device')?.classList.remove('active');
         document.getElementById('nav-calibrate')?.classList.remove('active');
         document.getElementById('home-page')?.classList.remove('hidden');
         document.getElementById('home-sidebar')?.classList.remove('hidden');
         document.getElementById('main-container')?.classList.add('hidden');
         document.getElementById('preview-page')?.classList.add('hidden');
+        document.getElementById('device-page')?.classList.add('hidden');
         document.getElementById('calibrate-page')?.classList.add('hidden');
-        document.getElementById('texture-slice-group')?.classList.add('hidden');
+        document.getElementById('flat-page')?.classList.add('hidden');
         document.getElementById('btn-model-slice')?.classList.add('hidden');
-        document.getElementById('btn-start-print')?.classList.add('hidden');
+        document.getElementById('btn-model-retry')?.classList.add('hidden');
+        document.getElementById('btn-flat-slice')?.classList.add('hidden');
+        document.getElementById('btn-print-gcode')?.classList.add('hidden');
+        this._disposeGcode3DView();
+        this._updatePrintStatusText();
         this._updateSidebarActive('sidebar-nav-home');
         this.loadRecentProjects();
     }
@@ -1128,15 +2572,21 @@ class BedPreview {
         document.getElementById('nav-home')?.classList.remove('active');
         document.getElementById('nav-prepare')?.classList.add('active');
         document.getElementById('nav-preview')?.classList.remove('active');
+        document.getElementById('nav-flat')?.classList.remove('active');
+        document.getElementById('nav-device')?.classList.remove('active');
         document.getElementById('nav-calibrate')?.classList.remove('active');
         document.getElementById('home-page')?.classList.add('hidden');
         document.getElementById('home-sidebar')?.classList.add('hidden');
         document.getElementById('preview-page')?.classList.add('hidden');
+        document.getElementById('device-page')?.classList.add('hidden');
         document.getElementById('calibrate-page')?.classList.add('hidden');
+        document.getElementById('flat-page')?.classList.add('hidden');
         document.getElementById('main-container')?.classList.remove('hidden');
-        document.getElementById('texture-slice-group')?.classList.remove('hidden');
         document.getElementById('btn-model-slice')?.classList.remove('hidden');
-        document.getElementById('btn-start-print')?.classList.add('hidden');
+        document.getElementById('btn-model-retry')?.classList.remove('hidden');
+        document.getElementById('btn-flat-slice')?.classList.add('hidden');
+        document.getElementById('btn-print-gcode')?.classList.add('hidden');
+        this._disposeGcode3DView();
         // 强制重排，修复 Three.js 渲染器从 display:none 恢复后的尺寸
         this.onWindowResize();
 
@@ -1149,72 +2599,399 @@ class BedPreview {
     }
 
     switchToPreview() {
+        console.log('[GCodeDrop] switchToPreview called');
         // 切片进行中不允许切换到预览页
         if (this._sliceRunning) {
             this.showToast('纹理切片进行中，请等待完成', 'info');
             return;
         }
+        // 防止重入
+        if (this._gcode3DViewSwitching) {
+            console.log('[GCodeDrop] switchToPreview: already switching, skip');
+            return;
+        }
+        this._gcode3DViewSwitching = true;
+
+        this._setupGcodeDropZone();
         document.getElementById('nav-home')?.classList.remove('active');
         document.getElementById('nav-prepare')?.classList.remove('active');
         document.getElementById('nav-preview')?.classList.add('active');
+        document.getElementById('nav-flat')?.classList.remove('active');
+        document.getElementById('nav-device')?.classList.remove('active');
         document.getElementById('nav-calibrate')?.classList.remove('active');
         document.getElementById('home-page')?.classList.add('hidden');
         document.getElementById('home-sidebar')?.classList.add('hidden');
         document.getElementById('main-container')?.classList.add('hidden');
+        document.getElementById('device-page')?.classList.add('hidden');
         document.getElementById('calibrate-page')?.classList.add('hidden');
+        document.getElementById('flat-page')?.classList.add('hidden');
         document.getElementById('preview-page')?.classList.remove('hidden');
-        document.getElementById('texture-slice-group')?.classList.add('hidden');
         document.getElementById('btn-model-slice')?.classList.add('hidden');
-        document.getElementById('btn-start-print')?.classList.remove('hidden');
+        document.getElementById('btn-model-retry')?.classList.add('hidden');
+        document.getElementById('btn-flat-slice')?.classList.add('hidden');
+        // 预览页：已加载 GCode 才显示"立即打印"按钮
+        if (this._lastGcode) {
+            document.getElementById('btn-print-gcode')?.classList.remove('hidden');
+        } else {
+            document.getElementById('btn-print-gcode')?.classList.add('hidden');
+        }
 
-        // 自动加载预览文件夹中的切片图片
-        this._loadPreviewFolderImages();
+        // 仅在无切片结果时从预览文件夹加载（切片流程已通过 displaySliceImages 设置 _sliceImages）
+        if (!this._sliceImages || this._sliceImages.length === 0) {
+            this._loadPreviewFolderImages();
+        }
 
-        // 自动初始化 3D 轨迹视图
-        if (!this._gcode3DRenderer) {
+        // 仅当已加载 GCode 时才初始化 3D 视图
+        if (this._lastGcode && !this._gcode3DRenderer) {
+            console.log('[GCodeDrop] switchToPreview: creating 3D view');
             this._setupGcode3DView();
-            this._renderToolpath3D();
+        }
+        if (this._lastGcode && this._gcode3DRenderer) {
+            this._renderToolpath3D().catch(e => console.error('_renderToolpath3D error:', e));
         }
         // 触发 resize 以填充容器
         setTimeout(() => {
             if (this._gcode3DResizeHandler) this._gcode3DResizeHandler();
         }, 50);
+
+        this._gcode3DViewSwitching = false;
+
+        // 启动头样子进程轮询（Orca 调起的后处理进度）
+        this._startHeadlessPolling();
+    }
+
+    /** 设置 GCode 导入区域 */
+    _setupGcodeDropZone() {
+        const container = document.getElementById('gcode-3d-container');
+        if (!container || this._gcodeDropBound) return;
+
+        // 绑定导入按钮点击事件
+        const importBtn = document.getElementById('btn-import-gcode');
+        if (importBtn) {
+            importBtn.addEventListener('click', () => this.loadGcodeFromBackend());
+        }
+
+        // 绑定重新加载按钮（重新选择 GCode 文件）
+        const reloadBtn = document.getElementById('btn-reload-gcode');
+        if (reloadBtn) {
+            reloadBtn.addEventListener('click', () => this.loadGcodeFromBackend());
+        }
+
+        // 保留拖拽阻止默认行为，防止浏览器打开文件
+        const onDragOver = (e) => {
+            e.preventDefault();
+        };
+        const onDrop = (e) => {
+            e.preventDefault();
+            this.showToast('请使用「导入 GCode」按钮选择文件', 'info');
+        };
+        container.addEventListener('dragover', onDragOver);
+        container.addEventListener('drop', onDrop);
+
+        this._gcodeDropBound = { container, onDragOver, onDrop };
+    }
+
+    /** GCode 拖入后的处理 */
+    async _onGcodeDropped(filePath) {
+        console.log('[GCodeDrop] _onGcodeDropped called, path:', filePath);
+        if (!window.pywebview || !window.pywebview.api) {
+            console.error('[GCodeDrop] pywebview not available');
+            this.showToast('pywebview 不可用', 'error');
+            return;
+        }
+
+        try {
+            console.log('[GCodeDrop] calling load_gcode_file...');
+            const result = await window.pywebview.api.load_gcode_file(filePath);
+            console.log('[GCodeDrop] load_gcode_file result:', result);
+            if (!result || !result.success) {
+                this.showToast(result?.error || '读取 GCode 失败', 'error');
+                return;
+            }
+
+            console.log(`[GCodeDrop] loaded: ${filePath}, size: ${result.gcode?.length || 0} bytes`);
+            this._lastGcode = result.gcode;
+            this._testGcodePath = filePath;  // 同步实际文件路径
+            this._updatePrintStatusText();
+
+            // 隐藏占位符
+            const placeholder = document.getElementById('gcode-drop-placeholder');
+            if (placeholder) {
+                placeholder.style.display = 'none';
+                console.log('[GCodeDrop] placeholder hidden');
+            } else {
+                console.warn('[GCodeDrop] placeholder not found');
+            }
+
+            // 显示参数信息 toast
+            if (result.info) {
+                const i = result.info;
+                const msg = i.total_time_str
+                    ? `${i.name} | 层高${i.layer_height}mm | ${i.total_layers}层 | 预估${i.total_time_str}`
+                    : `${i.name} | ${(i.size_bytes / 1024).toFixed(1)}KB`;
+                this.showToast(msg, 'info');
+            }
+
+            // 切换到预览页并渲染
+            console.log('[GCodeDrop] switching to preview...');
+            this.switchToPreview();
+            console.log('[GCodeDrop] calling displayGcode...');
+            await this.displayGcode(result.gcode);
+            setTimeout(() => {
+                console.log('[GCodeDrop] timeout: _updateLayerSlider');
+                this._updateLayerSlider();
+            }, 100);
+
+        } catch (e) {
+            console.error('[GCodeDrop] exception:', e);
+            this.showToast('读取 GCode 异常: ' + e.message, 'error');
+        }
+    }
+
+    /** 恢复 GCode 占位符显示 */
+    _showGcodePlaceholder() {
+        const placeholder = document.getElementById('gcode-drop-placeholder');
+        if (placeholder) {
+            placeholder.style.display = '';
+        }
     }
 
     async _loadPreviewFolderImages() {
         const container = document.getElementById('slice-images-container');
         if (!container) return;
         if (!window.pywebview || !window.pywebview.api) return;
+        // 防止重复加载
+        if (this._previewImagesLoading) return;
+        this._previewImagesLoading = true;
+
         try {
             const result = await window.pywebview.api.load_preview_images();
             const count = (result && result.count) ? result.count : 0;
-            // 始终更新图片总数（以 Preview 文件夹中的 PNG 数量为准）
             this._previewImageCount = count;
+            // 缩放指导：后端把模型聚焦区换算成预览图归一化矩形，前端据此预放大铺满视口
+            this._sliceFocusRect = (result && result.focus_rect
+                && result.focus_rect.x != null && result.focus_rect.w > 0)
+                ? result.focus_rect : null;
+            this._sliceFocusApplied = false;
 
-            if (result && result.success && result.images && result.images.length > 0) {
-                this.displaySliceImages(result.images);
+            // 异步等待期间，切片结果可能已通过 displaySliceImages 写入 _sliceImages，
+            // 此时不应覆盖（直接模式的图片优先级高于文件夹懒加载）
+            if (this._sliceImages && this._sliceImages.length > 0) {
+                return;
+            }
+
+            if (count > 0) {
+                // 全部缩略图都要预加载（翻层/缩放立即可用），先并行预加载全部，再渲染首张
+                this._previewImagesCache = {};
+                await this._preloadAllPreviewImages(count);
+                if (this._previewImagesCache[0] !== undefined) {
+                    this._showSliceImageByIndex(0, this._previewImagesCache[0]);
+                } else {
+                    await this._loadAndShowPreviewImage(0);
+                }
             } else {
-                // 没有图片时也要更新层数滑块
                 this._updateLayerSlider();
+            }
+        } catch (e) {
+            console.error('加载预览图片失败:', e);
+        } finally {
+            this._previewImagesLoading = false;
+        }
+    }
+
+    // 并发预加载全部预览缩略图到 _previewImagesCache（文件夹路径）
+    async _preloadAllPreviewImages(count) {
+        const CONC = 8;
+        for (let start = 0; start < count; start += CONC) {
+            const batch = [];
+            for (let i = start; i < Math.min(start + CONC, count); i++) {
+                if (this._previewImagesCache && this._previewImagesCache[i] !== undefined) continue;
+                batch.push((async () => {
+                    try {
+                        const result = await window.pywebview.api.load_preview_image(i);
+                        if (result && result.success && result.image) {
+                            if (this._previewImagesCache) this._previewImagesCache[i] = result.image;
+                            if (result.total) this._previewImageCount = result.total;
+                        }
+                    } catch (e) {
+                        console.error('[PreloadPreview] 预加载失败:', i, e);
+                    }
+                })());
+            }
+            await Promise.all(batch);
+            await new Promise(r => setTimeout(r, 0));
+        }
+    }
+
+    async _loadAndShowPreviewImage(index) {
+        if (!window.pywebview || !window.pywebview.api) return;
+        if (this._previewImagesCache && this._previewImagesCache[index]) {
+            this._showSliceImageByIndex(index, this._previewImagesCache[index]);
+            return;
+        }
+        const reqId = ++this._sliceLoadRequestId;
+        try {
+            const result = await window.pywebview.api.load_preview_image(index);
+            if (result && result.success && result.image && this._sliceLoadRequestId === reqId) {
+                if (!this._previewImagesCache) this._previewImagesCache = {};
+                this._previewImagesCache[index] = result.image;
+                if (result.total) this._previewImageCount = result.total;
+                this._showSliceImageByIndex(index, result.image);
             }
         } catch (e) {
             console.error('加载预览图片失败:', e);
         }
     }
 
+    _showSliceImageByIndex(index, imageData) {
+        const container = document.getElementById('slice-images-container');
+        if (!container) return;
+
+        const total = this._previewImageCount || 0;
+        if (total === 0) {
+            container.innerHTML = '<div class="slice-images-empty">暂无切片图片数据。</div>';
+            return;
+        }
+
+        const i = Math.max(0, Math.min(index, total - 1));
+        this._currentSliceImageIndex = i;
+
+        container.innerHTML = '';
+
+        const item = document.createElement('div');
+        item.className = 'slice-image-item';
+
+        const label = document.createElement('div');
+        label.className = 'slice-image-label';
+        label.textContent = `切片层 ${i + 1} / ${total}`;
+
+        const zoomWrapper = document.createElement('div');
+        zoomWrapper.className = 'slice-image-zoom-wrapper';
+
+        const img = document.createElement('img');
+        img.src = imageData;
+        img.alt = `切片层 ${i + 1}`;
+        img.draggable = false;
+
+        zoomWrapper.appendChild(img);
+        item.appendChild(label);
+        item.appendChild(zoomWrapper);
+        container.appendChild(item);
+
+        this._setupImageZoom(zoomWrapper, img, i);
+        this._updateLayerSlider();
+    }
+
+    switchToFlat() {
+        this._stopHeadlessPolling();
+        document.getElementById('nav-home')?.classList.remove('active');
+        document.getElementById('nav-prepare')?.classList.remove('active');
+        document.getElementById('nav-preview')?.classList.remove('active');
+        document.getElementById('nav-flat')?.classList.add('active');
+        document.getElementById('nav-device')?.classList.remove('active');
+        document.getElementById('nav-calibrate')?.classList.remove('active');
+        document.getElementById('home-page')?.classList.add('hidden');
+        document.getElementById('home-sidebar')?.classList.add('hidden');
+        document.getElementById('main-container')?.classList.add('hidden');
+        document.getElementById('preview-page')?.classList.add('hidden');
+        document.getElementById('device-page')?.classList.add('hidden');
+        document.getElementById('calibrate-page')?.classList.add('hidden');
+        document.getElementById('flat-page')?.classList.remove('hidden');
+        document.getElementById('btn-model-slice')?.classList.add('hidden');
+        document.getElementById('btn-model-retry')?.classList.add('hidden');
+        document.getElementById('btn-flat-slice')?.classList.remove('hidden');
+        this._disposeGcode3DView();
+        this._updateSidebarActive('sidebar-nav-flat');
+        this._initFlatPage();
+    }
+
     switchToCalibrate() {
         document.getElementById('nav-home')?.classList.remove('active');
         document.getElementById('nav-prepare')?.classList.remove('active');
         document.getElementById('nav-preview')?.classList.remove('active');
+        document.getElementById('nav-flat')?.classList.remove('active');
+        document.getElementById('nav-device')?.classList.remove('active');
         document.getElementById('nav-calibrate')?.classList.add('active');
         document.getElementById('home-page')?.classList.add('hidden');
         document.getElementById('home-sidebar')?.classList.add('hidden');
         document.getElementById('main-container')?.classList.add('hidden');
         document.getElementById('preview-page')?.classList.add('hidden');
+        document.getElementById('device-page')?.classList.add('hidden');
+        document.getElementById('flat-page')?.classList.add('hidden');
         document.getElementById('calibrate-page')?.classList.remove('hidden');
-        document.getElementById('texture-slice-group')?.classList.add('hidden');
         document.getElementById('btn-model-slice')?.classList.add('hidden');
-        document.getElementById('btn-start-print')?.classList.add('hidden');
+        document.getElementById('btn-model-retry')?.classList.add('hidden');
+        document.getElementById('btn-flat-slice')?.classList.add('hidden');
+        document.getElementById('btn-print-gcode')?.classList.add('hidden');
+        this._disposeGcode3DView();
+        this.refreshPostprocessCommand();
+        // 切换回配置页时重新加载当前配置，确保显示最新值
+        const configName = this._configValueDisplay?.textContent;
+        if (configName && configName !== '未配置' && window.pywebview?.api) {
+            window.pywebview.api.load_print_setting(configName).then(result => {
+                if (result?.success && result.data) {
+                    // 触发自定义事件让 _setupPrintConfigSelect 中的 applyData 重新执行
+                    const evt = new CustomEvent('mkp-reload-config', { detail: result.data });
+                    document.dispatchEvent(evt);
+                }
+            }).catch(() => {});
+        }
+    }
+
+    switchToDevice() {
+        this._stopHeadlessPolling();
+        document.getElementById('nav-home')?.classList.remove('active');
+        document.getElementById('nav-prepare')?.classList.remove('active');
+        document.getElementById('nav-preview')?.classList.remove('active');
+        document.getElementById('nav-flat')?.classList.remove('active');
+        document.getElementById('nav-calibrate')?.classList.remove('active');
+        document.getElementById('nav-device')?.classList.add('active');
+        document.getElementById('home-page')?.classList.add('hidden');
+        document.getElementById('home-sidebar')?.classList.add('hidden');
+        document.getElementById('main-container')?.classList.add('hidden');
+        document.getElementById('preview-page')?.classList.add('hidden');
+        document.getElementById('calibrate-page')?.classList.add('hidden');
+        document.getElementById('flat-page')?.classList.add('hidden');
+        document.getElementById('device-page')?.classList.remove('hidden');
+        document.getElementById('btn-model-slice')?.classList.add('hidden');
+        document.getElementById('btn-model-retry')?.classList.add('hidden');
+        document.getElementById('btn-flat-slice')?.classList.add('hidden');
+        document.getElementById('btn-print-gcode')?.classList.add('hidden');
+        this._disposeGcode3DView();
+        this._loadDeviceUrl();
+    }
+
+    _loadDeviceUrl() {
+        // 从打印机设置读取地址并自动加载
+        if (window.pywebview && window.pywebview.api) {
+            window.pywebview.api.load_printer_settings().then(result => {
+                if (result && result.success && result.settings) {
+                    const addr = (result.settings.printerAddress || '').trim();
+                    if (addr) {
+                        this._loadDeviceIframe(addr);
+                    }
+                }
+            }).catch(() => {});
+        }
+    }
+
+    _loadDeviceIframe(url) {
+        const iframe = document.getElementById('device-iframe');
+        const placeholder = document.getElementById('device-placeholder');
+        if (!iframe) return;
+        let targetUrl = url.trim();
+        if (!targetUrl) {
+            iframe.style.display = 'none';
+            if (placeholder) placeholder.style.display = '';
+            return;
+        }
+        // 自动补全协议
+        if (!/^https?:\/\//i.test(targetUrl)) {
+            targetUrl = 'http://' + targetUrl;
+        }
+        iframe.src = targetUrl;
+        iframe.style.display = 'block';
+        if (placeholder) placeholder.style.display = 'none';
     }
 
     _triggerHomeImport() {
@@ -1365,7 +3142,9 @@ class BedPreview {
         const name = fileName.replace(/\.[^/.]+$/, '');
 
         try {
-            if (ext === 'mkp') {
+            if (ext === 'gcode') {
+                await this._onGcodeDropped(filePath);
+            } else if (ext === 'mkp') {
                 // 复用 load_mkp_project，直接使用原始路径
                 const result = await window.pywebview.api.load_mkp_project(filePath);
                 if (!result?.success) {
@@ -1609,22 +3388,46 @@ class BedPreview {
         const rotY = document.getElementById('rot-y');
         const rotZ = document.getElementById('rot-z');
 
-        if (scaleX) scaleX.value = (transformSource.scale.x * 100).toFixed(2);
-        if (scaleY) scaleY.value = (transformSource.scale.y * 100).toFixed(2);
-        if (scaleZ) scaleZ.value = (transformSource.scale.z * 100).toFixed(2);
+        const _focused = document.activeElement;
+        const _isFocused = (el) => el && _focused === el;
+        if (scaleX && !_isFocused(scaleX)) scaleX.value = (transformSource.scale.x * 100).toFixed(2);
+        if (scaleY && !_isFocused(scaleY)) scaleY.value = (transformSource.scale.y * 100).toFixed(2);
+        if (scaleZ && !_isFocused(scaleZ)) scaleZ.value = (transformSource.scale.z * 100).toFixed(2);
 
-        if (sizeX) sizeX.value = size.x.toFixed(2);
-        if (sizeY) sizeY.value = size.y.toFixed(2);
-        if (sizeZ) sizeZ.value = size.z.toFixed(2);
+        if (sizeX && !_isFocused(sizeX)) sizeX.value = size.x.toFixed(2);
+        if (sizeY && !_isFocused(sizeY)) sizeY.value = size.y.toFixed(2);
+        if (sizeZ && !_isFocused(sizeZ)) sizeZ.value = size.z.toFixed(2);
 
-        if (posX) posX.value = center.x.toFixed(2);
-        if (posY) posY.value = center.y.toFixed(2);
-        if (posZ) posZ.value = center.z.toFixed(2);
+        // 位置显示为相对所属盘/自由区容器的局部坐标（盘左下角为 0,0）
+        // 模型是世界坐标(scene子节点)，换算：局部 = 世界 − 归属盘左下角世界坐标
+        let localCenter = center;
+        const pid = model.plateId || this.freePlateId;
+        if (pid) {
+            const c = this._getPlateWorldPos(pid);
+            localCenter = new THREE.Vector3(
+                center.x - (c.x - this.bedSize.x / 2),
+                center.y - (c.y - this.bedSize.y / 2),
+                center.z
+            );
+        }
+        if (posX && !_isFocused(posX)) posX.value = localCenter.x.toFixed(2);
+        if (posY && !_isFocused(posY)) posY.value = localCenter.y.toFixed(2);
+        if (posZ && !_isFocused(posZ)) posZ.value = localCenter.z.toFixed(2);
 
-        const euler = new THREE.Euler().setFromQuaternion(transformSource.quaternion, 'XYZ');
-        if (rotX) rotX.value = (euler.x * 180 / Math.PI).toFixed(2);
-        if (rotY) rotY.value = (euler.y * 180 / Math.PI).toFixed(2);
-        if (rotZ) rotZ.value = (euler.z * 180 / Math.PI).toFixed(2);
+        // 校准模型：位置和缩放输入框设为只读
+        const isCalib = model._isCalibration === true;
+        [scaleX, scaleY, scaleZ, sizeX, sizeY, sizeZ, posX, posY].forEach(el => {
+            if (el) el.readOnly = isCalib;
+        });
+
+        const liveEuler = new THREE.Euler().setFromQuaternion(transformSource.quaternion, 'XYZ');
+        const accum = model._accumRotation || new THREE.Euler(0, 0, 0, 'XYZ');
+        const dispX = accum.x + liveEuler.x;
+        const dispY = accum.y + liveEuler.y;
+        const dispZ = accum.z + liveEuler.z;
+        if (rotX && !_isFocused(rotX)) rotX.value = (dispX * 180 / Math.PI).toFixed(2);
+        if (rotY && !_isFocused(rotY)) rotY.value = (dispY * 180 / Math.PI).toFixed(2);
+        if (rotZ && !_isFocused(rotZ)) rotZ.value = (dispZ * 180 / Math.PI).toFixed(2);
     }
 
     lockZAxis() {
@@ -1661,11 +3464,18 @@ class BedPreview {
         const mesh = model.mesh;
         mesh.updateMatrixWorld(true);
 
+        if (!model._accumRotation) model._accumRotation = new THREE.Euler(0, 0, 0, 'XYZ');
+        const transformSource = model._transformProxy || model.mesh;
+        const liveEuler = new THREE.Euler().setFromQuaternion(transformSource.quaternion, 'XYZ');
+        model._accumRotation.x += liveEuler.x;
+        model._accumRotation.y += liveEuler.y;
+        model._accumRotation.z += liveEuler.z;
+
         // 记录烘焙前的世界 XY 中心位置
         const preBox = new THREE.Box3().setFromObject(mesh);
         const preCenter = preBox.getCenter(new THREE.Vector3());
 
-        // 把世界矩阵应用到所有几何体顶点
+        // 把世界矩阵应用到所有几何体顶点（模型是场景全局子节点，世界=自身变换）
         mesh.traverse((child) => {
             if (child.geometry && child.geometry.attributes.position) {
                 child.geometry.applyMatrix4(child.matrixWorld);
@@ -1724,6 +3534,395 @@ class BedPreview {
             const proxy = model._transformProxy;
             setTimeout(() => this.transformControls.attach(proxy), 0);
         }
+
+        // 几何顶点已重排，凸包缓存失效
+        this._invalidateHullCache(model);
+    }
+
+    // 使某模型的凸包/平面缓存失效（几何/变换变化后调用）
+    _invalidateHullCache(model) {
+        if (!model) return;
+        if (model._hullPlanes) {
+            for (const p of model._hullPlanes) {
+                if (p.geometry) p.geometry.dispose();
+                if (p.material) p.material.dispose();
+                if (p.mesh) { if (p.mesh.geometry) p.mesh.geometry.dispose(); if (p.mesh.material) p.mesh.material.dispose(); }
+                if (p.raycastMesh) { if (p.raycastMesh.geometry) p.raycastMesh.geometry.dispose(); }
+            }
+            model._hullPlanes = null;
+        }
+        if (model._hullPickObjects) {
+            for (const o of model._hullPickObjects) { if (o && o.geometry) o.geometry.dispose(); }
+            model._hullPickObjects = null;
+        }
+    }
+
+    // 收集模型所有网格的世界坐标唯一顶点（4 位小数去重，避免重复点拖慢凸包）
+    _collectUniqueWorldPoints(model) {
+        const mesh = model.mesh;
+        mesh.updateMatrixWorld(true);
+        const seen = new Set();
+        const points = [];
+        const pushVertex = (x, y, z) => {
+            const key = x.toFixed(4) + ',' + y.toFixed(4) + ',' + z.toFixed(4);
+            if (seen.has(key)) return;
+            seen.add(key);
+            points.push(new THREE.Vector3(x, y, z));
+        };
+        mesh.traverse((child) => {
+            if (!child.isMesh || !child.geometry) return;
+            const pos = child.geometry.attributes.position;
+            if (!pos) return;
+            const idx = child.geometry.index;
+            const n = idx ? idx.count : pos.count;
+            const wp = new THREE.Vector3();
+            for (let i = 0; i < n; i++) {
+                const gi = idx ? idx.getX(i) : i;
+                wp.set(pos.getX(gi), pos.getY(gi), pos.getZ(gi)).applyMatrix4(child.matrixWorld);
+                pushVertex(wp.x, wp.y, wp.z);
+            }
+        });
+        return points;
+    }
+
+    // 基于 OrcaSlicer GLGizmoFlatten::update_planes() 移植：
+    // 1. 取模型三维凸包（ConvexHull）
+    // 2. 把法线近似相同的相邻三角面合并成一个"平面"（BFS 泛洪）
+    // 3. 剔除过小/过窄面，只保留面积最大的 254 个
+    // 4. 向质心收缩 10% -> 用平滑迭代磨圆角 -> 沿法线抬升 0.1 防闪烁
+    // 5. 三角扇生成几何，缓存到 model._hullPlanes
+    _computeHullPlanes(model) {
+        if (!model || !model.mesh) return null;
+        if (model._hullPlanes) return model._hullPlanes;
+        const points = this._collectUniqueWorldPoints(model);
+        if (points.length < 4) return null;
+
+        let hull;
+        try {
+            hull = new ConvexHull().setFromPoints(points);
+        } catch (e) {
+            console.warn('convex hull failed:', e);
+            return null;
+        }
+        const faces = hull.faces; // Face[] ; face.normal、face.edge(HalfEdge 链) 可访问顶点与邻接
+        const numFaces = faces.length;
+
+        const sameNormal = (a, b) => Math.abs(a.x - b.x) < 0.001 && Math.abs(a.y - b.y) < 0.001 && Math.abs(a.z - b.z) < 0.001;
+
+        // 建立 face 对象 -> 下标的映射，再做 BFS 合并共面相邻三角面成"平面"
+        const faceIndex = new Map();
+        for (let i = 0; i < numFaces; i++) faceIndex.set(faces[i], i);
+        const planeVisited = new Array(numFaces).fill(false);
+        const resultPlanes = [];
+
+        for (let start = 0; start < numFaces; start++) {
+            if (planeVisited[start]) continue;
+            const refNormal = faces[start].normal;
+            const queue = [start];
+            planeVisited[start] = true;
+            const poly = [];
+            // 只收集"与基准法线一致"的相邻三角面并扩散；法线不一致的邻居不标记、不入队，
+            // 留给外层循环当作新的平面种子，否则第一次泛洪会把不同方向的侧面提前"吃掉"，
+            // 导致方块只有顶/底两个平面、侧面消失。
+            while (queue.length) {
+                const fi = queue.pop();
+                const face = faces[fi];
+                let e = face.edge;
+                do {
+                    const p = e.vertex.point;
+                    poly.push(new THREE.Vector3(p.x, p.y, p.z));
+                    e = e.next;
+                } while (e !== face.edge);
+                // 只向同样共面的邻居扩散
+                let nbr = face.edge;
+                do {
+                    const twin = nbr.twin;
+                    if (twin) {
+                        const nfi = faceIndex.get(twin.face);
+                        if (nfi !== undefined && !planeVisited[nfi] && sameNormal(twin.face.normal, refNormal)) {
+                            planeVisited[nfi] = true;
+                            queue.push(nfi);
+                        }
+                    }
+                    nbr = nbr.next;
+                } while (nbr !== face.edge);
+            }
+            if (poly.length < 3) continue; // 至少一个三角形
+            const normal = new THREE.Vector3().copy(refNormal).normalize();
+            resultPlanes.push({ normal, verts: poly });
+        }
+
+        // ---- 后处理：剔除 + 收缩 + 磨圆 + 抬升 + 三角化（全部沿用 Orca 逻辑） ----
+        // 阈值按模型尺寸相对缩放：Orca 按真实毫米模型用 5mm²/1mm，小模型需等比缩小，
+        // 否则 8mm 的小猫几乎所有凸包面都会被滤掉。这里以模型包围盒对角线为基准；
+        // 换算因子参考 Orca 默认模型（约 100mm 级）→ 面积比例 5/100²、边长比例 1/100。
+        const diagLen = (() => {
+            const bb2 = new THREE.Box3();
+            for (const p of points) bb2.expandByPoint(p);
+            return bb2.getSize(new THREE.Vector3()).length();
+        })();
+        const scaleF = Math.max(diagLen / 100.0, 0.001);
+        // 温和过滤：只去掉过小到无意义的凸包面（避免渲染无数极小的碎面），
+        // 但阈值相对模型尺寸缩放且留足余量，避免误杀球的两极、方块的侧面。
+        const minimal_area = 0.1 * scaleF * scaleF;
+        const minimal_side = 0.12 * scaleF;
+        const minimal_angle = 15.0 * Math.PI / 180.0;
+
+        const processed = [];
+        for (const plane of resultPlanes) {
+            // 先算凸包多边形轮廓（合并后 poly 含重复点，先对点集求凸包外壳多边形）
+            let polygon = this._hullPolygonOutline(plane.verts);
+            if (!polygon || polygon.length < 3) continue;
+
+            // 淘汰：任一边过短
+            let smallSide = false;
+            for (let i = 0; i < polygon.length; i++) {
+                const a = polygon[i], b = polygon[(i + 1) % polygon.length];
+                if (a.distanceTo(b) < minimal_side) { smallSide = true; break; }
+            }
+            if (smallSide) continue;
+
+            // 真实面积：用扇形三角化求和每个三角形的面积（叉积模长），坐标系无关、平移无关
+            let area = 0;
+            {
+                const o = new THREE.Vector3();
+                for (const p of polygon) o.add(p);
+                o.divideScalar(polygon.length);
+                const n = polygon.length;
+                for (let i = 0; i < n; i++) {
+                    const a = polygon[i], b = polygon[(i + 1) % n];
+                    const tri = new THREE.Vector3().subVectors(a, o).cross(new THREE.Vector3().subVectors(b, o));
+                    area += tri.length();
+                }
+                area *= 0.5;
+            }
+            if (area < minimal_area) continue;
+
+            // 角度检查（最小内角）
+            let badAngle = false;
+            for (let i = 0; i < polygon.length; i++) {
+                const prec = polygon[(i + polygon.length - 1) % polygon.length];
+                const curr = polygon[i];
+                const next = polygon[(i + 1) % polygon.length];
+                const d1 = new THREE.Vector3().subVectors(prec, curr).normalize();
+                const d2 = new THREE.Vector3().subVectors(next, curr).normalize();
+                if (d1.angleTo(d2) < minimal_angle) { badAngle = true; break; }
+            }
+            if (badAngle) continue;
+
+            // 向质心收缩 10%（避免接触模型边缘）
+            const centroid = new THREE.Vector3();
+            for (const v of polygon) centroid.add(v);
+            centroid.divideScalar(polygon.length);
+            for (const v of polygon) v.lerp(centroid, 0.1);
+
+            // 磨圆：Orca 的迭代平滑
+            polygon = this._roundPolygonCorners(polygon, 10, 0.2);
+
+            // 抬升：沿法线抬 0.1 防 z-fighting
+            const lift = plane.normal.clone().multiplyScalar(0.1);
+            for (const v of polygon) v.add(lift);
+
+            processed.push({ normal: plane.normal, polygon });
+        }
+
+        // 按面积降序，只保留面积最大的 254 个（过多会拖慢渲染）
+        const withArea = processed.map((p) => {
+            let area = 0;
+            {
+                const plg = p.polygon;
+                const o = new THREE.Vector3();
+                for (const pt of plg) o.add(pt);
+                o.divideScalar(plg.length);
+                const n = plg.length;
+                for (let i = 0; i < n; i++) {
+                    const ta = plg[i], tb = plg[(i + 1) % n];
+                    const tri = new THREE.Vector3().subVectors(ta, o).cross(new THREE.Vector3().subVectors(tb, o));
+                    area += tri.length();
+                }
+                area *= 0.5;
+            }
+            return { ...p, _area: area };
+        });
+        withArea.sort((a, b) => b._area - a._area);
+        const top = withArea.slice(0, 254);
+
+        // 生成每个平面的渲染数据：三角扇填充 + 圆角多边形外轮廓（供描边）
+        const planes = top.map((p) => {
+            const verts = p.polygon;
+            const positions = [];
+            const pts = [];
+            for (const v of verts) { positions.push(v.x, v.y, v.z); pts.push(v); }
+            const indices = [];
+            for (let i = 1; i < pts.length - 1; i++) indices.push(0, i, i + 1);
+            const geom = new THREE.BufferGeometry();
+            geom.setAttribute('position', new THREE.BufferAttribute(new Float32Array(positions), 3));
+            geom.setIndex(indices);
+            geom.computeVertexNormals();
+            const mat = new THREE.MeshBasicMaterial({
+                color: 0xffffff,
+                transparent: true,
+                opacity: 0.5,
+                side: THREE.DoubleSide,
+                depthWrite: false
+            });
+            return { normal: p.normal, geometry: geom, material: mat, area: p._area, polygon: pts };
+        });
+
+        model._hullPlanes = planes;
+        return planes;
+    }
+
+    // 对给定顶点集求其二维凸包多边形（投影到法线平面），返回按序顶点数组
+    _hullPolygonOutline(verts) {
+        if (!verts || verts.length < 3) return null;
+        // 用三个不共线点建立局部坐标系，投影到 2D 做单调链凸包
+        // 简化：直接用 ConvexGeometry 求小凸包来获得轮廓（点的顺序由 QuickHull 保证）
+        // 但为了得到简单有序的外轮廓，这里用角度排序法。
+        // 先求质心
+        const c = new THREE.Vector3();
+        for (const v of verts) c.add(v);
+        c.divideScalar(verts.length);
+        // 计算近似法线（用前三个不共线点）
+        let n = new THREE.Vector3();
+        const v0 = verts[0];
+        for (let i = 1; i < verts.length - 1; i++) {
+            n = new THREE.Vector3().subVectors(verts[i], v0).cross(new THREE.Vector3().subVectors(verts[i + 1], v0));
+            if (n.lengthSq() > 1e-12) break;
+        }
+        n.normalize();
+        // 建立平面内两个正交轴
+        const ref = new THREE.Vector3(1, 0, 0);
+        if (Math.abs(n.dot(ref)) > 0.99) ref.set(0, 1, 0);
+        const u = new THREE.Vector3().crossVectors(n, ref).normalize();
+        const v = new THREE.Vector3().crossVectors(n, u).normalize();
+        // 投影并绕质心按极角排序
+        const proj = [];
+        for (const p of verts) {
+            const d = new THREE.Vector3().subVectors(p, c);
+            proj.push({ x: d.dot(u), y: d.dot(v), p });
+        }
+        // 去掉重复投影点
+        const seen = new Set();
+        const uniq = [];
+        for (const pr of proj) {
+            const key = pr.x.toFixed(4) + ',' + pr.y.toFixed(4);
+            if (seen.has(key)) continue;
+            seen.add(key);
+            uniq.push(pr);
+        }
+        if (uniq.length < 3) return null;
+        // 以重心为极点，按角度排序得到凸包顺序（对近似凸点集有效）
+        uniq.sort((a, b) => Math.atan2(a.y, a.x) - Math.atan2(b.y, b.x));
+        return uniq.map((pr) => pr.p.clone());
+    }
+
+    // Orca 的角点磨圆算法：多次迭代把每个角向邻边中点平均方向收缩
+    _roundPolygonCorners(polygon, k, aggressivity) {
+        const N = polygon.length;
+        if (N < 3 || k === 0) return polygon.slice();
+        const pts = polygon.slice();
+        const neighbours = [];
+        const points_out = [];
+        for (let j = 0; j < N; j++) {
+            points_out[j * 2 * k] = pts[j].clone();
+            neighbours.push([(j * 2 * k - k < 0) ? (N - 1) * 2 * k + k : j * 2 * k - k, j * 2 * k + k]);
+        }
+        for (let i = 0; i < k; i++) {
+            for (let j = 0; j < N; j++) {
+                if (i === 0) {
+                    points_out[j * 2 * k + k] = new THREE.Vector3().copy(points_out[j * 2 * k])
+                        .add(points_out[j === N - 1 ? 0 : (j + 1) * 2 * k]).multiplyScalar(0.5);
+                } else {
+                    const r = 0.2 + 0.3 / (k - 1) * i;
+                    points_out[neighbours[j][0]] = new THREE.Vector3().copy(points_out[j * 2 * k]).multiplyScalar(r)
+                        .addScaledVector(points_out[neighbours[j][0] - 1], 1 - r);
+                    points_out[neighbours[j][1]] = new THREE.Vector3().copy(points_out[j * 2 * k]).multiplyScalar(r)
+                        .addScaledVector(points_out[neighbours[j][1] + 1], 1 - r);
+                }
+            }
+            for (let j = 0; j < N; j++) {
+                const p = points_out[2 * k * j];
+                points_out[2 * k * j] = new THREE.Vector3().copy(p).multiplyScalar(1 - aggressivity)
+                    .addScaledVector(new THREE.Vector3().copy(points_out[neighbours[j][0]]).add(points_out[neighbours[j][1]]).multiplyScalar(0.5), aggressivity);
+            }
+            for (const nb of neighbours) { nb[0]++; nb[1]--; }
+        }
+        return points_out;
+    }
+
+    // 把指定平面（planeIndices 为 _hullPlanes 的下标）渲染成 Group（世界坐标）：
+    // 每个平面 = 半透明填充 + 圆角亮边轮廓（参考图那种"明亮三角面 + 清晰边线"）
+    _buildPlaneOverlay(model, planeIndices, style) {
+        const planes = this._computeHullPlanes(model);
+        if (!planes) return null;
+        const opts = style || {};
+        const group = new THREE.Group();
+        const renderOrder = opts.renderOrder !== undefined ? opts.renderOrder : 1;
+        for (const idx of (Array.isArray(planeIndices) ? planeIndices : [planeIndices])) {
+            const plane = planes[idx];
+            if (!plane) continue;
+            const mat = new THREE.MeshBasicMaterial({
+                color: opts.fillColor !== undefined ? opts.fillColor : 0xffffff,
+                transparent: true,
+                opacity: opts.opacity !== undefined ? opts.opacity : 0.5,
+                side: THREE.DoubleSide,
+                depthTest: opts.depthTest !== undefined ? opts.depthTest : true,
+                depthWrite: false,
+                polygonOffset: true,
+                polygonOffsetFactor: 4,
+                polygonOffsetUnits: 4
+            });
+            const mesh = new THREE.Mesh(plane.geometry, mat);
+            mesh.renderOrder = renderOrder;
+            group.add(mesh);
+
+            // 圆角亮边：沿多边形轮廓画一圈闭合圆头线（Line2）
+            if (opts.showOutline !== false && plane.polygon && plane.polygon.length >= 2) {
+                const pts = plane.polygon;
+                const polyPts = [];
+                for (const p of pts) polyPts.push(p.x, p.y, p.z);
+                polyPts.push(pts[0].x, pts[0].y, pts[0].z); // 闭合
+                const lineGeom = new LineGeometry();
+                lineGeom.setPositions(polyPts);
+                const lineMat = new LineMaterial({
+                    color: opts.outlineColor !== undefined ? opts.outlineColor : 0xa7ff6b,
+                    linewidth: opts.outlineWidth !== undefined ? opts.outlineWidth : 3,
+                    transparent: true,
+                    opacity: opts.outlineOpacity !== undefined ? opts.outlineOpacity : 0.9,
+                    depthTest: opts.depthTest !== undefined ? opts.depthTest : true,
+                    depthWrite: false
+                });
+                if (this.renderer) {
+                    const c = this.renderer.domElement;
+                    lineMat.resolution.set(c.width, c.height);
+                }
+                const line = new Line2(lineGeom, lineMat);
+                line.renderOrder = renderOrder + 1;
+                group.add(line);
+            }
+        }
+        return group;
+    }
+
+    // 返回光标射线命中的平面下标（-1 表示未命中）
+    _pickPlane(model, raycaster) {
+        const planes = this._computeHullPlanes(model);
+        if (!planes) return -1;
+        if (!model._hullPickObjects) model._hullPickObjects = [];
+        if (model._hullPickObjects.length !== planes.length) model._hullPickObjects = [];
+        let objects = model._hullPickObjects;
+        for (let i = 0; i < planes.length; i++) {
+            if (!objects[i]) {
+                objects[i] = new THREE.Mesh(planes[i].geometry);
+                objects[i].matrixAutoUpdate = false;
+            }
+            objects[i].matrixWorld.identity();
+            objects[i].updateMatrixWorld(true);
+        }
+        const inter = raycaster.intersectObjects(objects, false);
+        if (inter.length === 0) return -1;
+        return objects.indexOf(inter[0].object);
     }
 
     saveState(description = '操作') {
@@ -1734,28 +3933,79 @@ class BedPreview {
         };
         this.models.forEach((model, id) => {
             const transformSource = model._transformProxy || model.mesh;
+
+            // 统一以【全局坐标】为准：无论模型当前挂在 proxy、scene 还是盘板容器下，
+            // 都取 world 变换作为记录标准，避免盘板局部坐标错位。
+            const worldPosition = new THREE.Vector3();
+            const worldQuaternion = new THREE.Quaternion();
+            const worldScale = new THREE.Vector3();
+            model.mesh.getWorldPosition(worldPosition);
+            model.mesh.getWorldQuaternion(worldQuaternion);
+            model.mesh.getWorldScale(worldScale);
+
+            const accum = model._accumRotation || new THREE.Euler(0, 0, 0, 'XYZ');
             state.models[id] = {
                 name: model.name,
-                position: { 
-                    x: transformSource.position.x, 
-                    y: transformSource.position.y, 
-                    z: transformSource.position.z 
+                position: {
+                    x: transformSource.position.x,
+                    y: transformSource.position.y,
+                    z: transformSource.position.z
                 },
-                rotation: { 
-                    x: transformSource.rotation.x, 
-                    y: transformSource.rotation.y, 
-                    z: transformSource.rotation.z 
+                rotation: {
+                    x: transformSource.rotation.x,
+                    y: transformSource.rotation.y,
+                    z: transformSource.rotation.z
                 },
-                scale: { 
-                    x: transformSource.scale.x, 
-                    y: transformSource.scale.y, 
-                    z: transformSource.scale.z 
-                }
+                scale: {
+                    x: transformSource.scale.x,
+                    y: transformSource.scale.y,
+                    z: transformSource.scale.z
+                },
+                accumRotation: { x: accum.x, y: accum.y, z: accum.z },
+                meshOffset: {
+                    x: model.mesh.position.x,
+                    y: model.mesh.position.y,
+                    z: model.mesh.position.z
+                },
+                hasProxy: !!model._transformProxy,
+                // 全局坐标快照（撤销/重做还原时的统一基准）
+                worldPosition: {
+                    x: worldPosition.x, y: worldPosition.y, z: worldPosition.z
+                },
+                worldRotation: {
+                    x: worldQuaternion.x, y: worldQuaternion.y, z: worldQuaternion.z, w: worldQuaternion.w
+                },
+                worldScale: {
+                    x: worldScale.x, y: worldScale.y, z: worldScale.z
+                },
+                // 烘焙后的全局几何顶点快照：每项 = { array: 全局坐标顶点（JSON 安全纯数组） }，
+                // 用于烘焙后精确还原几何形状
+                worldGeometry: this._captureWorldGeometry(model.mesh)
             };
         });
         const info = this.historyManager.record(state);
         this.updateUndoRedoButtons();
         return info;
+    }
+
+    // 把模型所有子网格的 position 顶点烘焙成全局坐标的快照。
+    // 返回 JSON 安全的纯 JS 数组（HistoryManager.record 会 JSON 序列化，不能存 TypedArray）。
+    _captureWorldGeometry(mesh) {
+        mesh.updateMatrixWorld(true);
+        const list = [];
+        mesh.traverse((child) => {
+            if (!child.geometry || !child.geometry.attributes || !child.geometry.attributes.position) return;
+            const posAttr = child.geometry.attributes.position;
+            const src = posAttr.array;
+            if (!(src instanceof Float32Array)) return; // 非 Float32 缓冲区走旧的 transform-only 路径
+            const tmp = new THREE.BufferGeometry();
+            tmp.setAttribute('position', new THREE.BufferAttribute(new Float32Array(src), posAttr.itemSize));
+            tmp.applyMatrix4(child.matrixWorld);
+            const out = tmp.attributes.position.array;
+            list.push({ array: Array.prototype.slice.call(out) });
+            tmp.dispose();
+        });
+        return list;
     }
 
     restoreState(result) {
@@ -1764,13 +4014,29 @@ class BedPreview {
         this.isUndoRedo = true;
 
         this.models.forEach((model, id) => {
-            if (state.models && state.models[id]) {
-                const modelState = state.models[id];
+            if (!state.models || !state.models[id]) return;
+            const modelState = state.models[id];
+            if (!model._accumRotation) model._accumRotation = new THREE.Euler(0, 0, 0, 'XYZ');
+            if (modelState.accumRotation) {
+                model._accumRotation.set(modelState.accumRotation.x || 0, modelState.accumRotation.y || 0, modelState.accumRotation.z || 0);
+            } else if (!Array.isArray(modelState.worldGeometry) || !modelState.worldGeometry.length) {
+                model._accumRotation.set(modelState.rotation.x || 0, modelState.rotation.y || 0, modelState.rotation.z || 0);
+            }
 
+            if (Array.isArray(modelState.worldGeometry) && modelState.worldGeometry.length) {
+                // 新快照：还原烘焙后的全局几何，并按全局坐标放置
+                this._applySnapshot(model, modelState);
+            } else {
+                // 旧快照（无 geometry 快照）：走原来的 transform-only 兼容路径
+                const meshOffset = modelState.meshOffset || { x: 0, y: 0, z: 0 };
                 if (model.selected && model._transformProxy) {
                     model._transformProxy.position.set(modelState.position.x, modelState.position.y, modelState.position.z);
                     model._transformProxy.rotation.set(modelState.rotation.x, modelState.rotation.y, modelState.rotation.z);
                     model._transformProxy.scale.set(modelState.scale.x, modelState.scale.y, modelState.scale.z);
+                    model.mesh.position.set(meshOffset.x, meshOffset.y, meshOffset.z);
+                    model.mesh.quaternion.identity();
+                    model.mesh.scale.set(1, 1, 1);
+                    model.mesh.updateMatrix();
                     model._transformProxy.updateMatrixWorld(true);
                 } else {
                     model.mesh.position.set(modelState.position.x, modelState.position.y, modelState.position.z);
@@ -1781,12 +4047,70 @@ class BedPreview {
             }
         });
 
+        // lockZAxis 会再调 mesh.position.z 贴底，需在顶点快照恢复之后执行
         this.lockZAxis();
         this.updateTransformInputs();
         this.updateSelectionBoxes();
         this.isUndoRedo = false;
         
         return result.info;
+    }
+
+    // 按快照还原模型：写回烘焙后的全局几何顶点 + 放到全局坐标
+    _applySnapshot(model, modelState) {
+        const mesh = model.mesh;
+
+        // 1) 从 proxy / 盘板容器中脱离，回到全局自由区（场景）以保持“全局坐标”语义
+        if (this.transformControls && this.transformControls.object === model._transformProxy) {
+            this.transformControls.detach();
+        }
+        if (model._transformProxy) {
+            if (mesh.parent === model._transformProxy) model._transformProxy.remove(mesh);
+            if (model._transformProxy.parent) model._transformProxy.parent.remove(model._transformProxy);
+            model._transformProxy = null;
+        }
+        const parent = mesh.parent;
+        const host = this.freePlateGroup || this.scene;
+        if (parent && parent !== this.scene && parent !== this.freePlateGroup) {
+            parent.remove(mesh);
+        }
+        if (mesh.parent !== host) host.add(mesh);
+
+        // 2) 写回全局顶点快照（遍历顺序与 _captureWorldGeometry 一致）
+        const snaps = modelState.worldGeometry || [];
+        let snapIdx = 0;
+        mesh.traverse((child) => {
+            if (!child.geometry || !child.geometry.attributes || !child.geometry.attributes.position) return;
+            const snap = snaps[snapIdx++];
+            if (!snap || !snap.array) return;
+            const posAttr = child.geometry.attributes.position;
+            if (!(posAttr.array instanceof Float32Array)) return;
+            const n = Math.min(posAttr.count * posAttr.itemSize, snap.array.length);
+            if (n <= 0) return;
+            for (let i = 0; i < n; i++) posAttr.array[i] = snap.array[i];
+            posAttr.needsUpdate = true;
+            child.geometry.attributes.position = posAttr;
+            child.geometry.computeBoundingBox();
+            child.geometry.computeBoundingSphere();
+        });
+
+        // 3) 置网格变换为恒等：顶点已含全局坐标，不需额外位移
+        mesh.position.set(0, 0, 0);
+        mesh.quaternion.identity();
+        mesh.scale.set(1, 1, 1);
+        mesh.updateMatrix();
+        mesh.updateMatrixWorld(true);
+
+        // 4) 归属盘按模型全局中心重算（只改逻辑 plateId，不重挂父节点）
+        this._assignModelToPlateByPosition(model);
+
+        // 5) 几何已重排，凸包缓存失效
+        this._invalidateHullCache(model);
+
+        // 6) 若该模型仍处于选中态，重建 proxy/selectionBox 使 gizmo 跟随
+        if (model.selected && this.selectedModels.has(model.id)) {
+            this.selectModelInternal(model);
+        }
     }
 
     undo() {
@@ -1850,7 +4174,10 @@ class BedPreview {
                     child.geometry = child.geometry.clone();
                 }
                 if (child.material) {
-                    child.material = child.material.clone();
+                    // 若源材质处于“不可打印”灰化状态，克隆其已保存的原始材质作为副本底材
+                    const srcMat = child.material;
+                    const saved = this._savedPrintMaterials.get(srcMat);
+                    child.material = (saved || srcMat).clone();
                 }
             }
         });
@@ -1858,6 +4185,9 @@ class BedPreview {
         const newModelId = this.nextModelId++;
         const newName = `${sourceModel.name} (副本)`;
         const newModelObj = new ModelObject(newMesh, newName, newModelId);
+        // 继承源模型的可打印状态与所属盘，避免副本状态与外观/控件不一致
+        newModelObj.printable = sourceModel.printable;
+        newModelObj.plateId = sourceModel.plateId;
 
         // 更新 userData.modelId，避免点击选中母本
         newMesh.traverse((child) => {
@@ -1879,6 +4209,8 @@ class BedPreview {
 
         this.models.set(newModelId, newModelObj);
         this.scene.add(newMesh);
+        // 仅当副本为不可打印时重设灰色外观并登记副本自身的原始材质，保证后续切换能正确还原
+        if (!newModelObj.printable) this._updateModelPrintAppearance(newModelObj);
 
         const filePath = this.modelFilePaths.get(this.clipboard.sourceModelId);
         if (filePath) {
@@ -1935,10 +4267,9 @@ class BedPreview {
         const groupCenterMatrix = new THREE.Matrix4().makeTranslation(groupCenter.x, groupCenter.y, groupCenter.z);
         const invGroupCenter = new THREE.Matrix4().copy(groupCenterMatrix).invert();
 
-        // 2. 遍历每个模型，收集子网格、记录解组信息
-        const allGeometries = [];
+        // 2. 遍历每个模型，收集子网格、记录解组信息（保留各自的几何/材质/贴图）
         const groupDataParts = [];
-        let firstMaterial = null;
+        const groupMeshes = [];   // 组合体内的子网格：几何 + 材质 + 贴图原样保留
 
         selectedModelIds.forEach(modelId => {
             const model = this.models.get(modelId);
@@ -1949,13 +4280,15 @@ class BedPreview {
             const subMeshData = [];
             model.mesh.traverse((child) => {
                 if (child.isMesh && child.geometry && child.geometry.attributes.position) {
-                    // 计算该子网格在组内的局部变换
+                    // 计算该子网格相对组中心的局部变换
                     const localMatrix = new THREE.Matrix4().multiplyMatrices(invGroupCenter, child.matrixWorld);
 
-                    // 克隆几何体并应用局部变换，用于合并
-                    const clonedGeo = child.geometry.clone();
-                    clonedGeo.applyMatrix4(localMatrix);
-                    allGeometries.push(clonedGeo);
+                    // 复刻一个子网格：几何 + 材质 + 贴图原样保留，定位到组内局部坐标
+                    const partMesh = new THREE.Mesh(child.geometry.clone(), child.material);
+                    partMesh.applyMatrix4(localMatrix);
+                    partMesh.castShadow = true;
+                    partMesh.receiveShadow = true;
+                    groupMeshes.push(partMesh);
 
                     // 保存原始几何体和局部变换，用于解组
                     subMeshData.push({
@@ -1963,10 +4296,6 @@ class BedPreview {
                         material: child.material,
                         localMatrix: localMatrix.clone(),
                     });
-
-                    if (!firstMaterial && child.material) {
-                        firstMaterial = child.material;
-                    }
                 }
             });
 
@@ -1984,25 +4313,19 @@ class BedPreview {
             });
         });
 
-        // 3. 合并所有几何体
-        const mergedGeo = this._mergeGeometries(allGeometries);
-
-        // 4. 创建合并后的单一 mesh（保留第一个模型的材质外观）
-        const mergedMaterial = firstMaterial
-            ? firstMaterial.clone()
-            : new THREE.MeshStandardMaterial({ color: 0xcccccc, roughness: 0.5, metalness: 0.1 });
-        mergedMaterial.flatShading = false;
-        const mergedMesh = new THREE.Mesh(mergedGeo, mergedMaterial);
-        mergedMesh.position.copy(groupCenter);
-        mergedMesh.castShadow = true;
-        mergedMesh.receiveShadow = true;
+        // 3. 组合体 = 一个 THREE.Group，原点置于组中心；子网格各保留材质/贴图，不再强行合并几何体
+        //    （这避免了合并丢失 UV 和贴图导致纹理错乱）
+        const groupRoot = new THREE.Group();
+        groupMeshes.forEach((m) => groupRoot.add(m));
+        groupRoot.position.copy(groupCenter);
+        groupRoot.userData.isGroupRoot = true;
 
         const modelId = this.nextModelId++;
-        mergedMesh.userData.modelId = modelId;
+        groupRoot.userData.modelId = modelId;
 
-        this.scene.add(mergedMesh);
+        this.scene.add(groupRoot);
 
-        const modelObj = new ModelObject(mergedMesh, `组合体 ${modelId}`, modelId);
+        const modelObj = new ModelObject(groupRoot, `组合体 ${modelId}`, modelId);
         modelObj._groupData = {
             center: groupCenter.clone(),
             parts: groupDataParts,
@@ -2016,7 +4339,6 @@ class BedPreview {
 
         this.updateObjectList();
         this.updateTransformPanel();
-        this.showToast(`已组合 ${groupDataParts.length} 个对象`, 'success');
     }
 
     _mergeGeometries(geometries) {
@@ -2145,7 +4467,6 @@ class BedPreview {
         this.saveState('解组对象');
         this.updateObjectList();
         this.updateTransformPanel();
-        this.showToast('已解组', 'success');
     }
 
     fitCameraToModel(mesh) {
@@ -2170,11 +4491,11 @@ class BedPreview {
             this.camera.bottom = -this._orthoHalfSize;
             this.camera.updateProjectionMatrix();
 
-            // 从斜上方俯视
+            // 从斜上方俯视，X 对齐床中心使地平线与 X 轴（Y=0 线）平行
             const dist = Math.max(this.bedSize.x, this.bedSize.y) * 0.85;
             const angle = Math.PI / 4;
             this.camera.position.set(
-                bedCenter.x + dist * Math.cos(angle),
+                bedCenter.x,
                 bedCenter.y - dist * Math.cos(angle),
                 bedCenter.z + dist * Math.sin(angle)
             );
@@ -2191,7 +4512,7 @@ class BedPreview {
             const horizontalDist = cameraDist * Math.cos(angle);
             const verticalDist = cameraDist * Math.sin(angle);
             this.camera.position.set(
-                bedCenter.x + horizontalDist,
+                bedCenter.x,
                 bedCenter.y - horizontalDist,
                 bedCenter.z + verticalDist
             );
@@ -2210,6 +4531,16 @@ class BedPreview {
     }
 
     setMode(mode) {
+        // 校准模型只允许旋转
+        if (mode !== 'rotate' && this.selectedModels.size === 1) {
+            const modelId = Array.from(this.selectedModels)[0];
+            const model = this.models.get(modelId);
+            if (model && model._isCalibration) {
+                this.showToast('校准模型只允许旋转，不可移动或缩放', 'warning');
+                return;
+            }
+        }
+
         if (this.currentMode === mode) {
             this.currentMode = null;
             this.transformControls.detach();
@@ -2244,8 +4575,11 @@ class BedPreview {
         if (this.isLayOnFaceMode) {
             this.currentMode = null;
             this.transformControls.detach();
+            // 点亮整体模型的明亮三角面
+            this._rebuildTriangulationOverlay();
         } else {
             this._clearFaceHighlight();
+            this._clearTriangulationOverlay();
         }
         this.updateModeButtons();
         this.switchTransformContent();
@@ -2255,7 +4589,12 @@ class BedPreview {
     onMouseMove(event) {
         if (!this.isLayOnFaceMode) {
             this._clearFaceHighlight();
+            this._clearTriangulationOverlay();
             return;
+        }
+        // 模型/三角面层在任何状态变化后自动补齐
+        if (!this._triangulationOverlay) {
+            this._rebuildTriangulationOverlay();
         }
 
         const rect = this.renderer.domElement.getBoundingClientRect();
@@ -2295,22 +4634,13 @@ class BedPreview {
         }
     }
 
-    _highlightFaceRegion(intersect) {
-        const mesh = intersect.object;
-        // 确保矩阵最新
-        mesh.updateMatrixWorld(true);
-
-        const region = this._getCoplanarRegion(mesh, intersect.faceIndex);
-        if (!region || region.faceIndices.length === 0) return;
-
+    _extractFacePositions(mesh, faceIndices) {
         const geometry = mesh.geometry;
         const pos = geometry.attributes.position;
-
-        // 合并区域所有三角面的顶点（支持索引/非索引几何体）
         const vertices = [];
         if (geometry.index) {
             const idx = geometry.index;
-            for (const fi of region.faceIndices) {
+            for (const fi of faceIndices) {
                 const i0 = idx.getX(fi * 3);
                 const i1 = idx.getX(fi * 3 + 1);
                 const i2 = idx.getX(fi * 3 + 2);
@@ -2319,7 +4649,7 @@ class BedPreview {
                 vertices.push(pos.getX(i2), pos.getY(i2), pos.getZ(i2));
             }
         } else {
-            for (const fi of region.faceIndices) {
+            for (const fi of faceIndices) {
                 const i0 = fi * 3;
                 const i1 = fi * 3 + 1;
                 const i2 = fi * 3 + 2;
@@ -2328,33 +4658,239 @@ class BedPreview {
                 vertices.push(pos.getX(i2), pos.getY(i2), pos.getZ(i2));
             }
         }
+        return new Float32Array(vertices);
+    }
+
+    // 生成一个圆角三角形的轮廓顶点（按边界顺序，三个角用圆弧过渡而非锐利尖角）
+    _roundedTriangleOutline(vArr, base, cornerSegs, radiusRatio, out) {
+        const a = new THREE.Vector3(vArr[base], vArr[base + 1], vArr[base + 2]);
+        const b = new THREE.Vector3(vArr[base + 3], vArr[base + 4], vArr[base + 5]);
+        const c = new THREE.Vector3(vArr[base + 6], vArr[base + 7], vArr[base + 8]);
+        const corners = [a, b, c];
+        // 每条边的单位方向：edgeDir[i] 从 corners[i] 指向 corners[(i+1)%3]
+        const edgeDir = [];
+        const edgeLen = [];
+        for (let i = 0; i < 3; i++) {
+            const nxt = corners[(i + 1) % 3];
+            const d = new THREE.Vector3().subVectors(nxt, corners[i]);
+            edgeLen.push(d.length());
+            if (edgeLen[i] > 1e-9) d.divideScalar(edgeLen[i]);
+            edgeDir.push(d);
+        }
+        // 每个角点到其两侧切点的距离 t[i]
+        const t = [];
+        for (let i = 0; i < 3; i++) {
+            const prevEdge = edgeDir[(i + 2) % 3];
+            const nextEdge = edgeDir[i];
+            const half = prevEdge.clone().add(nextEdge);
+            const halfLen = half.length();
+            if (halfLen < 1e-9) { t.push(0); continue; }
+            half.divideScalar(halfLen);
+            const cosHalf = half.dot(nextEdge);
+            const r = Math.min(edgeLen[(i + 2) % 3], edgeLen[i]) * radiusRatio;
+            t.push(Math.min(Math.abs(r / (cosHalf || 1e-9)), edgeLen[(i + 2) % 3] * 0.5, edgeLen[i] * 0.5));
+        }
+        // 圆角三角形中心点（重心），用于内部扇形三角化
+        const segs = Math.max(2, cornerSegs);
+        // 先为每个角算好 entry（沿上一边进入角）、leave（沿当前边离开角）两个切点，以及圆弧圆心/半径
+        const arcInfo = [];
+        for (let i = 0; i < 3; i++) {
+            const v = corners[i];
+            const e0 = edgeDir[(i + 2) % 3]; // 进入边方向：prev->v
+            const e1 = edgeDir[i];           // 离开边方向：v->next
+            const tIn = t[i];
+            const entry = v.clone().addScaledVector(e0, -tIn);
+            const leave = v.clone().addScaledVector(e1, tIn);
+            const half = e0.clone().add(e1);
+            const halfLen = half.length();
+            if (halfLen < 1e-9 || tIn < 1e-9) {
+                arcInfo.push({ entry, leave, center: null, rEff: 0, aStart: 0, sweep: 0, degenerate: true });
+                continue;
+            }
+            half.divideScalar(halfLen);
+            const cosHalf = half.dot(e1) || 1e-9;
+            const center = v.clone().addScaledVector(half, -(tIn / cosHalf));
+            const rEff = entry.distanceTo(center);
+            const sDir = new THREE.Vector3().subVectors(entry, center);
+            const eDir3 = new THREE.Vector3().subVectors(leave, center);
+            const aStart = Math.atan2(sDir.y, sDir.x);
+            const aEnd = Math.atan2(eDir3.y, eDir3.x);
+            let sweep = aEnd - aStart;
+            while (sweep > Math.PI) sweep -= Math.PI * 2;
+            while (sweep < -Math.PI) sweep += Math.PI * 2;
+            arcInfo.push({ entry, leave, center, rEff, aStart, sweep, degenerate: false });
+        }
+        // 按逆时针（A→B→C→A）拼出闭合轮廓：直边 + 角圆弧，首尾去重
+        const boundary = [];
+        for (let i = 0; i < 3; i++) {
+            const info = arcInfo[i];
+            const nextEntry = arcInfo[(i + 1) % 3].entry;
+            // 沿当前角圆弧从 entry 转到 leave（到达角的弧）
+            if (!info.degenerate) {
+                for (let s = 0; s <= segs; s++) {
+                    const ang = info.aStart + info.sweep * (s / segs);
+                    boundary.push(new THREE.Vector3(
+                        info.center.x + Math.cos(ang) * info.rEff,
+                        info.center.y + Math.sin(ang) * info.rEff,
+                        info.center.z
+                    ));
+                }
+            } else {
+                boundary.push(info.leave.clone());
+            }
+            // 直边：从当前角的 leave 连到下一个角的 entry（都在同一网格边上）
+            boundary.push(nextEntry.clone());
+        }
+        // 闭合并去重首尾（首尾会在同一直边上重合）
+        const tolerance = 1e-6;
+        if (boundary.length > 1) {
+            const first = boundary[0];
+            const last = boundary[boundary.length - 1];
+            if (first.distanceTo(last) < tolerance) boundary.pop();
+        }
+        const centroid = new THREE.Vector3().copy(a).add(b).add(c).multiplyScalar(1 / 3);
+        out.push(centroid.x, centroid.y, centroid.z);
+        for (const p of boundary) {
+            out.push(p.x, p.y, p.z);
+        }
+    }
+
+    // 用重心扇形法把圆角三角形轮廓三角化（质心 + 每段轮廓顶点）
+    _buildFaceHighlightOverlay(mesh, faceIndices, style) {
+        const opts = style || {};
+        const vertexArray = this._extractFacePositions(mesh, faceIndices);
+        const triCount = faceIndices.length;
+        const group = new THREE.Group();
+
+        // 把每个三角面替换成圆角三角（三个角圆弧过渡），合并成一个几何体绘制。
+        // 视觉上就是一个一个边缘圆润的三角形片；全部面合成单个 BufferGeometry，
+        // 只需一次 draw call，性能好
+        const cornerSegs = opts.cornerSegs !== undefined ? opts.cornerSegs : 6;
+        const radiusRatio = opts.radiusRatio !== undefined ? opts.radiusRatio : 0.45;
+        const polygonVerts = [];
+        for (let f = 0; f < triCount; f++) {
+            const outline = [];
+            this._roundedTriangleOutline(vertexArray, f * 9, cornerSegs, radiusRatio, outline);
+            // outline[0] 是质心，其余按边界顺序
+            const n = (outline.length - 1) / 3;
+            const cx = outline[0], cy = outline[1], cz = outline[2];
+            for (let k = 1; k < n; k++) {
+                polygonVerts.push(
+                    cx, cy, cz,
+                    outline[k * 3], outline[k * 3 + 1], outline[k * 3 + 2],
+                    outline[(k + 1) * 3], outline[(k + 1) * 3 + 1], outline[(k + 1) * 3 + 2]
+                );
+            }
+        }
 
         const triGeom = new THREE.BufferGeometry();
-        triGeom.setAttribute('position', new THREE.BufferAttribute(new Float32Array(vertices), 3));
+        triGeom.setAttribute('position', new THREE.BufferAttribute(new Float32Array(polygonVerts), 3));
         triGeom.computeVertexNormals();
 
-        const triMat = new THREE.MeshBasicMaterial({
-            color: 0x4a9eff,
-            transparent: true,
-            opacity: 0.4,
+        const fillMat = new THREE.MeshBasicMaterial({
+            color: opts.fillColor !== undefined ? opts.fillColor : 0x00d94f,
+            transparent: opts.opacity !== undefined,
+            opacity: opts.opacity !== undefined ? opts.opacity : 1,
             side: THREE.DoubleSide,
-            depthTest: false
+            depthTest: opts.depthTest !== undefined ? opts.depthTest : true,
+            polygonOffset: opts.polyOffset !== false,
+            polygonOffsetFactor: 4,
+            polygonOffsetUnits: 4
         });
+        const fill = new THREE.Mesh(triGeom, fillMat);
+        fill.renderOrder = opts.renderOrder !== undefined ? opts.renderOrder : 1;
+        group.add(fill);
 
-        const highlight = new THREE.Mesh(triGeom, triMat);
-        highlight.applyMatrix4(mesh.matrixWorld);
-
-        this._clearFaceHighlight();
-        this._faceHighlight = highlight;
-        this.scene.add(highlight);
+        group.applyMatrix4(mesh.matrixWorld);
+        return group;
     }
 
     _clearFaceHighlight() {
         if (this._faceHighlight) {
             this.scene.remove(this._faceHighlight);
-            this._faceHighlight.geometry.dispose();
-            this._faceHighlight.material.dispose();
+            this._disposeGroup(this._faceHighlight);
             this._faceHighlight = null;
+        }
+    }
+
+    _disposeGroup(group) {
+        group.traverse((child) => {
+            if (child.geometry) child.geometry.dispose();
+            if (child.material) child.material.dispose();
+        });
+    }
+
+    _clearTriangulationOverlay() {
+        if (this._triangulationOverlay) {
+            this.scene.remove(this._triangulationOverlay);
+            this._disposeGroup(this._triangulationOverlay);
+            this._triangulationOverlay = null;
+        }
+    }
+
+    _rebuildTriangulationOverlay() {
+        this._clearTriangulationOverlay();
+        const group = new THREE.Group();
+        // 每个模型：只点亮其凸包上合并出的"平面"（同法线相邻三角合并成一块），不渲染内部网格面
+        this.models.forEach(model => {
+            const planes = this._computeHullPlanes(model);
+            if (!planes || planes.length === 0) return;
+            const indices = [];
+            for (let i = 0; i < planes.length; i++) indices.push(i);
+            const ov = this._buildPlaneOverlay(model, indices, {
+                fillColor: 0xffffff,
+                opacity: 0.3,
+                outlineColor: 0xffffff,
+                outlineOpacity: 0.7,
+                outlineWidth: 2,
+                renderOrder: 1,
+                depthTest: true   // 参与深度测试：被模型自身遮挡的背面凸包面不显示，避免隔着物体看到对面
+            });
+            if (ov) group.add(ov);
+        });
+        if (group.children.length > 0) {
+            this._triangulationOverlay = group;
+            this.scene.add(group);
+        }
+    }
+
+    _highlightFaceRegion(intersect) {
+        // 按面放平 = 用凸包合并出的"平面"逼近模型。
+        // 悬停时只让命中的凸包平面更亮；未命中任何凸包平面则保持当前高亮（不退回原始网格面，
+        // 否则会混入模型自身的不规则小面）。
+        const mesh = intersect.object;
+        let targetMesh = mesh;
+        let modelId = null;
+        while (targetMesh) {
+            if (targetMesh.userData && targetMesh.userData.modelId !== undefined) {
+                modelId = targetMesh.userData.modelId;
+                break;
+            }
+            targetMesh = targetMesh.parent;
+        }
+        const model = (modelId !== null && this.models.has(modelId)) ? this.models.get(modelId) : null;
+        if (model) {
+            try {
+                const planeIdx = this._pickPlane(model, this.raycaster);
+                if (planeIdx >= 0) {
+                    const ov = this._buildPlaneOverlay(model, [planeIdx], {
+                        fillColor: 0xffffff,
+                        opacity: 0.8,
+                        outlineColor: 0xffffff,
+                        outlineOpacity: 1,
+                        outlineWidth: 3,
+                        renderOrder: 10,
+                        depthTest: false
+                    });
+                    if (ov) {
+                        this._clearFaceHighlight();
+                        this._faceHighlight = ov;
+                        this.scene.add(ov);
+                    }
+                }
+            } catch (e) {
+                console.warn('plane highlight failed:', e);
+            }
         }
     }
 
@@ -2461,12 +4997,6 @@ class BedPreview {
             return;
         }
 
-        // 记录放平前的 XY 视觉中心
-        const preLayBox = new THREE.Box3().setFromObject(model.mesh);
-        const preLayCenter = preLayBox.getCenter(new THREE.Vector3());
-
-        this.saveState('按面放平');
-
         this._clearFaceHighlight();
 
         // 取消选中，直接操作 mesh，避免 proxy 的偏移导致定位错误
@@ -2478,39 +5008,60 @@ class BedPreview {
         }
 
         const meshToUse = intersect.object;
-
-        // 确保 meshToUse 的 matrixWorld 是最新的（deselect 可能改变了父子关系）
         meshToUse.updateMatrixWorld(true);
 
-        // 展开共面区域
-        const region = this._getCoplanarRegion(meshToUse, intersect.faceIndex);
-        if (!region) return;
-
-        // 计算区域的平均法线（统一转到世界空间）
-        let avgNormal;
-        if (!meshToUse.geometry.index) {
-            avgNormal = intersect.face.normal.clone();
-            avgNormal.transformDirection(meshToUse.matrixWorld);
-        } else {
-            avgNormal = new THREE.Vector3();
-            const geometry = meshToUse.geometry;
-            const pos = geometry.attributes.position;
-            const idx = geometry.index;
-            for (const fi of region.faceIndices) {
-                const i0 = idx.getX(fi * 3);
-                const i1 = idx.getX(fi * 3 + 1);
-                const i2 = idx.getX(fi * 3 + 2);
-                const p0 = new THREE.Vector3(pos.getX(i0), pos.getY(i0), pos.getZ(i0));
-                const p1 = new THREE.Vector3(pos.getX(i1), pos.getY(i1), pos.getZ(i1));
-                const p2 = new THREE.Vector3(pos.getX(i2), pos.getY(i2), pos.getZ(i2));
-                const e1 = new THREE.Vector3().copy(p1).sub(p0);
-                const e2 = new THREE.Vector3().copy(p2).sub(p0);
-                const n = new THREE.Vector3().crossVectors(e1, e2).normalize();
-                avgNormal.add(n);
+        // 优先用凸包合并出的"平面"放平：命中该平面并让平面法线朝上
+        const tryHull = (() => {
+            const modelHull = this.models.get(modelId) || model;
+            const planeIdx = this._pickPlane(modelHull, this.raycaster);
+            if (planeIdx < 0) return null;
+            const planes = this._computeHullPlanes(modelHull);
+            if (!planes || !planes[planeIdx]) return null;
+            const plane = planes[planeIdx];
+            // 平面几何顶点（世界坐标，已抬升 0.1）用于求最低点
+            const pos = plane.geometry.attributes.position;
+            const verts = [];
+            for (let i = 0; i < pos.count; i++) {
+                verts.push(new THREE.Vector3(pos.getX(i), pos.getY(i), pos.getZ(i)));
             }
-            avgNormal.normalize();
-            // 转世界空间，与 setFromUnitVectors(avgNormal, up) 中的 up 坐标系一致
-            avgNormal.transformDirection(meshToUse.matrixWorld);
+            return { planeIdx, normal: plane.normal.clone().normalize(), verts, lift: 0.1 };
+        })();
+
+        let avgNormal;
+        let regionVerts = null;
+        if (tryHull) {
+            // 用该平面的法线放平，并用其顶点求最低点贴床
+            avgNormal = tryHull.normal;
+            regionVerts = { geometry: tryHull, faceIndices: null, minZFrom: 'hull' };
+        } else {
+            // 展开共面区域（回退到原始网格）
+            const region = this._getCoplanarRegion(meshToUse, intersect.faceIndex);
+            if (!region) return;
+            // 计算区域的平均法线（统一转到世界空间）
+            if (!meshToUse.geometry.index) {
+                avgNormal = intersect.face.normal.clone();
+                avgNormal.transformDirection(meshToUse.matrixWorld);
+            } else {
+                avgNormal = new THREE.Vector3();
+                const geometry = meshToUse.geometry;
+                const pos = geometry.attributes.position;
+                const idx = geometry.index;
+                for (const fi of region.faceIndices) {
+                    const i0 = idx.getX(fi * 3);
+                    const i1 = idx.getX(fi * 3 + 1);
+                    const i2 = idx.getX(fi * 3 + 2);
+                    const p0 = new THREE.Vector3(pos.getX(i0), pos.getY(i0), pos.getZ(i0));
+                    const p1 = new THREE.Vector3(pos.getX(i1), pos.getY(i1), pos.getZ(i1));
+                    const p2 = new THREE.Vector3(pos.getX(i2), pos.getY(i2), pos.getZ(i2));
+                    const e1 = new THREE.Vector3().copy(p1).sub(p0);
+                    const e2 = new THREE.Vector3().copy(p2).sub(p0);
+                    const n = new THREE.Vector3().crossVectors(e1, e2).normalize();
+                    avgNormal.add(n);
+                }
+                avgNormal.normalize();
+                avgNormal.transformDirection(meshToUse.matrixWorld);
+            }
+            regionVerts = { geometry: meshToUse.geometry, faceIndices: region.faceIndices, minZFrom: 'mesh' };
         }
 
         // 用平均法线做旋转
@@ -2524,46 +5075,90 @@ class BedPreview {
         model.mesh.quaternion.copy(worldQuat);
         model.mesh.updateMatrixWorld(true);
 
-        // 将区域所有顶点转到世界坐标，找最低点
-        const posAttr = meshToUse.geometry.attributes.position;
-        let minZ = Infinity;
-        const worldPos = new THREE.Vector3();
-        for (const fi of region.faceIndices) {
-            const verts = [];
-            if (meshToUse.geometry.index) {
-                const idx = meshToUse.geometry.index;
-                verts.push(idx.getX(fi * 3), idx.getX(fi * 3 + 1), idx.getX(fi * 3 + 2));
-            } else {
-                verts.push(fi * 3, fi * 3 + 1, fi * 3 + 2);
-            }
-            for (const vi of verts) {
-                worldPos.set(posAttr.getX(vi), posAttr.getY(vi), posAttr.getZ(vi));
-                worldPos.applyMatrix4(meshToUse.matrixWorld);
-                if (worldPos.z < minZ) minZ = worldPos.z;
-            }
-        }
-
-        if (isFinite(minZ) && Math.abs(minZ) > 0.001) {
-            model.mesh.position.z -= minZ;
+        // 贴床：用模型整体包围盒，把最低点落到 z=0，避免用世界顶点旋转导致的坐标爆炸
+        model.mesh.updateMatrixWorld(true);
+        let box = new THREE.Box3().setFromObject(model.mesh);
+        if (isFinite(box.min.z)) {
+            const liftBottom = box.min.z; // 通常为负或 0，抬到 z=0 即最低点贴床
+            model.mesh.position.z -= liftBottom;
             model.mesh.updateMatrixWorld(true);
         }
 
+        // 放平后让模型在床面范围内：先贴底，再水平约束到 [0, bedSize]
         this.updateSelectionBoxes();
         this.updateTransformInputs();
 
         // 烘焙变换到几何体，避免后续矩阵链漂移
-        this.bakeTransform(model);
+        this.geometryOnlyBake(model);
+        this._invalidateHullCache(model);
 
-        // 强制恢复放平前的 XY 视觉中心
-        const postLayBox = new THREE.Box3().setFromObject(model.mesh);
-        const postLayCenter = postLayBox.getCenter(new THREE.Vector3());
-        model.mesh.position.x += (preLayCenter.x - postLayCenter.x);
-        model.mesh.position.y += (preLayCenter.y - postLayCenter.y);
-        model.mesh.updateMatrixWorld(true);
+        // 把模型放进 [0, bedSize] 的打印区域内（需在烘焙后按包围盒精确落位）
+        this._seatModelInBed(model);
+        this._invalidateHullCache(model);
+        this.updateSelectionBoxes();
+        this.updateTransformInputs();
 
         this.isLayOnFaceMode = false;
         this._clearFaceHighlight();
+        this._clearTriangulationOverlay();
         this.updateModeButtons();
+
+        // 烘焙 + 落床完成后存稳定快照，撤销/重做都回到完整的放平后状态
+        this.saveState('按面放平');
+    }
+
+    // 仅把当前世界变换烘焙到几何顶点（不触发 proxy 搬运/再贴床，避免二次漂移）
+    geometryOnlyBake(model) {
+        const mesh = model.mesh;
+        mesh.updateMatrixWorld(true);
+        mesh.traverse((child) => {
+            if (child.geometry && child.geometry.attributes.position) {
+                child.geometry.applyMatrix4(child.matrixWorld);
+                child.geometry.computeBoundingBox();
+            }
+        });
+        mesh.position.set(0, 0, 0);
+        mesh.quaternion.identity();
+        mesh.scale.set(1, 1, 1);
+        mesh.updateMatrixWorld(true);
+        this._invalidateHullCache(model);
+    }
+
+    // 把模型整体放进所属盘范围内（世界坐标），并贴床（z 最低=0）
+    _seatModelInBed(model, bound) {
+        if (!model || !model.mesh) return;
+        const bed = bound !== undefined ? bound : 270;
+        const mesh = model.mesh;
+        const box = new THREE.Box3().setFromObject(mesh);
+        // 贴床：最低点 z=0
+        mesh.position.z -= box.min.z;
+        mesh.updateMatrixWorld(true);
+        const box2 = new THREE.Box3().setFromObject(mesh);
+        // 所属盘的世界范围（以盘中心为基准）
+        const pc = this._getPlateWorldPos(model.plateId || this.freePlateId);
+        const half = bed / 2;
+        const pMinX = pc.x - half, pMaxX = pc.x + half;
+        const pMinY = pc.y - half, pMaxY = pc.y + half;
+        // 水平放到所属盘中心
+        const cx = (box2.min.x + box2.max.x) / 2;
+        const cy = (box2.min.y + box2.max.y) / 2;
+        mesh.position.x += pc.x - cx;
+        mesh.position.y += pc.y - cy;
+        mesh.updateMatrixWorld(true);
+        // 终检：确保所有顶点都在所属盘内
+        const box3 = new THREE.Box3().setFromObject(mesh);
+        let minX = box3.min.x, minY = box3.min.y, minZ3 = box3.min.z;
+        let maxX = box3.max.x, maxY = box3.max.y, maxZ3 = box3.max.z;
+        if (minX < pMinX) mesh.position.x += (pMinX - minX);
+        if (minY < pMinY) mesh.position.y += (pMinY - minY);
+        if (minZ3 < 0) mesh.position.z += (-minZ3);
+        if (maxX > pMaxX) mesh.position.x -= (maxX - pMaxX);
+        if (maxY > pMaxY) mesh.position.y -= (maxY - pMaxY);
+        mesh.updateMatrixWorld(true);
+        if (model._transformProxy) {
+            model._transformProxy.position.copy(mesh.position);
+            model._transformProxy.updateMatrixWorld(true);
+        }
     }
 
     updateModeButtons() {
@@ -2588,10 +5183,9 @@ class BedPreview {
 
     resetScale() {
         if (this.selectedModels.size !== 1) return;
-        this.saveState();
         const modelId = Array.from(this.selectedModels)[0];
         const model = this.models.get(modelId);
-        if (!model) return;
+        if (!model || model._isCalibration) return;
 
         model.mesh.updateMatrixWorld(true);
         model.mesh.scale.set(1, 1, 1);
@@ -2607,15 +5201,16 @@ class BedPreview {
         document.getElementById('scale-z').value = '100.00';
 
         this.lockZAxis();
+        if (!model._groupData) this.bakeTransform(model);
         this.updateSelectionBoxes();
+        this.saveState('重置缩放');
     }
 
     resetPosition() {
         if (this.selectedModels.size !== 1) return;
-        this.saveState();
         const modelId = Array.from(this.selectedModels)[0];
         const model = this.models.get(modelId);
-        if (!model) return;
+        if (!model || model._isCalibration) return;
 
         const transformSource = model._transformProxy || model.mesh;
         transformSource.updateMatrixWorld(true);
@@ -2628,17 +5223,20 @@ class BedPreview {
         transformSource.updateMatrixWorld(true);
 
         this.lockZAxis();
+        if (!model._groupData) this.bakeTransform(model);
         this.updateSelectionBoxes();
         this.updateTransformInputs();
+        this.saveState('重置位置');
     }
 
     resetRotation() {
         if (this.selectedModels.size !== 1) return;
-        this.saveState();
         const modelId = Array.from(this.selectedModels)[0];
         const model = this.models.get(modelId);
         if (!model) return;
 
+        if (!model._accumRotation) model._accumRotation = new THREE.Euler(0, 0, 0, 'XYZ');
+        model._accumRotation.set(0, 0, 0);
         const transformSource = model._transformProxy || model.mesh;
         transformSource.rotation.set(0, 0, 0);
 
@@ -2647,21 +5245,24 @@ class BedPreview {
         document.getElementById('rot-z').value = '0.00';
 
         this.lockZAxis();
+        if (!model._groupData) this.bakeTransform(model);
         this.updateSelectionBoxes();
+        this.saveState('重置旋转');
     }
 
     applyScaleFromInputs() {
         if (this.selectedModels.size !== 1) return;
-        this.saveState();
         const modelId = Array.from(this.selectedModels)[0];
         const model = this.models.get(modelId);
-        if (!model) return;
+        if (!model || model._isCalibration) return;
 
         const isUniform = document.getElementById('uniform-scale').checked;
         let sx = parseFloat(document.getElementById('scale-x').value) || 100;
         let sy = parseFloat(document.getElementById('scale-y').value) || 100;
         let sz = parseFloat(document.getElementById('scale-z').value) || 100;
         sx /= 100; sy /= 100; sz /= 100;
+
+        const scaleTarget = model._transformProxy || model.mesh;
 
         if (isUniform) {
             // 用世界缩放做均匀缩放基准，避免 _transformProxy/mesh 局部值不一致
@@ -2670,25 +5271,32 @@ class BedPreview {
             const diffs = [Math.abs(sx - ws.x), Math.abs(sy - ws.y), Math.abs(sz - ws.z)];
             const uniformScale = diffs[0] >= diffs[1] && diffs[0] >= diffs[2] ? sx : diffs[1] >= diffs[2] ? sy : sz;
             sx = sy = sz = uniformScale;
-            const displayValue = (uniformScale * 100).toFixed(2);
-            document.getElementById('scale-x').value = displayValue;
-            document.getElementById('scale-y').value = displayValue;
-            document.getElementById('scale-z').value = displayValue;
         }
 
-        // 有 _transformProxy 时修改 proxy 的 scale，否则修改 mesh
-        const scaleTarget = model._transformProxy || model.mesh;
+        // 先刷数字：把目标缩放% 与换算出的目标大小mm 同步写入两个框（数字先变，均立即反映）
+        document.getElementById('scale-x').value = (sx * 100).toFixed(2);
+        document.getElementById('scale-y').value = (sy * 100).toFixed(2);
+        document.getElementById('scale-z').value = (sz * 100).toFixed(2);
+        const curWorld = new THREE.Vector3();
+        model.mesh.getWorldScale(curWorld);
+        const curSize = new THREE.Box3().setFromObject(model.mesh).getSize(new THREE.Vector3());
+        const wxs = curWorld.x || 1, wys = curWorld.y || 1, wzs = curWorld.z || 1;
+        document.getElementById('size-x').value = (curSize.x * sx / wxs).toFixed(2);
+        document.getElementById('size-y').value = (curSize.y * sy / wys).toFixed(2);
+        document.getElementById('size-z').value = (curSize.z * sz / wzs).toFixed(2);
+
+        // 再放大：同步施加缩放后模型在下一帧渲染体现（数字先变、图后放大，同帧完成）
         scaleTarget.scale.set(sx, sy, sz);
         this.lockZAxis();
         this.updateSelectionBoxes();
+        this.saveState('缩放');
     }
 
     applySizeFromInputs() {
         if (this.selectedModels.size !== 1) return;
-        this.saveState();
         const modelId = Array.from(this.selectedModels)[0];
         const model = this.models.get(modelId);
-        if (!model) return;
+        if (!model || model._isCalibration) return;
 
         const sx = parseFloat(document.getElementById('size-x').value) || 0;
         const sy = parseFloat(document.getElementById('size-y').value) || 0;
@@ -2711,27 +5319,31 @@ class BedPreview {
         if (isUniform) {
             const newScale = Math.max(newScaleX, newScaleY, newScaleZ);
             newScaleX = newScaleY = newScaleZ = newScale;
-            const newDisplayX = (baseX * newScale).toFixed(2);
-            const newDisplayY = (baseY * newScale).toFixed(2);
-            const newDisplayZ = (baseZ * newScale).toFixed(2);
-            document.getElementById('size-x').value = newDisplayX;
-            document.getElementById('size-y').value = newDisplayY;
-            document.getElementById('size-z').value = newDisplayZ;
+            document.getElementById('size-x').value = (baseX * newScale).toFixed(2);
+            document.getElementById('size-y').value = (baseY * newScale).toFixed(2);
+            document.getElementById('size-z').value = (baseZ * newScale).toFixed(2);
         }
 
-        // 有 _transformProxy 时修改 proxy 的 scale，否则修改 mesh
+        // 有 _transformProxy 时修改 proxy 的 scale，否则修改 mesh（不烘焙，与缩放输入一致）
         const scaleTarget = model._transformProxy || model.mesh;
+
+        // 先刷数字：把换算出的目标缩放% 同步写入框里（数字先变，立即反映）
+        document.getElementById('scale-x').value = (newScaleX * 100).toFixed(2);
+        document.getElementById('scale-y').value = (newScaleY * 100).toFixed(2);
+        document.getElementById('scale-z').value = (newScaleZ * 100).toFixed(2);
+
+        // 再放大：同步施加缩放后模型在下一帧渲染体现（数字先变、图后放大，同帧完成）
         scaleTarget.scale.set(newScaleX, newScaleY, newScaleZ);
         this.lockZAxis();
         this.updateSelectionBoxes();
+        this.saveState('尺寸');
     }
 
     applyPositionFromInputs() {
         if (this.selectedModels.size !== 1) return;
-        this.saveState();
         const modelId = Array.from(this.selectedModels)[0];
         const model = this.models.get(modelId);
-        if (!model) return;
+        if (!model || model._isCalibration) return;
 
         const x = parseFloat(document.getElementById('pos-x').value) || 0;
         const y = parseFloat(document.getElementById('pos-y').value) || 0;
@@ -2739,17 +5351,24 @@ class BedPreview {
         if (model._transformProxy) {
             model._transformProxy.position.x = x;
             model._transformProxy.position.y = y;
+            // 关键：赋值后立即刷新 proxy 的 matrix 与 matrixWorld，
+            // 否则 bakeTransform 用 mesh.updateMatrixWorld 时读到的是陈旧的 proxy.matrixWorld，
+            // 用户设置的位置不会烤进顶点，模型就不会移动（Gizmo 因内部实时刷新而不受影响）。
+            model._transformProxy.updateMatrix();
+            model._transformProxy.updateMatrixWorld(true);
         } else {
             model.mesh.position.x = x;
             model.mesh.position.y = y;
+            model.mesh.updateMatrix();
         }
         this.lockZAxis();
+        if (!model._groupData) this.bakeTransform(model);
         this.updateSelectionBoxes();
+        this.saveState('移动');
     }
 
     applyRotationFromInputs() {
         if (this.selectedModels.size !== 1) return;
-        this.saveState();
         const modelId = Array.from(this.selectedModels)[0];
         const model = this.models.get(modelId);
         if (!model) return;
@@ -2758,13 +5377,23 @@ class BedPreview {
         const y = (parseFloat(document.getElementById('rot-y').value) || 0) * Math.PI / 180;
         const z = (parseFloat(document.getElementById('rot-z').value) || 0) * Math.PI / 180;
 
+        if (!model._accumRotation) model._accumRotation = new THREE.Euler(0, 0, 0, 'XYZ');
+        const dx = x - model._accumRotation.x;
+        const dy = y - model._accumRotation.y;
+        const dz = z - model._accumRotation.z;
         if (model._transformProxy) {
-            model._transformProxy.rotation.set(x, y, z);
+            model._transformProxy.rotation.set(dx, dy, dz);
+            // 与位置输入同理：赋值后立即刷新 proxy 矩阵，确保旋转烤进顶点
+            model._transformProxy.updateMatrix();
+            model._transformProxy.updateMatrixWorld(true);
         } else {
-            model.mesh.rotation.set(x, y, z);
+            model.mesh.rotation.set(dx, dy, dz);
+            model.mesh.updateMatrix();
         }
         this.lockZAxis();
+        if (!model._groupData) this.bakeTransform(model);
         this.updateSelectionBoxes();
+        this.saveState('旋转');
     }
 
     onMouseClick(event) {
@@ -2774,9 +5403,24 @@ class BedPreview {
         this.mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
         this.mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
 
+        // 屏幕坐标命中检测盘操作按钮（不被 3D 面方向影响）
+        const hitAction = this._hitTestPlateAction(event.clientX, event.clientY);
+        if (hitAction) {
+            this._handlePlateActionClick(hitAction.action, hitAction.plateId, event);
+            return;
+        }
+
         this.raycaster.setFromCamera(this.mouse, this.camera);
 
         const objectsToTest = [];
+        // 盘板本体（点击可切换当前盘 + 创建控件到该板）
+        if (this.plateBoards) {
+            this.plateBoards.forEach((group) => {
+                group.traverse((child) => {
+                    if (child.isMesh) objectsToTest.push(child);
+                });
+            });
+        }
         this.models.forEach(model => {
             if (model.visible) {
                 model.mesh.traverse((child) => {
@@ -2795,10 +5439,39 @@ class BedPreview {
         }
 
         const intersects = this.raycaster.intersectObjects(objectsToTest);
+        // 按距离排序：模型在盘板上方时优先命中模型，避免盘板挡住模型点击
+        if (intersects.length > 1) intersects.sort((a, b) => a.distance - b.distance);
 
         if (intersects.length > 0) {
             let targetMesh = intersects[0].object;
+
+        // 点击擦料塔：选中整座塔（外观两色、实质一个对象，像模型一样拖拽移动，禁止缩放旋转）
+        if (targetMesh.userData && targetMesh.userData.isTower) {
+            this.clearSelection();
+            // 解析到塔对象（group）：整塔一体，不区分左右半块
+            const towerGroup = targetMesh.userData.towerGroup || targetMesh;
+            this._selectedTower = towerGroup;
+            this._showTowerSelection(towerGroup);
+            return;
+        }
+
+            // 点击盘板本体：只有点到"非当前激活"的板才切换盘；
+            // 点到当前激活板视为点击板上的模型（不拦截，继续走模型命中）。
+            let hitPlateId = null;
+            while (targetMesh) {
+                if (targetMesh.userData && targetMesh.userData.plateId !== undefined) {
+                    hitPlateId = targetMesh.userData.plateId;
+                    break;
+                }
+                targetMesh = targetMesh.parent;
+            }
+            if (hitPlateId !== null && this.plates.has(hitPlateId) && hitPlateId !== this.currentPlateId) {
+                this.setCurrentPlate(hitPlateId);
+                return;
+            }
+
             let modelId = null;
+            targetMesh = intersects[0].object;
 
             while (targetMesh) {
                 if (targetMesh.userData.modelId !== undefined) {
@@ -2824,6 +5497,75 @@ class BedPreview {
             }
         } else {
             this.clearSelection();
+        }
+    }
+
+    // 处理盘操作 3D 按钮点击
+    // 屏幕范围命中检测盘操作按钮：把每个按钮的世界坐标投影到屏幕，用矩形区域判定
+    _hitTestPlateAction(clientX, clientY) {
+        const btn = this._hitTestPlateButtonMesh(clientX, clientY);
+        if (!btn) return null;
+        return { action: btn.userData.action, plateId: btn.userData.plateId };
+    }
+
+    _hitTestPlateButtonMesh(clientX, clientY) {
+        if (!this.plateActions || this.plateActions.length === 0) return null;
+        const rect = this.renderer.domElement.getBoundingClientRect();
+        const size = 40; // 按钮在屏幕上的命中半径（像素）
+        let best = null;
+        let bestDist = size;
+        for (let i = 0; i < this.plateActions.length; i++) {
+            const btn = this.plateActions[i];
+            const v = new THREE.Vector3();
+            btn.getWorldPosition(v);
+            v.project(this.camera);
+            const sx = (v.x * 0.5 + 0.5) * rect.width + rect.left;
+            const sy = (-v.y * 0.5 + 0.5) * rect.height + rect.top;
+            const d = Math.hypot(clientX - sx, clientY - sy);
+            if (d <= bestDist) {
+                bestDist = d;
+                best = btn;
+            }
+        }
+        return best;
+    }
+
+    _handlePlateActionClick(action, plateId, event) {
+        if (action === 'add') {
+            this.addPlate();
+        } else if (action === 'lock') {
+            this.toggleLockPlate(plateId);
+        } else if (action === 'front') {
+            this.movePlateToFront(plateId);
+        } else if (action === 'del') {
+            // 先清掉选中，避免删除盘时残留选中导致列表异常
+            this.clearSelection();
+            this.deletePlate(plateId);
+        }
+        if (event && event.stopPropagation) event.stopPropagation();
+    }
+
+    // 鼠标悬停/按下的按钮高亮反馈：放大(hover) + 缩小(press)
+    _curPlateHoverBtn = null;
+
+    _setPlateButtonHover(btn, on) {
+        if (!btn) return;
+        const base = 1;
+        if (on) {
+            btn.scale.set(1.12, 1.12, 1.12);
+            this._curPlateHoverBtn = btn;
+        } else {
+            btn.scale.set(base, base, base);
+            if (this._curPlateHoverBtn === btn) this._curPlateHoverBtn = null;
+        }
+    }
+
+    _setPlateButtonPress(btn, on) {
+        if (!btn) return;
+        if (on) {
+            btn.scale.set(0.85, 0.85, 0.85);
+        } else {
+            btn.scale.set(1.12, 1.12, 1.12);
         }
     }
 
@@ -2892,9 +5634,12 @@ class BedPreview {
 
         document.getElementById('clear-all-models')?.addEventListener('click', () => this.clearAllModels());
 
+        this.renderPlates();
+
         document.getElementById('btn-save')?.addEventListener('click', () => this.saveProject());
         document.getElementById('btn-undo')?.addEventListener('click', () => this.undo());
         document.getElementById('btn-redo')?.addEventListener('click', () => this.redo());
+        document.getElementById('btn-calibrate')?.addEventListener('click', () => this.loadCalibrationModel());
 
         // 设置按钮
         document.getElementById('btn-settings')?.addEventListener('click', () => this.openSettingsDialog());
@@ -2930,6 +5675,26 @@ class BedPreview {
             window.pywebview?.api?.window_close();
         });
 
+        // 关闭到托盘确认弹窗按钮
+        document.getElementById('tray-close-minimize')?.addEventListener('click', () => {
+            document.getElementById('tray-close-overlay')?.classList.add('hidden');
+            window.pywebview?.api?.tray_confirm_close('minimize');
+        });
+        document.getElementById('tray-close-exit')?.addEventListener('click', () => {
+            document.getElementById('tray-close-overlay')?.classList.add('hidden');
+            window.pywebview?.api?.tray_confirm_close('exit');
+        });
+
+        // 暴露全局函数供 Python evaluate_js 调用
+        // canMinimize: true 显示"最小化到托盘"按钮; false 只显示"退出"
+        window.showCloseTrayDialog = (canMinimize = true) => {
+            const minimizeBtn = document.getElementById('tray-close-minimize');
+            if (minimizeBtn) {
+                minimizeBtn.style.display = canMinimize ? '' : 'none';
+            }
+            document.getElementById('tray-close-overlay')?.classList.remove('hidden');
+        };
+
         // 标题栏拖拽（仅在非按钮区域触发手动窗口拖拽）
         const titleBar = document.getElementById('title-bar');
         if (titleBar) {
@@ -2953,23 +5718,55 @@ class BedPreview {
         document.getElementById('nav-home')?.addEventListener('click', () => this.switchToHome());
         document.getElementById('nav-prepare')?.addEventListener('click', () => this.switchToPrepare());
         document.getElementById('nav-preview')?.addEventListener('click', () => this.switchToPreview());
+        document.getElementById('nav-flat')?.addEventListener('click', () => this.switchToFlat());
+        document.getElementById('nav-device')?.addEventListener('click', () => this.switchToDevice());
         document.getElementById('nav-calibrate')?.addEventListener('click', () => this.switchToCalibrate());
 
         // 首页侧边栏导航
         document.getElementById('sidebar-nav-home')?.addEventListener('click', () => this.switchToHome());
         document.getElementById('sidebar-nav-prepare')?.addEventListener('click', () => this.switchToPrepare());
+        document.getElementById('sidebar-nav-flat')?.addEventListener('click', () => this.switchToFlat());
+        document.getElementById('sidebar-nav-device')?.addEventListener('click', () => this.switchToDevice());
         document.getElementById('sidebar-nav-calibrate')?.addEventListener('click', () => this.switchToCalibrate());
         document.getElementById('sidebar-import-file')?.addEventListener('click', () => this._triggerHomeImport());
         document.getElementById('sidebar-open-project')?.addEventListener('click', () => {
             this.switchToPrepare();
             setTimeout(() => this.openProject(), 100);
         });
-        document.getElementById('sidebar-settings')?.addEventListener('click', () => {
-            document.getElementById('settings-dialog')?.classList.remove('hidden');
-        });
+        document.getElementById('sidebar-settings')?.addEventListener('click', () => this.openSettingsDialog());
         document.getElementById('sidebar-about')?.addEventListener('click', () => {
             document.getElementById('about-dialog')?.classList.remove('hidden');
         });
+        // 复制后处理命令（静默复制，优先 textarea 回退方案，兼容 WebView2）
+        document.getElementById('btn-copy-postprocess')?.addEventListener('click', () => {
+            const cmd = document.getElementById('postprocess-cmd')?.textContent || '';
+            const ta = document.createElement('textarea');
+            ta.value = cmd;
+            ta.style.position = 'fixed';
+            ta.style.opacity = '0';
+            document.body.appendChild(ta);
+            ta.select();
+            try {
+                document.execCommand('copy');
+            } catch (_) {
+                // execCommand 不可用时尝试 clipboard API
+                if (navigator.clipboard && navigator.clipboard.writeText) {
+                    navigator.clipboard.writeText(cmd).catch(() => {});
+                }
+            }
+            document.body.removeChild(ta);
+        });
+        document.getElementById('postprocess-cmd')?.addEventListener('click', () => {
+            document.getElementById('btn-copy-postprocess')?.click();
+        });
+
+        if (window.pywebview && window.pywebview.api) {
+            this.refreshPostprocessCommand();
+        } else {
+            window.addEventListener('pywebviewready', () => {
+                this.refreshPostprocessCommand();
+            });
+        }
         document.getElementById('about-close')?.addEventListener('click', () => {
             document.getElementById('about-dialog')?.classList.add('hidden');
         });
@@ -2982,22 +5779,24 @@ class BedPreview {
         // 校准页面交互
         this._initCalibrateUI();
 
-        // 纹理切片按钮
-        document.getElementById('btn-texture-slice')?.addEventListener('click', () => this.doSlicing());
         // 模型切片按钮
         document.getElementById('btn-model-slice')?.addEventListener('click', () => this.doModelSlice());
+        // 重试切片按钮（不唤起新的 Orca，仅重建 pending_slice 并开始轮询）
+        document.getElementById('btn-model-retry')?.addEventListener('click', () => this.retrySlice());
+        // 立即打印按钮
+        document.getElementById('btn-print-gcode')?.addEventListener('click', () => {
+            this.startPrint();
+            this.switchToDevice();
+        });
         // 取消切片按钮
         document.getElementById('btn-cancel-slice')?.addEventListener('click', () => this._cancelSlicing());
-
-        // 开始打印按钮
-        document.getElementById('btn-start-print')?.addEventListener('click', () => this.startPrint());
 
         // 自动摆放卡片按钮
         document.getElementById('arrange-cancel')?.addEventListener('click', () => this.hideArrangeCard());
         document.getElementById('arrange-confirm')?.addEventListener('click', () => this.doAutoArrange());
 
-        // 首页按钮
-        document.getElementById('home-new-project')?.addEventListener('click', () => this.switchToPrepare());
+        // 新建项目：若已有模型则需确认，否则直接重置盘面并进入准备页
+        document.getElementById('home-new-project')?.addEventListener('click', () => this.newProject());
         document.getElementById('home-open-project')?.addEventListener('click', () => {
             this.switchToPrepare();
             setTimeout(() => this.openProject(), 100);
@@ -3014,20 +5813,32 @@ class BedPreview {
             }
         });
 
-        // 拖拽导入文件
+        // 拖拽导入文件（仅当拖拽内容包含文件时才拦截；文本/内部拖拽放行默认行为）
+        const hasFiles = (e) => {
+            if (!e.dataTransfer) return false;
+            const types = e.dataTransfer.types;
+            for (let i = 0; i < types.length; i++) {
+                if (types[i] === 'Files') return true;
+            }
+            return false;
+        };
+
         document.addEventListener('dragover', (e) => {
+            if (!hasFiles(e)) return;
             e.preventDefault();
             e.stopPropagation();
             document.getElementById('drop-overlay')?.classList.remove('hidden');
         });
 
         document.addEventListener('dragleave', (e) => {
+            if (!hasFiles(e)) return;
             if (e.relatedTarget === null || e.clientX === 0) {
                 document.getElementById('drop-overlay')?.classList.add('hidden');
             }
         });
 
         document.addEventListener('drop', (e) => {
+            if (!hasFiles(e)) return;
             e.preventDefault();
             e.stopPropagation();
             document.getElementById('drop-overlay')?.classList.add('hidden');
@@ -3047,26 +5858,64 @@ class BedPreview {
             document.getElementById(id)?.addEventListener('click', () => this[handler]());
         });
 
-        // 变换输入框回车确认
-        const transformInputIds = [
-            { ids: ['size-x', 'size-y', 'size-z'], handler: 'applySizeFromInputs' },
-            { ids: ['scale-x', 'scale-y', 'scale-z'], handler: 'applyScaleFromInputs' },
-            { ids: ['pos-x', 'pos-y'], handler: 'applyPositionFromInputs' },
-            { ids: ['rot-x', 'rot-y', 'rot-z'], handler: 'applyRotationFromInputs' },
-        ];
-        transformInputIds.forEach(group => {
-            group.ids.forEach(id => {
+        // 变换输入框回车/失焦确认（回车、NumpadEnter、change、blur 均提交，贴近 Orca/Bambu 行为）
+        // 用捕获阶段的委托确保 WebView2/中文输入法下 Enter 也能截获
+        const transformInputMap = {
+            'size-x': 'applySizeFromInputs', 'size-y': 'applySizeFromInputs', 'size-z': 'applySizeFromInputs',
+            'scale-x': 'applyScaleFromInputs', 'scale-y': 'applyScaleFromInputs', 'scale-z': 'applyScaleFromInputs',
+            'pos-x': 'applyPositionFromInputs', 'pos-y': 'applyPositionFromInputs',
+            'rot-x': 'applyRotationFromInputs', 'rot-y': 'applyRotationFromInputs', 'rot-z': 'applyRotationFromInputs',
+        };
+        const _transformIds = new Set(Object.keys(transformInputMap));
+        const _commitTransform = (id) => {
+            if (!id || !_transformIds.has(id)) return;
+            if (this.selectedModels.size !== 1) {
+                // 未单选时不提交（多选/无选中场景下的输入回车不应误改任何模型）
+                return;
+            }
+            this[transformInputMap[id]]();
+        };
+        // 捕获阶段拦截 Enter，小键盘回车用 code 判定，WebView2 下 key 可能为空故补充 keyCode
+        document.addEventListener('keydown', (e) => {
+            const tid = e.target && e.target.id;
+            if (!tid || !_transformIds.has(tid)) return;
+            if (e.key === 'Enter' || e.code === 'NumpadEnter' || e.keyCode === 13) {
+                e.preventDefault();
+                e.stopPropagation();
+                if (typeof e.stopImmediatePropagation === 'function') e.stopImmediatePropagation();
+                _commitTransform(tid);
+                // 延迟失焦，避免与 change/blur 时序冲突；失焦后焦点保护会放开
+                setTimeout(() => { try { e.target.blur(); } catch (_) {} }, 0);
+            }
+        }, true);
+        document.addEventListener('keyup', (e) => {
+            const tid = e.target && e.target.id;
+            if (!tid || !_transformIds.has(tid)) return;
+            if (e.key === 'Enter' || e.code === 'NumpadEnter' || e.keyCode === 13) {
+                e.preventDefault();
+                e.stopPropagation();
+            }
+        }, true);
+        // change/blur 仍作为键盘外的兜底（鼠标点别处、滚轮改值等）
+        const _attachBlurChange = () => {
+            Object.keys(transformInputMap).forEach(id => {
                 const el = document.getElementById(id);
-                if (el) {
-                    el.addEventListener('keydown', (e) => {
-                        if (e.key === 'Enter') {
-                            e.preventDefault();
-                            this[group.handler]();
-                        }
-                    });
-                }
+                if (!el || el._mkpBound) return;
+                el._mkpBound = true;
+                let _pending = false;
+                const once = () => {
+                    if (_pending) return;
+                    _pending = true;
+                    _commitTransform(id);
+                    setTimeout(() => { _pending = false; }, 0);
+                };
+                el.addEventListener('change', once);
+                el.addEventListener('blur', once);
             });
-        });
+        };
+        _attachBlurChange();
+        // 面板显隐后可能重建，延迟再绑一次兜底
+        setTimeout(_attachBlurChange, 800);
 
         // 使用 click 事件直接处理点击
         this.renderer.domElement.addEventListener('click', (e) => {
@@ -3081,24 +5930,53 @@ class BedPreview {
                 this.updateTransformInputs();
                 this.updateSelectionBoxes();
             }
-            if (this.isFreeDragging) {
+            if (this.isFreeDragging || this._towerDrag) {
                 this.handleFreeDrag(e);
+            }
+            // 盘操作按钮悬停高亮
+            if (this.plateActions) {
+                const hit = this._hitTestPlateButtonMesh(e.clientX, e.clientY);
+                const prev = this._curPlateHoverBtn;
+                if (hit) {
+                    if (prev && prev !== hit) this._setPlateButtonHover(prev, false);
+                    this._setPlateButtonHover(hit, true);
+                } else if (prev) {
+                    this._setPlateButtonHover(prev, false);
+                }
             }
         });
 
         this.renderer.domElement.addEventListener('mousedown', (e) => {
             if (e.button === 0) {
+                // 盘操作按钮按下反馈
+                if (this.plateActions) {
+                    const hit = this._hitTestPlateButtonMesh(e.clientX, e.clientY);
+                    if (hit) this._setPlateButtonPress(hit, true);
+                }
                 this.handleMouseDown(e);
             }
         });
 
         this.renderer.domElement.addEventListener('mouseup', (e) => {
             if (e.button === 0) {
+                // 释放按钮按下反馈
+                if (this.plateActions) {
+                    this.plateActions.forEach((b) => {
+                        if (this._curPlateHoverBtn === b) this._setPlateButtonHover(b, true);
+                        else b.scale.set(1, 1, 1);
+                    });
+                }
                 this.handleMouseUp(e);
             }
         });
 
         document.addEventListener('keydown', (e) => {
+            // 焦点在输入框/文本域时，放行默认行为（粘贴/全选等）
+            const tag = document.activeElement ? document.activeElement.tagName : '';
+            const isInput = tag === 'INPUT' || tag === 'TEXTAREA' ||
+                            document.activeElement?.isContentEditable;
+            if (isInput) return;
+
             if ((e.ctrlKey || e.metaKey) && e.key === 'z' && !e.shiftKey) {
                 e.preventDefault();
                 this.undo();
@@ -3137,10 +6015,57 @@ class BedPreview {
 
         this.raycaster.setFromCamera(this.mouse, this.camera);
 
+        // 擦料塔：直接命中任意塔即可拖拽（像拖动模型一样，禁止缩放旋转）—— 已锁定的盘禁止编辑塔位置
+        if (this.plateBoards) {
+            const towerMeshes = [];
+            this.plateBoards.forEach((group) => {
+                group.traverse((o) => { if (o.isMesh && o.userData && o.userData.isTower) towerMeshes.push(o); });
+            });
+            if (towerMeshes.length) {
+                const hits = this.raycaster.intersectObjects(towerMeshes, false);
+                if (hits.length > 0) {
+                    const hitMesh = hits[0].object;
+                    // 解析到塔对象（group）——整塔一体
+                    const tower = hitMesh.userData.towerGroup || hitMesh;
+                    const towerPlateId = tower.userData ? tower.userData.plateId : null;
+                    if (towerPlateId != null && this.isPlateLocked(towerPlateId)) {
+                        const plateName = this.plates.get(towerPlateId)?.name || `盘 ${towerPlateId}`;
+                        this.showToast(`「${plateName}」已锁定，无法移动擦嘴塔`, 'warning');
+                        // 已锁定时不选中也不进入拖拽，避免后续可拖动
+                        if (this._selectedTower) {
+                            this._selectedTower = null;
+                            this._hideTowerSelection();
+                        }
+                        return;
+                    }
+                    this._selectedTower = tower;
+                    this._showTowerSelection(tower);
+                    this._towerDrag = {
+                        tower,
+                        plateId: tower.userData.plateId,
+                        baseX: tower.position.x,
+                        baseY: tower.position.y,
+                    };
+                    this.orbitControls.enabled = false;
+                    return;
+                }
+            }
+        }
+
+        // 选中的擦料塔（若上一步没命中，则取消选中）
+        if (this._selectedTower && this._towerDrag === null) {
+            const box = new THREE.Box3().setFromObject(this._selectedTower);
+            const hit = this.raycaster.ray.intersectBox(box, new THREE.Vector3());
+            if (hit === null) {
+                this._selectedTower = null;
+                this._hideTowerSelection();
+            }
+        }
+
         if (this.selectedModels.size === 1) {
             const selectedModelId = Array.from(this.selectedModels)[0];
             const model = this.models.get(selectedModelId);
-            if (model && model.visible) {
+            if (model && model.visible && !this.isModelLocked(selectedModelId)) {
                 const box = new THREE.Box3().setFromObject(model.mesh);
                 const intersects = this.raycaster.ray.intersectBox(box, new THREE.Vector3());
 
@@ -3155,6 +6080,34 @@ class BedPreview {
     }
 
     handleFreeDrag(e) {
+        // 擦料塔拖拽：在塔当前高度平面移动 —— 已锁盘禁止拖动
+        if (this._towerDrag && this._towerDrag.tower) {
+            const dragPlateId = this._towerDrag.plateId;
+            if (dragPlateId != null && this.isPlateLocked(dragPlateId)) {
+                this._towerDrag = null;
+                if (this._selectedTower) { this._selectedTower = null; this._hideTowerSelection(); }
+                return;
+            }
+            const rect = this.renderer.domElement.getBoundingClientRect();
+            const mouseX = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+            const mouseY = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+            const ray = new THREE.Raycaster();
+            ray.setFromCamera(new THREE.Vector2(mouseX, mouseY), this.camera);
+            const tower = this._towerDrag.tower;
+            const plane = new THREE.Plane(new THREE.Vector3(0, 0, 1), -tower.position.z);
+            const inter = new THREE.Vector3();
+            if (ray.ray.intersectPlane(plane, inter)) {
+                const center = this._getPlateWorldPos(this._towerDrag.plateId);
+                // 限制在盘内
+                const halfW = this.bedSize.x / 2;
+                const halfD = this.bedSize.y / 2;
+                tower.position.x = Math.max(center.x - halfW, Math.min(center.x + halfW, inter.x));
+                tower.position.y = Math.max(center.y - halfD, Math.min(center.y + halfD, inter.y));
+                tower.updateMatrixWorld(true);
+                if (this._towerSelHelper) this._towerSelHelper.update();
+            }
+            return;
+        }
         if (!this.isFreeDragging || !this.freeDragModel) return;
 
         const rect = this.renderer.domElement.getBoundingClientRect();
@@ -3175,8 +6128,17 @@ class BedPreview {
         raycaster.ray.intersectPlane(plane, intersection);
 
         if (intersection) {
-            transformSource.position.x = intersection.x;
-            transformSource.position.y = intersection.y;
+            // 交点是世界坐标，需转成 transformSource 父级（盘容器/自由区）的局部坐标
+            const parentObj = transformSource.parent;
+            if (parentObj) {
+                parentObj.updateMatrixWorld(true);
+                const local = parentObj.worldToLocal(intersection.clone());
+                transformSource.position.x = local.x;
+                transformSource.position.y = local.y;
+            } else {
+                transformSource.position.x = intersection.x;
+                transformSource.position.y = intersection.y;
+            }
         }
 
         transformSource.updateMatrixWorld(true);
@@ -3186,9 +6148,31 @@ class BedPreview {
     }
 
     handleMouseUp(e) {
+        if (this._towerDrag && this._towerDrag.tower) {
+            const dragPlateId = this._towerDrag.plateId;
+            if (dragPlateId != null && this.isPlateLocked(dragPlateId)) {
+                // 已锁定时撤销拖动，不保存位置
+                this._towerDrag = null;
+                if (this._selectedTower) { this._selectedTower = null; this._hideTowerSelection(); }
+            } else {
+                // 把塔当前位置存入该盘的塔偏移（相对盘中心），供 wipe_tower 用
+                const center = this._getPlateWorldPos(this._towerDrag.plateId);
+                const tower = this._towerDrag.tower;
+                const ox = tower.position.x - center.x;
+                const oy = tower.position.y - center.y;
+                tower.userData.offset = { x: ox, y: oy };
+                const plate = this.plates.get(this._towerDrag.plateId);
+                if (plate) plate.towerOffset = { x: ox, y: oy };
+                this._towerDrag = null;
+                this.saveState('调整擦料塔位置');
+            }
+        }
         if (this.isFreeDragging) {
             this.isFreeDragging = false;
+            // 拖动后按位置归属：模型中心落入某个盘→归属该盘；否则回自由区
+            const dragged = this.freeDragModel;
             this.freeDragModel = null;
+            if (dragged) this._assignModelToPlateByPosition(dragged);
             this.saveState();
         }
 
@@ -3198,6 +6182,7 @@ class BedPreview {
     setupContextMenu() {
         this.contextMenu = document.getElementById('context-menu');
         this.mirrorSubmenu = document.getElementById('mirror-submenu');
+        this.exportModelSubmenu = document.getElementById('export-model-submenu');
 
         this.renderer.domElement.addEventListener('contextmenu', (e) => {
             e.preventDefault();
@@ -3209,6 +6194,8 @@ class BedPreview {
                 const action = item.dataset.action;
                 if (action === 'mirror') {
                     this.showMirrorSubmenu(e);
+                } else if (action === 'export-model') {
+                    this.showExportModelSubmenu(e);
                 } else {
                     this.handleContextMenuAction(action);
                     this.hideContextMenu();
@@ -3218,8 +6205,11 @@ class BedPreview {
             item.addEventListener('mouseenter', (e) => {
                 if (item.dataset.action === 'mirror') {
                     this.showMirrorSubmenu(e);
+                } else if (item.dataset.action === 'export-model') {
+                    this.showExportModelSubmenu(e);
                 } else {
                     this.hideMirrorSubmenu();
+                    this.hideExportModelSubmenu();
                 }
             });
         });
@@ -3232,8 +6222,22 @@ class BedPreview {
             });
         });
 
+        if (this.exportModelSubmenu) {
+            this.exportModelSubmenu.querySelectorAll('.context-menu-item').forEach(item => {
+                item.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    const action = item.dataset.action;
+                    this.handleContextMenuAction(action);
+                    this.hideContextMenu();
+                });
+            });
+        }
+
         document.addEventListener('click', (e) => {
-            if (!this.contextMenu.contains(e.target) && !this.mirrorSubmenu.contains(e.target)) {
+            const inCtx = this.contextMenu.contains(e.target);
+            const inMirror = this.mirrorSubmenu && this.mirrorSubmenu.contains(e.target);
+            const inExport = this.exportModelSubmenu && this.exportModelSubmenu.contains(e.target);
+            if (!inCtx && !inMirror && !inExport) {
                 this.hideContextMenu();
             }
         });
@@ -3287,6 +6291,7 @@ class BedPreview {
         this.contextMenu.style.top = `${y}px`;
         this.contextMenu.classList.remove('hidden');
         this.hideMirrorSubmenu();
+        this.hideExportModelSubmenu();
 
         // 条件显示组合/解组
         const groupBtn = document.getElementById('ctx-group');
@@ -3328,6 +6333,7 @@ class BedPreview {
     hideContextMenu() {
         this.contextMenu.classList.add('hidden');
         this.hideMirrorSubmenu();
+        this.hideExportModelSubmenu();
         this.contextMenuTarget = null;
     }
 
@@ -3350,6 +6356,24 @@ class BedPreview {
 
     hideMirrorSubmenu() {
         this.mirrorSubmenu.classList.add('hidden');
+    }
+
+    showExportModelSubmenu(e) {
+        if (!this.exportModelSubmenu) return;
+        const anchor = this.contextMenu.querySelector('[data-action="export-model"]');
+        if (!anchor) return;
+        const rect = anchor.getBoundingClientRect();
+        this.hideMirrorSubmenu();
+        this.exportModelSubmenu.style.left = `${rect.right + 4}px`;
+        this.exportModelSubmenu.style.top = `${rect.top}px`;
+        this.exportModelSubmenu.classList.remove('hidden');
+        const r2 = this.exportModelSubmenu.getBoundingClientRect();
+        if (r2.right > window.innerWidth) this.exportModelSubmenu.style.left = `${rect.left - r2.width - 4}px`;
+        if (r2.bottom > window.innerHeight) this.exportModelSubmenu.style.top = `${window.innerHeight - r2.height - 10}px`;
+    }
+
+    hideExportModelSubmenu() {
+        if (this.exportModelSubmenu) this.exportModelSubmenu.classList.add('hidden');
     }
 
     handleContextMenuAction(action) {
@@ -3388,6 +6412,190 @@ class BedPreview {
             case 'toggle_printable':
                 this.toggleModelPrintable(this.contextMenuTarget);
                 break;
+            case 'export-glb':
+                this.exportSelectedModelAsGLB(this.contextMenuTarget);
+                break;
+            case 'export-obj':
+                this.exportSelectedModelAsOBJ(this.contextMenuTarget);
+                break;
+        }
+    }
+
+    _getBakedExportBaseName(model) {
+        const raw = (model && model.name) ? model.name : 'model';
+        return raw.replace(/\.[^.]+$/, '') || 'model';
+    }
+
+    _buildBakedOBJPayload(model) {
+        const meshes = [];
+        const texMap = {};
+        let textureCounter = 0;
+
+        model.mesh.updateWorldMatrix(true, true);
+        const invModelWorld = model.mesh.matrixWorld.clone().invert();
+        model.mesh.traverse((child) => {
+            if (!child.isMesh) return;
+            const geo = child.geometry.clone();
+            geo.applyMatrix4(child.matrixWorld);
+            geo.applyMatrix4(invModelWorld);
+            geo.computeVertexNormals();
+            let textureName = null;
+            let textureFlipY = true;
+            if (child.material && child.material.map && child.material.map.image) {
+                textureFlipY = child.material.map.flipY !== false;
+                const b64 = this._textureToBase64(child.material.map.image);
+                if (b64) {
+                    textureName = `tex_${textureCounter}.png`;
+                    textureCounter++;
+                    texMap[textureName] = b64;
+                }
+            }
+            meshes.push({ geometry: geo, textureName, textureFlipY });
+        });
+
+        if (meshes.length === 0) return null;
+
+        const modelBase = this._getBakedExportBaseName(model);
+        let objStr = '# Baked by MKPSpectrum\n';
+        const hasTextures = Object.keys(texMap).length > 0;
+        if (hasTextures) objStr += `mtllib ${modelBase}.mtl\n\n`;
+
+        let mtlStr = '# MTL generated by MKPSpectrum\n';
+        let vertexOffset = 0;
+        const usedMatNames = new Set();
+
+        for (const { geometry, textureName, textureFlipY } of meshes) {
+            const pos = geometry.getAttribute('position');
+            const uv = geometry.getAttribute('uv');
+            const norm = geometry.getAttribute('normal');
+            const index = geometry.index;
+            if (!pos || pos.count === 0) continue;
+
+            const matName = textureName ? textureName.replace('.png', '_mat') : 'default_mat';
+            if (!usedMatNames.has(matName)) {
+                usedMatNames.add(matName);
+                mtlStr += `\nnewmtl ${matName}\n`;
+                mtlStr += 'Kd 0.8 0.8 0.8\nKs 0.0 0.0 0.0\nNs 0\nd 1.0\nillum 2\n';
+                if (textureName) {
+                    mtlStr += `map_Kd ${textureName}\n`;
+                    mtlStr += `MKP_flipY ${textureFlipY ? 1 : 0}\n`;
+                }
+            }
+            objStr += `usemtl ${matName}\n`;
+
+            for (let i = 0; i < pos.count; i++) {
+                objStr += `v ${pos.getX(i).toFixed(6)} ${pos.getY(i).toFixed(6)} ${pos.getZ(i).toFixed(6)}\n`;
+            }
+            const hasUv = uv && uv.count > 0;
+            if (hasUv) {
+                for (let i = 0; i < uv.count; i++) objStr += `vt ${uv.getX(i).toFixed(6)} ${uv.getY(i).toFixed(6)}\n`;
+            }
+            const hasNorm = norm && norm.count > 0;
+            if (hasNorm) {
+                for (let i = 0; i < norm.count; i++) objStr += `vn ${norm.getX(i).toFixed(6)} ${norm.getY(i).toFixed(6)} ${norm.getZ(i).toFixed(6)}\n`;
+            }
+            const faceCount = index ? index.count : pos.count;
+            for (let i = 0; i < faceCount; i += 3) {
+                let a, b, c;
+                if (index) {
+                    a = index.getX(i) + 1 + vertexOffset;
+                    b = index.getX(i + 1) + 1 + vertexOffset;
+                    c = index.getX(i + 2) + 1 + vertexOffset;
+                } else {
+                    a = i + 1 + vertexOffset;
+                    b = i + 2 + vertexOffset;
+                    c = i + 3 + vertexOffset;
+                }
+                if (hasUv && hasNorm) objStr += `f ${a}/${a}/${a} ${b}/${b}/${b} ${c}/${c}/${c}\n`;
+                else if (hasUv) objStr += `f ${a}/${a} ${b}/${b} ${c}/${c}\n`;
+                else objStr += `f ${a} ${b} ${c}\n`;
+            }
+            vertexOffset += pos.count;
+        }
+
+        return { obj: objStr, mtl: hasTextures ? mtlStr : '', textures: texMap, name: model.name };
+    }
+
+    async exportSelectedModelAsOBJ(modelId) {
+        const model = this.models.get(modelId);
+        if (!model) { this.showToast('未找到所选模型', 'error'); return; }
+        const payload = this._buildBakedOBJPayload(model);
+        if (!payload) { this.showToast('没有可导出的网格', 'warning'); return; }
+        try {
+            const result = await window.pywebview.api.save_baked_obj_bundle(JSON.stringify(payload));
+            if (!result) { this.showToast('导出已取消或后端无响应', 'warning'); return; }
+            if (result.error === '已取消') return;
+            if (!result.success) { this.showToast('导出失败：' + (result.error || '未知错误'), 'error'); return; }
+            this.showToast('已导出：' + (result.path || ''), 'success');
+        } catch (e) {
+            console.error('[导出OBJ] 异常:', e);
+            this.showToast('导出失败：' + (e.message || String(e)), 'error');
+        }
+    }
+
+    async _buildBakedGLBArrayBuffer(model) {
+        // 把当前在场景中的变换烘焙到顶点后的克隆体导出为 GLB（保留贴图）
+        model.mesh.updateWorldMatrix(true, true);
+        const invModelWorld = model.mesh.matrixWorld.clone().invert();
+        const exportRoot = new THREE.Group();
+        exportRoot.name = this._getBakedExportBaseName(model);
+        model.mesh.traverse((child) => {
+            if (!child.isMesh) return;
+            const geo = child.geometry.clone();
+            geo.applyMatrix4(child.matrixWorld);
+            geo.applyMatrix4(invModelWorld);
+            geo.computeVertexNormals();
+            const mat = child.material ? child.material.clone() : new THREE.MeshStandardMaterial({ color: 0xcccccc });
+            // 关键：GLTFExporter 会从 material.map.image 抽贴图并内嵌到 GLB；clone 的材质仍保留贴图引用
+            const mesh = new THREE.Mesh(geo, mat);
+            mesh.name = child.name || 'mesh';
+            exportRoot.add(mesh);
+        });
+        if (exportRoot.children.length === 0) return null;
+
+        const exporter = new GLTFExporter();
+        const glb = await new Promise((resolve, reject) => {
+            exporter.parse(exportRoot, (result) => resolve(result), (err) => reject(err), { binary: true });
+        });
+        // exporter binary:true 返回 ArrayBuffer
+        if (glb instanceof ArrayBuffer) return glb;
+        if (glb && glb.buffer instanceof ArrayBuffer) return glb.buffer;
+        return glb;
+    }
+
+    _arrayBufferToBase64(buffer) {
+        const bytes = new Uint8Array(buffer);
+        let binary = '';
+        const chunk = 0x8000;
+        for (let i = 0; i < bytes.length; i += chunk) {
+            binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+        }
+        return btoa(binary);
+    }
+
+    async exportSelectedModelAsGLB(modelId) {
+        const model = this.models.get(modelId);
+        if (!model) { this.showToast('未找到所选模型', 'error'); return; }
+        let buffer = null;
+        try {
+            buffer = await this._buildBakedGLBArrayBuffer(model);
+        } catch (e) {
+            console.error('[导出GLB] 烘焙失败:', e);
+            this.showToast('导出失败：' + (e.message || String(e)), 'error');
+            return;
+        }
+        if (!buffer || buffer.byteLength === 0) { this.showToast('没有可导出的网格', 'warning'); return; }
+        const b64 = this._arrayBufferToBase64(buffer);
+        const dataUrl = 'data:application/octet-stream;base64,' + b64;
+        try {
+            const result = await window.pywebview.api.save_baked_glb(dataUrl, model.name || 'model');
+            if (!result) { this.showToast('导出已取消或后端无响应', 'warning'); return; }
+            if (result.error === '已取消') return;
+            if (!result.success) { this.showToast('导出失败：' + (result.error || '未知错误'), 'error'); return; }
+            this.showToast('已导出：' + (result.path || ''), 'success');
+        } catch (e) {
+            console.error('[导出GLB] 保存失败:', e);
+            this.showToast('导出失败：' + (e.message || String(e)), 'error');
         }
     }
 
@@ -3450,36 +6658,32 @@ class BedPreview {
         // 更新 3D 场景中的外观
         this._updateModelPrintAppearance(model);
 
-        this.showToast(`${model.name} 已${model.printable ? '设为可打印' : '设为不可打印'}`, 'info');
         this.updateObjectList();
         this.saveState();
     }
 
-    /** 根据 printable 状态更新模型外观：不可打印 = 灰色半透明 */
+    /** 根据 printable 状态更新模型外观：不可打印 = 灰色半透明；保存的原始材质放在 WeakMap，避免克隆时被 JSON 破坏 */
     _updateModelPrintAppearance(model) {
-        const materials = [];
-
         model.mesh.traverse((child) => {
             if (!child.isMesh) return;
             const mat = child.material;
             if (!mat) return;
 
             if (model.printable) {
-                // 恢复原始材质
-                if (mat.userData._savedMaterial) {
-                    child.material = mat.userData._savedMaterial;
-                    delete mat.userData._savedMaterial;
+                // 恢复原始材质（从 WeakMap 取；取不到说明没有灰化过，就地还原透明度即可）
+                const saved = this._savedPrintMaterials.get(mat);
+                if (saved) {
+                    child.material = saved;
+                    this._savedPrintMaterials.delete(mat);
                 } else {
-                    // 没有 savedMaterial 则只恢复透明度
                     mat.transparent = false;
                     mat.opacity = 1.0;
-                    mat.color.setHex(parseInt(mat.userData._origColorHex || 'ffffff', 16));
                     mat.needsUpdate = true;
                 }
             } else {
                 // 保存原始材质（仅首次）
-                if (!mat.userData._savedMaterial) {
-                    mat.userData._savedMaterial = mat.clone();
+                if (!this._savedPrintMaterials.has(mat)) {
+                    this._savedPrintMaterials.set(mat, mat.clone());
                     mat.userData._origColorHex = mat.color.getHex().toString(16);
                 }
                 // 设为灰色半透明
@@ -3513,7 +6717,10 @@ class BedPreview {
                         child.geometry = child.geometry.clone();
                     }
                     if (child.material) {
-                        child.material = child.material.clone();
+                        // 若源材质处于“不可打印”灰化状态，克隆其已保存的原始材质作为副本底材
+                        const srcMat = child.material;
+                        const saved = this._savedPrintMaterials.get(srcMat);
+                        child.material = (saved || srcMat).clone();
                     }
                 }
             });
@@ -3521,6 +6728,10 @@ class BedPreview {
             const newModelId = this.nextModelId++;
             const newName = count > 1 ? `${model.name} (副本${i})` : `${model.name} (副本)`;
             const newModelObj = new ModelObject(newMesh, newName, newModelId);
+            // 继承源模型的可打印状态与所属盘，避免副本状态与外观/控件不一致；随后重设外观以登记副本自身的原始材质
+            newModelObj.printable = model.printable;
+            newModelObj.plateId = model.plateId;
+            if (model._accumRotation) newModelObj._accumRotation.copy(model._accumRotation);
 
             // 更新克隆体所有子节点的 userData.modelId，否则点击会选中母本
             newMesh.traverse((child) => {
@@ -3538,6 +6749,8 @@ class BedPreview {
 
             this.models.set(newModelId, newModelObj);
             this.scene.add(newMesh);
+            // 仅当副本为不可打印时重设灰色外观并登记副本自身的原始材质，保证后续切换能正确还原
+            if (!newModelObj.printable) this._updateModelPrintAppearance(newModelObj);
 
             const filePath = this.modelFilePaths.get(modelId);
             if (filePath) {
@@ -3584,6 +6797,10 @@ class BedPreview {
                 if (this.cloneTargetId !== null) {
                     this.cloneModel(this.cloneTargetId, Math.max(1, count));
                     this.cloneTargetId = null;
+                    // 勾选「克隆后自动排列」时，克隆完成后对当前盘自动摆放
+                    if (document.getElementById('clone-arrange')?.checked) {
+                        this.doAutoArrange();
+                    }
                 }
                 this.closeCloneDialog();
             });
@@ -3624,6 +6841,9 @@ class BedPreview {
             dragOrig: null,              // rect 原始尺寸
             rects: { blue: null, red: null },
             selected: null,              // 'blue' | 'red'
+            blueLocked: false,           // 绘制红色框后蓝色框锁定，不可移动/缩放
+            correction: null,            // 待应用的偏移差值 {x, y}，未点击确定前不生效
+            panOffset: { x: 0, y: 0 },   // 右键拖拽平移量（缩放后可平移查看图片）
         };
 
         const scene = document.getElementById('cal-scene');
@@ -3653,13 +6873,19 @@ class BedPreview {
         // ---------- 更新 scene 位置/缩放 ----------
         function updateScene() {
             const vpRect = viewport.getBoundingClientRect();
-            // 居中
-            const cx = (vpRect.width - S.imgDisp.w * S.zoom) / 2;
-            const cy = (vpRect.height - S.imgDisp.h * S.zoom) / 2;
-            S.scenePos.x = cx;
-            S.scenePos.y = cy;
-            scene.style.left = cx + 'px';
-            scene.style.top = cy + 'px';
+            const sw = S.imgDisp.w * S.zoom;
+            const sh = S.imgDisp.h * S.zoom;
+            // 居中 + 右键拖拽平移（限制在可视范围内，避免拖出空白）
+            const cx = (vpRect.width - sw) / 2;
+            const cy = (vpRect.height - sh) / 2;
+            const maxX = Math.max(0, (sw - vpRect.width) / 2);
+            const maxY = Math.max(0, (sh - vpRect.height) / 2);
+            S.panOffset.x = Math.max(-maxX, Math.min(maxX, S.panOffset.x));
+            S.panOffset.y = Math.max(-maxY, Math.min(maxY, S.panOffset.y));
+            S.scenePos.x = cx + S.panOffset.x;
+            S.scenePos.y = cy + S.panOffset.y;
+            scene.style.left = S.scenePos.x + 'px';
+            scene.style.top = S.scenePos.y + 'px';
             scene.style.width = S.imgDisp.w + 'px';
             scene.style.height = S.imgDisp.h + 'px';
             scene.style.transform = 'scale(' + S.zoom + ')';
@@ -3679,6 +6905,7 @@ class BedPreview {
             img.classList.remove('cal-image-hidden');
             placeholder.style.display = 'none';
             S.zoom = 1;
+            S.panOffset = { x: 0, y: 0 };
             S.imageLoaded = true;
             updateScene();
         }
@@ -3759,7 +6986,9 @@ class BedPreview {
             S.rects.red = null;
             S.selected = null;
             S.drawMode = null;
-            rectBlue.classList.remove('active', 'selected');
+            S.blueLocked = false;
+            S.correction = null;
+            rectBlue.classList.remove('active', 'selected', 'locked');
             rectRed.classList.remove('active', 'selected');
             document.querySelectorAll('.cal-draw-btn').forEach(b => b.classList.remove('active'));
             scene.classList.remove('drawing');
@@ -3789,6 +7018,13 @@ class BedPreview {
 
         document.getElementById('btn-draw-red').addEventListener('click', function () {
             if (S.rects.red) return;
+            // 开始画红色框后，蓝色定位框固定，不允许再移动/缩放
+            if (S.rects.blue) {
+                S.blueLocked = true;
+                rectBlue.classList.add('locked');
+                rectBlue.classList.remove('selected');
+                statusEl.textContent = '蓝色框已固定，画错了请点击「清除」重新框选';
+            }
             enterDrawMode('red');
             this.classList.add('active');
             document.getElementById('btn-draw-blue').classList.remove('active');
@@ -3799,6 +7035,13 @@ class BedPreview {
         // ---------- 鼠标事件 ----------
         function onMouseDown(e) {
             if (!S.imageLoaded) return;
+            // 右键：按住拖拽平移图片（缩放后可平移查看）
+            if (e.button === 2) {
+                S.dragMode = 'pan';
+                S.dragStart = { x: e.clientX, y: e.clientY };
+                e.preventDefault();
+                return;
+            }
             if (e.button !== 0) return;
 
             const sp = getScenePos(e);
@@ -3818,6 +7061,7 @@ class BedPreview {
             if (target.classList.contains('cal-rect-handle')) {
                 const rectEl = target.closest('.cal-rect');
                 const key = rectEl.id === 'cal-rect-blue' ? 'blue' : 'red';
+                if (key === 'blue' && S.blueLocked) return;  // 蓝色框已锁定，不允许调整尺寸
                 selectRect(key);
                 S.dragMode = 'resize';
                 S.dragRect = key;
@@ -3905,6 +7149,12 @@ class BedPreview {
 
                 d.x = newX; d.y = newY; d.w = newW; d.h = newH;
                 applyRectDOM(S.dragRect);
+            } else if (S.dragMode === 'pan') {
+                // 右键拖拽平移图片
+                S.panOffset.x += e.clientX - S.dragStart.x;
+                S.panOffset.y += e.clientY - S.dragStart.y;
+                S.dragStart = { x: e.clientX, y: e.clientY };
+                updateScene();
             }
 
             if (S.dragMode !== 'draw') updateResult();
@@ -3941,6 +7191,7 @@ class BedPreview {
 
         function hitTestRect(sp) {
             for (const key of ['blue', 'red']) {
+                if (key === 'blue' && S.blueLocked) continue;  // 蓝色框已锁定，不允许移动
                 const d = getRectData(key);
                 if (!d) continue;
                 if (sp.x >= d.x && sp.x <= d.x + d.w &&
@@ -3954,8 +7205,11 @@ class BedPreview {
         scene.addEventListener('mousedown', onMouseDown);
         document.addEventListener('mousemove', onMouseMove);
         document.addEventListener('mouseup', onMouseUp);
+        // 屏蔽右键菜单：右键用于拖拽平移图片
+        scene.addEventListener('contextmenu', (e) => e.preventDefault());
 
         // ---------- 偏移计算 ----------
+        const self = this;
         function updateResult() {
             const b = S.rects.blue;
             const r = S.rects.red;
@@ -3963,6 +7217,7 @@ class BedPreview {
             if (!b || !r) {
                 offsetXEl.textContent = 'X: ---';
                 offsetYEl.textContent = 'Y: ---';
+                S.correction = null;
                 if (!b && !r) statusEl.textContent = '请绘制校准卡范围(蓝)和色块位置(红)';
                 else if (!b) statusEl.textContent = '请先绘制校准卡范围(蓝)';
                 else statusEl.textContent = '请再绘制色块位置(红)';
@@ -3977,12 +7232,19 @@ class BedPreview {
             const scaleX = BLUE_SIZE / b.w;
             const scaleY = BLUE_SIZE / b.h;
 
-            const offX = (rcx - bcx) * scaleX;
-            const offY = (rcy - bcy) * scaleY;
+            // 测量红框中心相对蓝框中心的偏移后换算为修正量：
+            // 偏右 → X 减；偏上 → Y 减（偏下 → Y 加）
+            const corrX = -(rcx - bcx) * scaleX;
+            const corrY = (rcy - bcy) * scaleY;
+            // 只保存差值，不直接写入偏移，等待点击[确定]再叠加到现有偏移上
+            S.correction = { x: corrX, y: corrY };
 
-            offsetXEl.textContent = 'X: ' + offX.toFixed(2) + ' mm';
-            offsetYEl.textContent = 'Y: ' + offY.toFixed(2) + ' mm';
-            statusEl.textContent = '偏移值已计算：红框中心相对于蓝框中心的偏移';
+            offsetXEl.textContent = 'X: ' + (corrX >= 0 ? '+' : '') + corrX.toFixed(2) + ' mm';
+            offsetYEl.textContent = 'Y: ' + (corrY >= 0 ? '+' : '') + corrY.toFixed(2) + ' mm';
+            const sx = (corrX >= 0 ? '加' : '减') + Math.abs(corrX).toFixed(2);
+            const sy = (corrY >= 0 ? '加' : '减') + Math.abs(corrY).toFixed(2);
+            statusEl.textContent = 'X方向' + sx + '，Y方向' + sy + '，点击[确定]叠加到当前偏移(X:' +
+                self.calibrateOffset.x.toFixed(2) + ' Y:' + self.calibrateOffset.y.toFixed(2) + ')';
         }
 
         // ---------- 窗口 resize 时重排 ----------
@@ -4010,34 +7272,85 @@ class BedPreview {
             });
         });
 
-        // 左侧方向键的同步
-        const updateDisplay = () => {
+        // 更新喷墨偏移值显示
+        const _updateOffsetDisplay = () => {
             const xEl = document.getElementById('offset-x');
             const yEl = document.getElementById('offset-y');
-            if (xEl) xEl.textContent = this.calibrateOffset.x.toFixed(2);
-            if (yEl) yEl.textContent = this.calibrateOffset.y.toFixed(2);
+            if (xEl) xEl.value = this.calibrateOffset.x.toFixed(2);
+            if (yEl) yEl.value = this.calibrateOffset.y.toFixed(2);
         };
 
+        // 输入框变更 → 同步到变量
+        const _readOffsetInputsToVars = () => {
+            const xEl = document.getElementById('offset-x');
+            const yEl = document.getElementById('offset-y');
+            if (xEl) this.calibrateOffset.x = parseFloat(xEl.value) || 0;
+            if (yEl) this.calibrateOffset.y = parseFloat(yEl.value) || 0;
+        };
+        ['offset-x', 'offset-y'].forEach(id => {
+            const el = document.getElementById(id);
+            if (el) el.addEventListener('change', () => _readOffsetInputsToVars());
+        });
+
+        // ---------- 确定按钮：把测量差值叠加到当前偏移上 ----------
+        const applyOffsetBtn = document.getElementById('cal-apply-offset');
+        if (applyOffsetBtn) {
+            applyOffsetBtn.addEventListener('click', () => {
+                if (!S.correction) {
+                    statusEl.textContent = '请先绘制校准卡范围(蓝)和色块位置(红)，再点击确定';
+                    return;
+                }
+                const dx = S.correction.x;
+                const dy = S.correction.y;
+                self.calibrateOffset.x += dx;
+                self.calibrateOffset.y += dy;
+                _updateOffsetDisplay();
+                statusEl.textContent = '已应用：X' + (dx >= 0 ? '加' : '减') + Math.abs(dx).toFixed(2) +
+                    '，Y' + (dy >= 0 ? '加' : '减') + Math.abs(dy).toFixed(2) +
+                    ' → 当前偏移 X:' + self.calibrateOffset.x.toFixed(2) +
+                    ' Y:' + self.calibrateOffset.y.toFixed(2);
+                // 差值已消费，防止重复叠加
+                S.correction = null;
+                offsetXEl.textContent = 'X: ---';
+                offsetYEl.textContent = 'Y: ---';
+                // 自动保存到当前配置
+                if (typeof self._saveCurrentConfig === 'function') self._saveCurrentConfig();
+            });
+        }
+
+        // ---------- 使用说明弹窗 ----------
+        const helpOverlay = document.getElementById('cal-help-overlay');
+        const helpBtn = document.getElementById('cal-help-btn');
+        if (helpOverlay && helpBtn) {
+            helpBtn.addEventListener('click', () => helpOverlay.classList.remove('hidden'));
+            const closeHelp = () => helpOverlay.classList.add('hidden');
+            document.getElementById('cal-help-close')?.addEventListener('click', closeHelp);
+            helpOverlay.addEventListener('click', (e) => {
+                if (e.target === helpOverlay) closeHelp();
+            });
+        }
+
+        // 方向键（D-Pad）
         document.getElementById('cal-up')?.addEventListener('click', () => {
             this.calibrateOffset.y += this.calibrateStep;
-            updateDisplay();
+            _updateOffsetDisplay();
         });
         document.getElementById('cal-down')?.addEventListener('click', () => {
             this.calibrateOffset.y -= this.calibrateStep;
-            updateDisplay();
+            _updateOffsetDisplay();
         });
         document.getElementById('cal-left')?.addEventListener('click', () => {
             this.calibrateOffset.x -= this.calibrateStep;
-            updateDisplay();
+            _updateOffsetDisplay();
         });
         document.getElementById('cal-right')?.addEventListener('click', () => {
             this.calibrateOffset.x += this.calibrateStep;
-            updateDisplay();
+            _updateOffsetDisplay();
         });
         document.getElementById('cal-home')?.addEventListener('click', () => {
             this.calibrateOffset.x = 0;
             this.calibrateOffset.y = 0;
-            updateDisplay();
+            _updateOffsetDisplay();
         });
 
         // ---------- 喷墨配置下拉框 ----------
@@ -4049,6 +7362,154 @@ class BedPreview {
         });
         document.getElementById('inkjet-speed').addEventListener('input', function () {
             document.getElementById('inkjet-speed-val').textContent = this.value;
+        });
+        document.getElementById('inkjet-contrast').addEventListener('input', function () {
+            document.getElementById('inkjet-contrast-val').textContent = parseFloat(this.value).toFixed(1);
+        });
+        this._getRepeatCount = () => {
+            const sel = document.querySelector('#inkjet-repeat-select .select-option.selected');
+            return sel ? parseInt(sel.dataset.value) || 1 : 1;
+        };
+        this._setRepeatCount = (val) => {
+            const opts = document.querySelectorAll('#inkjet-repeat-select .select-option');
+            const valDisplay = document.querySelector('#inkjet-repeat-select .select-value');
+            opts.forEach(o => {
+                o.classList.toggle('selected', parseInt(o.dataset.value) === val);
+                if (parseInt(o.dataset.value) === val && valDisplay) valDisplay.textContent = o.textContent;
+            });
+        };
+        // CMY 色调调节联动
+        ['cmy-c', 'cmy-m', 'cmy-y', 'cmy-saturation', 'cmy-brightness'].forEach(id => {
+            document.getElementById(id).addEventListener('input', function () {
+                const v = parseFloat(this.value);
+                const isSigned = id === 'cmy-saturation' || id === 'cmy-brightness';
+                document.getElementById(id + '-val').textContent =
+                    isSigned ? (v >= 0 ? '+' : '') + v.toFixed(2) : v.toFixed(2);
+            });
+        });
+        // CMY 对话框 打开/关闭
+        document.getElementById('btn-cmy-open').addEventListener('click', () => {
+            document.getElementById('cmy-dialog').classList.remove('hidden');
+        });
+        const _closeCmy = () => {
+            document.getElementById('cmy-dialog').classList.add('hidden');
+            // 联动保存
+            const name = this._configValueDisplay?.textContent;
+            if (name && name !== '未配置' && window.pywebview?.api) {
+                window.pywebview.api.save_print_setting(name, JSON.stringify(collectData())).catch(() => {});
+            }
+        };
+        document.getElementById('cmy-close').addEventListener('click', _closeCmy);
+        document.getElementById('cmy-done').addEventListener('click', _closeCmy);
+        // 点击遮罩也关闭
+        document.getElementById('cmy-dialog').addEventListener('click', function (e) {
+            if (e.target === this) _closeCmy();
+        });
+        // CMY 复位按钮
+        document.querySelectorAll('.cmy-reset').forEach(btn => {
+            btn.addEventListener('click', function () {
+                const targetId = this.dataset.target;
+                const defaultVal = this.dataset.default;
+                const slider = document.getElementById(targetId);
+                if (slider) {
+                    slider.value = defaultVal;
+                    const isSigned = targetId === 'cmy-saturation' || targetId === 'cmy-brightness';
+                    const v = parseFloat(defaultVal);
+                    document.getElementById(targetId + '-val').textContent =
+                        isSigned ? (v >= 0 ? '+' : '') + v.toFixed(2) : v.toFixed(2);
+                }
+            });
+        });
+
+        // ---------- 宏名称修改按钮 ----------
+        this._grabMacro = 'GRAB_INKJET_HEAD';
+        this._releaseMacro = 'RELEASE_INKJET_HEAD';
+        this._towerPosX = 10;
+        this._towerPosY = 220;
+        document.getElementById('btn-macro-edit').addEventListener('click', async () => {
+            const result = await this._showMacroDialog();
+            if (result) {
+                this._grabMacro = result.grab;
+                this._releaseMacro = result.release;
+                // 自动保存到当前配置
+                const name = this._configValueDisplay?.textContent;
+                if (name && name !== '未配置' && window.pywebview?.api) {
+                    const data = {
+                        inkjet: {
+                            offset: { ...this.calibrateOffset },
+                            step: this.calibrateStep,
+                            imageOffset: (() => {
+                                const xEl = document.getElementById('cal-img-offset-x');
+                                const yEl = document.getElementById('cal-img-offset-y');
+                                return { x: xEl ? xEl.textContent : '---', y: yEl ? yEl.textContent : '---' };
+                            })(),
+                            density: parseFloat(document.getElementById('inkjet-density').value) || 0.5,
+                            speed: parseInt(document.getElementById('inkjet-speed').value) || 50,
+                            repeat_count: this._getRepeatCount(),
+                            dry_time: parseInt(document.getElementById('inkjet-dry-time').value) || 3,
+                            contrast: parseFloat(document.getElementById('inkjet-contrast').value) || 1.0,
+                            shear_mm: parseFloat(document.getElementById('shear-mm').value) || 0,
+                            grab_macro: this._grabMacro || 'GRAB_INKJET_HEAD',
+                            release_macro: this._releaseMacro || 'RELEASE_INKJET_HEAD',
+                            cmy: {
+                                c: parseFloat(document.getElementById('cmy-c').value) || 1.0,
+                                m: parseFloat(document.getElementById('cmy-m').value) || 1.0,
+                                y: parseFloat(document.getElementById('cmy-y').value) || 1.0,
+                                saturation: parseFloat(document.getElementById('cmy-saturation').value) || 0.0,
+                                brightness: parseFloat(document.getElementById('cmy-brightness').value) || 0.0
+                            }
+                        },
+                        wipe_tower: this._getCurrentPlateTowerPos()
+                    };
+                    window.pywebview.api.save_print_setting(name, JSON.stringify(data));
+                }
+            }
+        });
+
+        // ---------- 擦嘴塔位置修改按钮（已取消，改由每盘中心方块决定） ----------
+        document.getElementById('btn-tower-pos-edit')?.addEventListener('click', async () => {
+            if (this.currentPlateId != null && this.isPlateLocked(this.currentPlateId)) {
+                const plateName = this.plates.get(this.currentPlateId)?.name || `盘 ${this.currentPlateId}`;
+                this.showToast(`「${plateName}」已锁定，无法修改擦嘴塔位置`, 'warning');
+                return;
+            }
+            const result = await this._showTowerPosDialog();
+            if (result) {
+                this._towerPosX = result.x;
+                this._towerPosY = result.y;
+                // 自动保存到当前配置
+                const name = this._configValueDisplay?.textContent;
+                if (name && name !== '未配置' && window.pywebview?.api) {
+                    const data = {
+                        inkjet: {
+                            offset: { ...this.calibrateOffset },
+                            step: this.calibrateStep,
+                            imageOffset: (() => {
+                                const xEl = document.getElementById('cal-img-offset-x');
+                                const yEl = document.getElementById('cal-img-offset-y');
+                                return { x: xEl ? xEl.textContent : '---', y: yEl ? yEl.textContent : '---' };
+                            })(),
+                            density: parseFloat(document.getElementById('inkjet-density').value) || 0.5,
+                            speed: parseInt(document.getElementById('inkjet-speed').value) || 50,
+                            repeat_count: this._getRepeatCount(),
+                            dry_time: parseInt(document.getElementById('inkjet-dry-time').value) || 3,
+                            contrast: parseFloat(document.getElementById('inkjet-contrast').value) || 1.0,
+                            shear_mm: parseFloat(document.getElementById('shear-mm').value) || 0,
+                            grab_macro: this._grabMacro || 'GRAB_INKJET_HEAD',
+                            release_macro: this._releaseMacro || 'RELEASE_INKJET_HEAD',
+                            cmy: {
+                                c: parseFloat(document.getElementById('cmy-c').value) || 1.0,
+                                m: parseFloat(document.getElementById('cmy-m').value) || 1.0,
+                                y: parseFloat(document.getElementById('cmy-y').value) || 1.0,
+                                saturation: parseFloat(document.getElementById('cmy-saturation').value) || 0.0,
+                                brightness: parseFloat(document.getElementById('cmy-brightness').value) || 0.0
+                            }
+                        },
+                        wipe_tower: this._getCurrentPlateTowerPos()
+                    };
+                    window.pywebview.api.save_print_setting(name, JSON.stringify(data));
+                }
+            }
         });
 
         // ---------- 预览层数滑块 ----------
@@ -4103,6 +7564,257 @@ class BedPreview {
         });
     }
 
+    // ---------- 修改宏名称弹窗 ----------
+    async _showMacroDialog() {
+        const overlay = document.getElementById('cal-dialog-overlay');
+        const contentRoot = overlay?.querySelector('.dialog-box');
+        if (!overlay || !contentRoot) return null;
+
+        // 尝试从已保存的配置中读取，避免硬编码默认值覆盖
+        let grabVal = this._grabMacro || 'GRAB_INKJET_HEAD';
+        let releaseVal = this._releaseMacro || 'RELEASE_INKJET_HEAD';
+        const configName = this._configValueDisplay?.textContent;
+        if (configName && configName !== '未配置' && window.pywebview?.api) {
+            try {
+                const res = await window.pywebview.api.load_print_setting(configName);
+                if (res?.success && res.data?.inkjet) {
+                    const ij = res.data.inkjet;
+                    if (ij.grab_macro) grabVal = ij.grab_macro;
+                    if (ij.release_macro) releaseVal = ij.release_macro;
+                }
+            } catch (e) { /* ignore */ }
+        }
+        // 同步实例变量
+        this._grabMacro = grabVal;
+        this._releaseMacro = releaseVal;
+
+        return new Promise((resolve) => {
+            const origHtml = contentRoot.innerHTML;
+
+            contentRoot.innerHTML = `
+                <div class="dialog-title" style="font-size:16px;font-weight:500;color:#e0e0e0;margin-bottom:4px;">修改喷墨宏名称</div>
+                <div class="dialog-desc" style="font-size:13px;color:#888;margin-bottom:12px;">设定在 GCode 中插入的取得/放回喷墨模块宏命令</div>
+                <div style="display:flex;flex-direction:column;gap:10px;width:100%;">
+                    <div style="display:flex;flex-direction:column;gap:4px;">
+                        <label style="font-size:13px;color:#ccc;">取得宏</label>
+                        <textarea id="macro-dlg-grab" rows="3" style="width:100%;box-sizing:border-box;background:#2a2a3a;border:1px solid #444;border-radius:6px;padding:8px 10px;color:#ccc;font-size:13px;outline:none;font-family:Consolas,monospace;resize:vertical;">${this._escapeHtml(grabVal)}</textarea>
+                    </div>
+                    <div style="display:flex;flex-direction:column;gap:4px;">
+                        <label style="font-size:13px;color:#ccc;">放回宏</label>
+                        <textarea id="macro-dlg-release" rows="3" style="width:100%;box-sizing:border-box;background:#2a2a3a;border:1px solid #444;border-radius:6px;padding:8px 10px;color:#ccc;font-size:13px;outline:none;font-family:Consolas,monospace;resize:vertical;">${this._escapeHtml(releaseVal)}</textarea>
+                    </div>
+                </div>
+                <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px;">
+                    <button class="btn-secondary" id="macro-dlg-cancel" style="padding:6px 16px;">取消</button>
+                    <button class="btn-primary" id="macro-dlg-confirm" style="padding:6px 16px;">保存</button>
+                </div>
+            `;
+            // 让 dialog-box 自适应内容宽度
+            contentRoot.style.width = 'auto';
+            contentRoot.style.minWidth = '500px';
+            // 不要全局灰色遮罩
+            const origOverlayBg = overlay.style.background;
+            overlay.style.background = 'transparent';
+            overlay.classList.remove('hidden');
+            overlay.querySelector('#macro-dlg-grab').focus();
+
+            // 阻止点击 dialog-box 内容区冒泡到 overlay 导致误关闭
+            const stopBubble = (e) => e.stopPropagation();
+            contentRoot.addEventListener('click', stopBubble);
+            contentRoot.addEventListener('mousedown', stopBubble);
+
+            const cleanup = () => {
+                overlay.classList.add('hidden');
+                overlay.style.background = origOverlayBg;
+                contentRoot.style.width = '';
+                contentRoot.style.minWidth = '';
+                contentRoot.innerHTML = origHtml;
+                contentRoot.removeEventListener('click', stopBubble);
+                contentRoot.removeEventListener('mousedown', stopBubble);
+                overlay.querySelector('#macro-dlg-cancel')?.removeEventListener('click', onCancel);
+                overlay.querySelector('#macro-dlg-confirm')?.removeEventListener('click', onConfirm);
+                overlay.removeEventListener('mousedown', onOverlay);
+            };
+            const onConfirm = () => {
+                const g = overlay.querySelector('#macro-dlg-grab');
+                const r = overlay.querySelector('#macro-dlg-release');
+                const result = {
+                    grab: (g ? g.value.trim() : '') || 'GRAB_INKJET_HEAD',
+                    release: (r ? r.value.trim() : '') || 'RELEASE_INKJET_HEAD',
+                };
+                cleanup();
+                resolve(result);
+            };
+            const onCancel = () => { cleanup(); resolve(null); };
+            const onOverlay = (e) => { if (e.target === overlay) onCancel(); };
+            overlay.querySelector('#macro-dlg-cancel').addEventListener('click', onCancel);
+            overlay.querySelector('#macro-dlg-confirm').addEventListener('click', onConfirm);
+            // 用 mousedown 而非 click，防止 focus 导致的误触发
+            setTimeout(() => {
+                overlay.addEventListener('mousedown', onOverlay);
+            }, 100);
+            overlay.querySelector('#macro-dlg-grab').addEventListener('keydown', (e) => {
+                if (e.key === 'Escape') onCancel();
+            });
+            overlay.querySelector('#macro-dlg-release').addEventListener('keydown', (e) => {
+                if (e.key === 'Escape') onCancel();
+            });
+        });
+    }
+
+    _setupRepeatSelect(onChange) {
+        const customSelect = document.getElementById('inkjet-repeat-select');
+        if (!customSelect) return;
+
+        const trigger = customSelect.querySelector('.select-trigger');
+        const optionsContainer = customSelect.querySelector('.select-options');
+        const valueDisplay = customSelect.querySelector('.select-value');
+        const options = customSelect.querySelectorAll('.select-option');
+
+        if (trigger) {
+            trigger.addEventListener('click', (e) => {
+                e.stopPropagation();
+                const isOpen = !optionsContainer.classList.contains('hidden');
+                this.closeAllSelects();
+                if (!isOpen) {
+                    optionsContainer.classList.remove('hidden');
+                    trigger.classList.add('open');
+                }
+            });
+        }
+
+        options.forEach(opt => {
+            opt.addEventListener('click', () => {
+                options.forEach(o => o.classList.remove('selected'));
+                opt.classList.add('selected');
+                if (valueDisplay) valueDisplay.textContent = opt.textContent;
+                optionsContainer.classList.add('hidden');
+                trigger.classList.remove('open');
+                // 吹干行可见性
+                const dryRow = document.getElementById('inkjet-dry-row');
+                if (dryRow) dryRow.style.display = this._getRepeatCount() > 1 ? '' : 'none';
+                // 自动保存
+                if (onChange) onChange();
+            });
+        });
+    }
+
+    // ---------- 擦嘴塔位置修改弹窗 ----------
+    async _showTowerPosDialog() {
+        const overlay = document.getElementById('cal-dialog-overlay');
+        const contentRoot = overlay?.querySelector('.dialog-box');
+        if (!overlay || !contentRoot) return null;
+
+        let xVal = this._towerPosX;
+        let yVal = this._towerPosY;
+        // 尝试从已保存的配置读取
+        const configName = this._configValueDisplay?.textContent;
+        if (configName && configName !== '未配置' && window.pywebview?.api) {
+            try {
+                const res = await window.pywebview.api.load_print_setting(configName);
+                if (res?.success && res.data?.wipe_tower) {
+                    const wt = res.data.wipe_tower;
+                    if (wt.x !== undefined && wt.x !== null) xVal = parseFloat(wt.x) || 10;
+                    if (wt.y !== undefined && wt.y !== null) yVal = parseFloat(wt.y) || 220;
+                }
+            } catch (e) { /* ignore */ }
+        }
+        this._towerPosX = xVal;
+        this._towerPosY = yVal;
+
+        return new Promise((resolve) => {
+            const origHtml = contentRoot.innerHTML;
+
+            contentRoot.innerHTML = `
+                <div class="dialog-title" style="font-size:16px;font-weight:500;color:#e0e0e0;margin-bottom:4px;">擦嘴塔位置修改</div>
+                <div class="dialog-desc" style="font-size:13px;color:#888;margin-bottom:12px;">设置擦嘴塔左下角在热床上的 X / Y 位置 (mm)</div>
+                <div style="display:flex;flex-direction:column;gap:10px;width:100%;">
+                    <div style="display:flex;align-items:center;gap:8px;">
+                        <label style="font-size:13px;color:#ccc;width:24px;">X</label>
+                        <input type="number" id="tower-dlg-x" step="0.1" value="${xVal}" style="flex:1;box-sizing:border-box;background:#2a2a3a;border:1px solid #444;border-radius:6px;padding:6px 10px;color:#ccc;font-size:13px;outline:none;">
+                    </div>
+                    <div style="display:flex;align-items:center;gap:8px;">
+                        <label style="font-size:13px;color:#ccc;width:24px;">Y</label>
+                        <input type="number" id="tower-dlg-y" step="0.1" value="${yVal}" style="flex:1;box-sizing:border-box;background:#2a2a3a;border:1px solid #444;border-radius:6px;padding:6px 10px;color:#ccc;font-size:13px;outline:none;">
+                    </div>
+                </div>
+                <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px;">
+                    <button class="btn-secondary" id="tower-dlg-cancel" style="padding:6px 16px;">取消</button>
+                    <button class="btn-primary" id="tower-dlg-confirm" style="padding:6px 16px;">保存</button>
+                </div>
+            `;
+            contentRoot.style.width = 'auto';
+            contentRoot.style.minWidth = '320px';
+            const origOverlayBg = overlay.style.background;
+            overlay.style.background = 'transparent';
+            overlay.classList.remove('hidden');
+            overlay.querySelector('#tower-dlg-x').focus();
+
+            const stopBubble = (e) => e.stopPropagation();
+            contentRoot.addEventListener('click', stopBubble);
+            contentRoot.addEventListener('mousedown', stopBubble);
+
+            const cleanup = () => {
+                overlay.classList.add('hidden');
+                overlay.style.background = origOverlayBg;
+                contentRoot.style.width = '';
+                contentRoot.style.minWidth = '';
+                contentRoot.innerHTML = origHtml;
+                contentRoot.removeEventListener('click', stopBubble);
+                contentRoot.removeEventListener('mousedown', stopBubble);
+                overlay.querySelector('#tower-dlg-cancel')?.removeEventListener('click', onCancel);
+                overlay.querySelector('#tower-dlg-confirm')?.removeEventListener('click', onConfirm);
+                overlay.removeEventListener('mousedown', onOverlay);
+            };
+            const onConfirm = () => {
+                const xEl = overlay.querySelector('#tower-dlg-x');
+                const yEl = overlay.querySelector('#tower-dlg-y');
+                const result = {
+                    x: parseFloat(xEl?.value) || 10,
+                    y: parseFloat(yEl?.value) || 220,
+                };
+                cleanup();
+                resolve(result);
+            };
+            const onCancel = () => { cleanup(); resolve(null); };
+            const onOverlay = (e) => { if (e.target === overlay) onCancel(); };
+            overlay.querySelector('#tower-dlg-cancel').addEventListener('click', onCancel);
+            overlay.querySelector('#tower-dlg-confirm').addEventListener('click', onConfirm);
+            setTimeout(() => { overlay.addEventListener('mousedown', onOverlay); }, 100);
+            overlay.querySelector('#tower-dlg-x').addEventListener('keydown', (e) => {
+                if (e.key === 'Escape') onCancel();
+            });
+            overlay.querySelector('#tower-dlg-y').addEventListener('keydown', (e) => {
+                if (e.key === 'Escape') onCancel();
+            });
+        });
+    }
+
+    _escapeHtml(str) {
+        const d = document.createElement('div');
+        d.textContent = str;
+        return d.innerHTML;
+    }
+
+    async refreshPostprocessCommand() {
+        const cmdEl = document.getElementById('postprocess-cmd');
+        if (!cmdEl) return;
+        if (window.pywebview && window.pywebview.api) {
+            try {
+                const configName = document.querySelector('#print-setting-select .select-value')?.textContent || 'MKP standard';
+                const result = await window.pywebview.api.get_gcode_generator_path(configName);
+                if (result && result.success && result.command) {
+                    cmdEl.textContent = result.command;
+                    return;
+                }
+            } catch (e) {
+                console.warn('获取后处理命令失败', e);
+            }
+        }
+        // 无后端时占位
+        cmdEl.textContent = 'python MKPSpectrum.py --Config "MKP standard" --Gcode';
+    }
+
     async _setupPrintConfigSelect() {
         const customSelect = document.getElementById('print-setting-select');
         if (!customSelect) return;
@@ -4110,15 +7822,14 @@ class BedPreview {
         const trigger = customSelect.querySelector('.select-trigger');
         const optionsContainer = customSelect.querySelector('.select-options');
         const valueDisplay = customSelect.querySelector('.select-value');
+        this._configValueDisplay = valueDisplay;
         const statusEl = document.getElementById('config-status');
 
         // 收集当前所有参数
         const collectData = () => ({
-            whiteInk: {
-                offset: { ...this.calibrateOffset },
-                step: this.calibrateStep
-            },
             inkjet: {
+                offset: { ...this.calibrateOffset },
+                step: this.calibrateStep,
                 imageOffset: (() => {
                     const xEl = document.getElementById('cal-img-offset-x');
                     const yEl = document.getElementById('cal-img-offset-y');
@@ -4128,41 +7839,109 @@ class BedPreview {
                     };
                 })(),
                 density: parseFloat(document.getElementById('inkjet-density').value) || 0.5,
-                speed: parseInt(document.getElementById('inkjet-speed').value) || 50
-            }
+                speed: parseInt(document.getElementById('inkjet-speed').value) || 50,
+                repeat_count: this._getRepeatCount(),
+                dry_time: parseInt(document.getElementById('inkjet-dry-time').value) || 3,
+                contrast: parseFloat(document.getElementById('inkjet-contrast').value) || 1.0,
+                shear_mm: parseFloat(document.getElementById('shear-mm').value) || 0,
+                grab_macro: this._grabMacro || 'GRAB_INKJET_HEAD',
+                release_macro: this._releaseMacro || 'RELEASE_INKJET_HEAD',
+                cmy: {
+                    c: parseFloat(document.getElementById('cmy-c').value) || 1.0,
+                    m: parseFloat(document.getElementById('cmy-m').value) || 1.0,
+                    y: parseFloat(document.getElementById('cmy-y').value) || 1.0,
+                    saturation: parseFloat(document.getElementById('cmy-saturation').value) || 0.0,
+                    brightness: parseFloat(document.getElementById('cmy-brightness').value) || 0.0
+                }
+            },
+            wipe_tower: this._getCurrentPlateTowerPos()
         });
 
         // 应用配置到 UI
         const applyData = (data) => {
-            // 白墨偏移
-            if (data.whiteInk) {
-                const wo = data.whiteInk.offset || {};
-                this.calibrateOffset.x = wo.x || 0;
-                this.calibrateOffset.y = wo.y || 0;
-                document.getElementById('offset-x').textContent = (wo.x || 0).toFixed(2);
-                document.getElementById('offset-y').textContent = (wo.y || 0).toFixed(2);
-                if (data.whiteInk.step) {
-                    this.calibrateStep = data.whiteInk.step;
-                    document.querySelectorAll('.step-btn').forEach(b => {
-                        b.classList.toggle('active', parseFloat(b.dataset.step) === data.whiteInk.step);
-                    });
-                }
-            }
-            // 喷墨参数
+            // 喷墨偏移与参数
             if (data.inkjet) {
                 const ij = data.inkjet;
+                if (ij.offset) {
+                    const x = (ij.offset.x !== undefined && ij.offset.x !== null) ? parseFloat(ij.offset.x) : 0;
+                    const y = (ij.offset.y !== undefined && ij.offset.y !== null) ? parseFloat(ij.offset.y) : 0;
+                    this.calibrateOffset.x = isNaN(x) ? 0 : x;
+                    this.calibrateOffset.y = isNaN(y) ? 0 : y;
+                    const xEl = document.getElementById('offset-x');
+                    const yEl = document.getElementById('offset-y');
+                    if (xEl) xEl.value = this.calibrateOffset.x.toFixed(2);
+                    if (yEl) yEl.value = this.calibrateOffset.y.toFixed(2);
+                }
+                if (ij.step !== undefined && ij.step !== null) {
+                    this.calibrateStep = parseFloat(ij.step) || 0.1;
+                    document.querySelectorAll('.step-btn').forEach(b => {
+                        b.classList.toggle('active', parseFloat(b.dataset.step) === this.calibrateStep);
+                    });
+                }
                 const densityEl = document.getElementById('inkjet-density');
                 const speedEl = document.getElementById('inkjet-speed');
-                if (ij.density && densityEl) {
+                if (ij.density !== undefined && ij.density !== null && densityEl) {
                     densityEl.value = ij.density;
                     document.getElementById('inkjet-density-val').textContent = ij.density;
                 }
-                if (ij.speed && speedEl) {
+                if (ij.speed !== undefined && ij.speed !== null && speedEl) {
                     speedEl.value = ij.speed;
                     document.getElementById('inkjet-speed-val').textContent = ij.speed;
                 }
+                if (ij.repeat_count !== undefined && ij.repeat_count !== null) {
+                    this._setRepeatCount(parseInt(ij.repeat_count) || 1);
+                }
+                if (ij.dry_time !== undefined && ij.dry_time !== null) {
+                    const dryEl = document.getElementById('inkjet-dry-time');
+                    const dryValEl = document.getElementById('inkjet-dry-time-val');
+                    if (dryEl) dryEl.value = ij.dry_time;
+                    if (dryValEl) dryValEl.textContent = ij.dry_time;
+                }
+                if (ij.contrast !== undefined && ij.contrast !== null) {
+                    const contrastEl = document.getElementById('inkjet-contrast');
+                    const contrastValEl = document.getElementById('inkjet-contrast-val');
+                    if (contrastEl) contrastEl.value = ij.contrast;
+                    if (contrastValEl) contrastValEl.textContent = parseFloat(ij.contrast).toFixed(1);
+                }
+                if (ij.shear_mm !== undefined && ij.shear_mm !== null) {
+                    const shearEl = document.getElementById('shear-mm');
+                    if (shearEl) shearEl.value = ij.shear_mm;
+                }
+                // 吹干行可见性
+                const dryRowEl = document.getElementById('inkjet-dry-row');
+                if (dryRowEl) {
+                    dryRowEl.style.display = (ij.repeat_count || 1) > 1 ? '' : 'none';
+                }
+                // CMY 色调调节
+                if (ij.cmy) {
+                    const setCmy = (id, val) => {
+                        const el = document.getElementById(id);
+                        if (el) {
+                            el.value = val;
+                            document.getElementById(id + '-val').textContent = parseFloat(val).toFixed(2);
+                        }
+                    };
+                    setCmy('cmy-c', ij.cmy.c !== undefined ? ij.cmy.c : 1.0);
+                    setCmy('cmy-m', ij.cmy.m !== undefined ? ij.cmy.m : 1.0);
+                    setCmy('cmy-y', ij.cmy.y !== undefined ? ij.cmy.y : 1.0);
+                    setCmy('cmy-saturation', ij.cmy.saturation !== undefined ? ij.cmy.saturation : 0.0);
+                    setCmy('cmy-brightness', ij.cmy.brightness !== undefined ? ij.cmy.brightness : 0.0);
+                }
+                if (ij.grab_macro) this._grabMacro = ij.grab_macro;
+                if (ij.release_macro) this._releaseMacro = ij.release_macro;
+            }
+            // 擦嘴塔位置
+            if (data.wipe_tower) {
+                const wt = data.wipe_tower;
+                if (wt.x !== undefined && wt.x !== null) this._towerPosX = parseFloat(wt.x) || 10;
+                if (wt.y !== undefined && wt.y !== null) this._towerPosY = parseFloat(wt.y) || 220;
             }
         };
+
+        // 监听外部重新加载配置的事件（如 switchToCalibrate 触发）
+        document.addEventListener('mkp-reload-config', (e) => {
+            if (e.detail) applyData(e.detail);
+        });
 
         // 加载配置列表
         const refreshList = async (selectName) => {
@@ -4190,6 +7969,7 @@ class BedPreview {
                                     window.pywebview.api.save_print_setting(name, JSON.stringify(collectData()));
                                 }
                                 refreshList(name);
+                                this.refreshPostprocessCommand();
                                 if (statusEl) {
                                     statusEl.textContent = '已切换: ' + name;
                                     statusEl.className = 'cal-config-status success';
@@ -4203,6 +7983,7 @@ class BedPreview {
                         optionsContainer.classList.add('hidden');
                         trigger.classList.remove('open');
                         loadConfig(opt.textContent);
+                        this.refreshPostprocessCommand();
                     });
                 });
             } catch (e) {
@@ -4216,6 +7997,7 @@ class BedPreview {
                 const result = await window.pywebview.api.load_print_setting(name);
                 if (!result || !result.success) return;
                 applyData(result.data);
+                this.refreshPostprocessCommand();
                 if (statusEl) {
                     statusEl.textContent = '已加载: ' + name;
                     statusEl.className = 'cal-config-status success';
@@ -4255,7 +8037,7 @@ class BedPreview {
                 return;
             }
             const name = valueDisplay.textContent;
-            if (!name || name === '默认配置' || name === '未配置') {
+            if (!name || name === '未配置') {
                 this._showDialog('保存配置', '请输入配置名称：', '例如：材料A 精细模式').then(async (newName) => {
                     if (!newName) return;
                     valueDisplay.textContent = newName;
@@ -4263,6 +8045,7 @@ class BedPreview {
                         await window.pywebview.api.save_print_setting(newName, JSON.stringify(collectData()));
                         if (statusEl) { statusEl.textContent = '已保存: ' + newName; statusEl.className = 'cal-config-status success'; }
                         refreshList(newName);
+                        this.refreshPostprocessCommand();
                     } catch (e) {
                         if (statusEl) { statusEl.textContent = '保存失败'; statusEl.className = 'cal-config-status'; }
                     }
@@ -4278,6 +8061,23 @@ class BedPreview {
             }
         });
 
+        // 浓度/速度滑块自动保存（change 事件：松手时触发）
+        this._saveCurrentConfig = () => {
+            const name = valueDisplay.textContent;
+            if (!name || name === '未配置' || !window.pywebview?.api) return;
+            window.pywebview.api.save_print_setting(name, JSON.stringify(collectData())).catch(() => {});
+        };
+        const autoSaveSlider = this._saveCurrentConfig;
+        document.getElementById('inkjet-density').addEventListener('change', autoSaveSlider);
+        document.getElementById('inkjet-speed').addEventListener('change', autoSaveSlider);
+        // 重复喷墨 自定义下拉
+        this._setupRepeatSelect(autoSaveSlider);
+        document.getElementById('inkjet-dry-time').addEventListener('input', function () {
+            document.getElementById('inkjet-dry-time-val').textContent = this.value;
+        });
+        document.getElementById('inkjet-dry-time').addEventListener('change', autoSaveSlider);
+        document.getElementById('inkjet-contrast').addEventListener('change', autoSaveSlider);
+        document.getElementById('shear-mm').addEventListener('change', autoSaveSlider);
         // 还原按钮
         document.getElementById('btn-reset-config').addEventListener('click', () => {
             this.calibrateOffset.x = 0;
@@ -4292,6 +8092,18 @@ class BedPreview {
             document.getElementById('inkjet-density-val').textContent = '0.5';
             document.getElementById('inkjet-speed').value = 50;
             document.getElementById('inkjet-speed-val').textContent = '50';
+            this._setRepeatCount(1);
+            document.getElementById('inkjet-dry-time').value = 3;
+            document.getElementById('inkjet-dry-time-val').textContent = '3';
+            document.getElementById('inkjet-dry-row').style.display = 'none';
+            document.getElementById('inkjet-contrast').value = 1.0;
+            document.getElementById('inkjet-contrast-val').textContent = '1.0';
+            document.getElementById('shear-mm').value = 0;
+            // 还原后自动保存
+            const name = valueDisplay.textContent;
+            if (name && name !== '未配置' && window.pywebview?.api) {
+                window.pywebview.api.save_print_setting(name, JSON.stringify(collectData())).catch(() => {});
+            }
             if (statusEl) { statusEl.textContent = '已还原为默认值'; statusEl.className = 'cal-config-status success'; }
             setTimeout(() => { statusEl.className = 'cal-config-status'; statusEl.textContent = ''; }, 3000);
         });
@@ -4324,8 +8136,8 @@ class BedPreview {
                     if (name) {
                         valueDisplay.textContent = name;
                         const data = {
-                            whiteInk: { offset: { x: 0, y: 0 }, step: 0.1 },
-                            inkjet: { imageOffset: { x: '---', y: '---' }, density: 0.5, speed: 50 }
+                            inkjet: { offset: { x: 0, y: 0 }, step: 0.1, imageOffset: { x: '---', y: '---' }, density: 0.5, speed: 50, repeat_count: 1, dry_time: 3, contrast: 1.0, shear_mm: 0 },
+                            wipe_tower: this._getCurrentPlateTowerPos()
                         };
                         await window.pywebview.api.save_print_setting(name, JSON.stringify(data));
                         refreshList(name);
@@ -4423,21 +8235,32 @@ class BedPreview {
 
         slider.addEventListener('input', updateLayerDisplay);
 
-        // 鼠标滚轮控制滑块 - 监听整个预览页面（图片区域除外）
-        const previewPage = document.getElementById('preview-page');
-        if (previewPage) {
-            previewPage.addEventListener('wheel', (e) => {
-                // 鼠标在切片图片区域内时，滚轮用于缩放图片，不切换层
-                if (e.target.closest('#slice-images-container')) return;
-
-                const step = parseFloat(slider.step) || 1;
-                const min = parseFloat(slider.min) || 1;
-                const max = parseFloat(slider.max) || 100;
-                let val = parseFloat(slider.value);
-                val += e.deltaY > 0 ? -step : step;
-                val = Math.max(min, Math.min(max, val));
-                slider.value = val;
-                slider.dispatchEvent(new Event('input'));
+        // 鼠标滚轮控制滑块 - 仅当鼠标悬停在层滑块区域时才切层，
+        // 避免在 3D 视口内滚轮缩放时同步带动滑块
+        const sliderBar = document.querySelector('.preview-slider-bar');
+        const sliderFooter = document.querySelector('.preview-footer');
+        const wheelTargets = [slider, sliderBar, sliderFooter].filter(Boolean);
+        const isOnSlider = (target) => target.closest('.preview-footer') || target.closest('#layer-slider');
+        const onSliderWheel = (e) => {
+            if (!isOnSlider(e.target)) return;
+            // 在滑块上滚动时只切层，不让事件冒泡到 3D 视口做缩放
+            e.preventDefault();
+            e.stopPropagation();
+            const step = parseFloat(slider.step) || 1;
+            const min = parseFloat(slider.min) || 1;
+            const max = parseFloat(slider.max) || 100;
+            let val = parseFloat(slider.value);
+            val += e.deltaY > 0 ? -step : step;
+            val = Math.max(min, Math.min(max, val));
+            slider.value = val;
+            slider.dispatchEvent(new Event('input'));
+        };
+        wheelTargets.forEach(el => el.addEventListener('wheel', onSliderWheel, { passive: false }));
+        // 阻断 3D 视口的滚轮冒泡到预览页，避免误触发切层
+        const gcodeContainer = document.getElementById('gcode-3d-container');
+        if (gcodeContainer) {
+            gcodeContainer.addEventListener('wheel', (e) => {
+                e.stopPropagation();
             }, { passive: true });
         }
 
@@ -4453,6 +8276,18 @@ class BedPreview {
     }
 
     _updateLayerSlider() {
+        // 防重入：_showSliceImage → _showSliceImageByIndex → _updateLayerSlider → _showSliceImage
+        // 会无限递归（RangeError）。用标志切断这个环。
+        if (this._updatingLayerSlider) return;
+        this._updatingLayerSlider = true;
+        try {
+            this._updateLayerSliderInner();
+        } finally {
+            this._updatingLayerSlider = false;
+        }
+    }
+
+    _updateLayerSliderInner() {
         const slider = document.getElementById('layer-slider');
         const layerNum = document.getElementById('layer-info-num');
         const layerZ = document.getElementById('layer-info-z');
@@ -4554,25 +8389,31 @@ class BedPreview {
                 model.selected = false;
             }
 
-            const oldPosition = oldMesh.position.clone();
-            const oldRotation = oldMesh.rotation.clone();
-            const oldScale = oldMesh.scale.clone();
+            // 记录当前（含已烘焙进几何的）世界包围盒中心、大小与原根旋转，
+            // 重新加载后据此重建相同变换（而不是完全重置回原文件变换）
+            oldMesh.updateMatrixWorld(true);
+            const oldBox = new THREE.Box3().setFromObject(oldMesh);
+            const bounds = {
+                center: oldBox.getCenter(new THREE.Vector3()),
+                size: oldBox.getSize(new THREE.Vector3()),
+                rotation: oldMesh.rotation.clone(),
+            };
 
             this.scene.remove(oldMesh);
 
             switch (result.type) {
                 case 'stl':
-                    this.loadSTLAndReplace(result.data, modelId, oldPosition, oldRotation, oldScale);
+                    this.loadSTLAndReplace(result.data, modelId, bounds);
                     break;
                 case 'obj':
-                    this.loadOBJAndReplace(result, modelId, oldPosition, oldRotation, oldScale);
+                    this.loadOBJAndReplace(result, modelId, bounds);
                     break;
                 case 'gltf':
             case 'glb':
-                this.loadGLTFAndReplace(result.data, modelId, oldPosition, oldRotation, oldScale);
+                this.loadGLTFAndReplace(result.data, modelId, bounds);
                 break;
             case 'fbx':
-                this.loadFBXAndReplace(result.data, modelId, oldPosition, oldRotation, oldScale);
+                this.loadFBXAndReplace(result.data, modelId, bounds);
                 break;
             }
         } catch (e) {
@@ -4581,28 +8422,28 @@ class BedPreview {
         }
     }
 
-    loadSTLAndReplace(dataUrl, modelId, position, rotation, scale) {
+    loadSTLAndReplace(dataUrl, modelId, bounds) {
         const loader = new STLLoader();
         loader.load(dataUrl, (geometry) => {
-            this.replaceModelMesh(modelId, geometry, position, rotation, scale);
+            this.replaceModelMesh(modelId, geometry, bounds);
         });
     }
 
-    loadGLTFAndReplace(dataUrl, modelId, position, rotation, scale) {
+    loadGLTFAndReplace(dataUrl, modelId, bounds) {
         const loader = new GLTFLoader();
         loader.load(dataUrl, (gltf) => {
-            this.replaceModelObject(modelId, gltf.scene, position, rotation, scale);
+            this.replaceModelObject(modelId, gltf.scene, bounds);
         });
     }
 
-    loadFBXAndReplace(dataUrl, modelId, position, rotation, scale) {
+    loadFBXAndReplace(dataUrl, modelId, bounds) {
         const loader = new FBXLoader();
         loader.load(dataUrl, (fbx) => {
-            this.replaceModelObject(modelId, fbx, position, rotation, scale);
+            this.replaceModelObject(modelId, fbx, bounds);
         });
     }
 
-    loadOBJAndReplace(result, modelId, position, rotation, scale) {
+    loadOBJAndReplace(result, modelId, bounds) {
         const manager = new THREE.LoadingManager();
         manager.setURLModifier((url) => {
             const cleanUrl = url.split('/').pop().split('\\').pop();
@@ -4622,17 +8463,34 @@ class BedPreview {
                             }
                         }
                     });
-                    this.replaceModelObject(modelId, object, position, rotation, scale);
+                    this.replaceModelObject(modelId, object, bounds);
                 }, undefined, () => {
-                    this.replaceModelObject(modelId, object, position, rotation, scale);
+                    this.replaceModelObject(modelId, object, bounds);
                 });
             } else {
-                this.replaceModelObject(modelId, object, position, rotation, scale);
+                this.replaceModelObject(modelId, object, bounds);
             }
         });
     }
 
-    replaceModelMesh(modelId, geometry, position, rotation, scale) {
+    // 用旧的包围盒中心 + 大小 + 根旋转，把新加载的 model（object）统一缩放、旋转并定位回原位置
+    _applyReplacedBounds(ref, center, size, rotation) {
+        const box = new THREE.Box3().setFromObject(ref);
+        const srcCenter = box.getCenter(new THREE.Vector3());
+        const srcSize = box.getSize(new THREE.Vector3());
+        const k = (srcSize.x > 0.001) ? (size.x / srcSize.x) : 1;
+        // 统一缩放使包围盒尺寸与旧的一致（若新旧宽高比不同，仍以 X 方向为准近似）
+        ref.scale.multiplyScalar(k);
+        // 平移使包围盒中心对齐到旧中心（注意缩放围绕对象原点进行）
+        ref.position.x = center.x - srcCenter.x * k;
+        ref.position.y = center.y - srcCenter.y * k;
+        ref.position.z = center.z - srcCenter.z * k;
+        // 恢复旧的根旋转
+        if (rotation) ref.rotation.copy(rotation);
+        ref.updateMatrixWorld(true);
+    }
+
+    replaceModelMesh(modelId, geometry, bounds) {
         const model = this.models.get(modelId);
         if (!model) return;
 
@@ -4648,9 +8506,7 @@ class BedPreview {
         mesh.userData.isModel = true;
         mesh.userData.modelId = modelId;
 
-        mesh.position.copy(position);
-        mesh.rotation.copy(rotation);
-        mesh.scale.copy(scale);
+        this._applyReplacedBounds(mesh, bounds.center, bounds.size, bounds.rotation);
 
         if (model.selected && model._transformProxy) {
             this.deselectModelInternal(model);
@@ -4668,7 +8524,7 @@ class BedPreview {
         this.saveState();
     }
 
-    replaceModelObject(modelId, object, position, rotation, scale) {
+    replaceModelObject(modelId, object, bounds) {
         const model = this.models.get(modelId);
         if (!model) return;
 
@@ -4681,9 +8537,7 @@ class BedPreview {
             }
         });
 
-        object.position.copy(position);
-        object.rotation.copy(rotation);
-        object.scale.copy(scale);
+        this._applyReplacedBounds(object, bounds.center, bounds.size, bounds.rotation);
 
         if (model.selected && model._transformProxy) {
             this.deselectModelInternal(model);
@@ -4705,8 +8559,6 @@ class BedPreview {
         const model = this.models.get(modelId);
         if (!model) return;
 
-        this.saveState();
-
         const transformSource = model._transformProxy || model.mesh;
 
         switch (axis) {
@@ -4723,6 +8575,15 @@ class BedPreview {
 
         transformSource.updateMatrixWorld(true);
         this.lockZAxis();
+        // 镜像后烘焙，把负 scale 写进顶点，避免变换链累积；烘焙后重算法线防止里外翻
+        if (!model._groupData) {
+            this.bakeTransform(model);
+            model.mesh.traverse((child) => {
+                if (child.isMesh && child.geometry) {
+                    child.geometry.computeVertexNormals();
+                }
+            });
+        }
         this.updateSelectionBoxes();
         this.updateTransformInputs();
         this.saveState('镜像模型');
@@ -4757,6 +8618,9 @@ class BedPreview {
 
     handleFileMenuAction(action) {
         switch (action) {
+            case 'new-project':
+                this.newProject();
+                break;
             case 'open-project':
                 this.openProject();
                 break;
@@ -4815,7 +8679,7 @@ class BedPreview {
             return;
         }
 
-        const project = this.exportProject();
+        const project = await this.exportProject();
         try {
             // 如果已有保存路径则直接保存，否则弹出保存对话框
             // 从未保存过则用第一个模型名作为默认文件名
@@ -4861,7 +8725,7 @@ class BedPreview {
             return;
         }
 
-        const project = this.exportProject();
+        const project = await this.exportProject();
         try {
             // 强制弹出保存对话框，不传入现有路径
             let defaultName = null;
@@ -4891,8 +8755,8 @@ class BedPreview {
         }
     }
 
-    // 导出项目数据
-    exportProject() {
+    // 导出项目数据：项目保存保留原始模型格式，不改 UV、不改贴图、不做格式转换。
+    async exportProject() {
         const project = {
             version: '1.0',
             timestamp: new Date().toISOString(),
@@ -4900,44 +8764,59 @@ class BedPreview {
             gridSize: this.gridSize,
             showGrid: this.showGrid,
             models: [],
+            plates: Array.from(this.plates.values()).map(p => ({
+                id: p.id,
+                name: p.name,
+                locked: p.locked,
+                order: p.order
+            })),
+            currentPlateId: this.currentPlateId,
             gcode: this._lastGcode || null
         };
 
-        this.models.forEach((model, id) => {
-            // 用 mesh.getWorld* 获取真正世界变换，避免 _transformProxy/mesh 局部值不一致导致丢失
+        for (const [id, model] of this.models) {
+            // 保存 MKP 时必须打包当前场景中的烘焙几何。
+            // 交互变换会被 bakeTransform 写入顶点，根对象 scale/rotation 可能已回到 1/0；
+            // 若继续打包原始 filePath，重开项目会丢失缩放/旋转/镜像等已烘焙变换。
+            const bakeResult = await this._bakeSingleModelToOBJ(model);
+            let filePath = bakeResult && bakeResult.success ? bakeResult.path : null;
+            let assetMode = filePath ? 'baked-obj' : 'missing';
+            if (!filePath) {
+                filePath = this.modelFilePaths.get(id) || null;
+                assetMode = filePath ? 'source' : 'missing';
+            }
+
+            // 统一记录模型相对所属盘左下角(0,0)的局部坐标与变换。
             const worldPos = new THREE.Vector3();
             const worldQuat = new THREE.Quaternion();
             const worldScale = new THREE.Vector3();
             model.mesh.getWorldPosition(worldPos);
             model.mesh.getWorldQuaternion(worldQuat);
             model.mesh.getWorldScale(worldScale);
+            const c = this._getPlateWorldPos(model.plateId || this.freePlateId);
+            const lx = worldPos.x - (c.x - this.bedSize.x / 2);
+            const ly = worldPos.y - (c.y - this.bedSize.y / 2);
+            const accum = model._accumRotation || new THREE.Euler(0, 0, 0, 'XYZ');
             const worldRot = new THREE.Euler().setFromQuaternion(worldQuat);
+            const pos = { x: lx, y: ly, z: worldPos.z };
+            const rot = { x: accum.x + worldRot.x, y: accum.y + worldRot.y, z: accum.z + worldRot.z };
+            const scl = { x: worldScale.x, y: worldScale.y, z: worldScale.z };
 
             project.models.push({
                 id: id,
                 name: model.name,
                 printable: model.printable,
-                filePath: this.modelFilePaths.get(id) || null,
-                position: {
-                    x: worldPos.x,
-                    y: worldPos.y,
-                    z: worldPos.z
-                },
-                rotation: {
-                    x: worldRot.x,
-                    y: worldRot.y,
-                    z: worldRot.z
-                },
-                scale: {
-                    x: worldScale.x,
-                    y: worldScale.y,
-                    z: worldScale.z
-                }
+                plateId: model.plateId ?? null,
+                filePath,
+                assetMode,
+                position: pos,
+                rotation: rot,
+                scale: scl
             });
-            console.log('[exportProject] 模型世界变换:', model.name,
-                'scale:', JSON.stringify(worldScale),
-                'pos:', JSON.stringify(worldPos));
-        });
+            console.log('[exportProject] 模型:', model.name,
+                'assetMode:', assetMode,
+                'pos:', JSON.stringify(pos));
+        }
 
         return project;
     }
@@ -4946,6 +8825,19 @@ class BedPreview {
     loadProject(project) {
         // 清除现有模型
         this.clearAllModels();
+
+        // 恢复盘（构建板），缺省时保留默认盘
+        if (project.plates && Array.isArray(project.plates) && project.plates.length > 0) {
+            this.plates.clear();
+            let maxId = 0;
+            project.plates.forEach(p => {
+                this.plates.set(p.id, { id: p.id, name: p.name || `盘 ${p.id}`, locked: !!p.locked, order: p.order != null ? p.order : p.id });
+                if (p.id > maxId) maxId = p.id;
+            });
+            this.nextPlateId = maxId + 1;
+            this.currentPlateId = (project.currentPlateId && this.plates.has(project.currentPlateId))
+                ? project.currentPlateId : this.defaultPlateId();
+        }
 
         // 设置热床尺寸
         if (project.bedSize) {
@@ -4961,6 +8853,12 @@ class BedPreview {
             this.showGrid = project.showGrid;
         }
         this.updateGrid();
+
+        // 先按项目盘信息重建盘板容器，再加载模型。
+        // 否则模型恢复 plateId 时找不到目标盘容器，会临时进入自由区，导致重开后位置漂移。
+        this.rebuildAllPlateBoards();
+        this.renderPlates();
+        this.buildActivePlateActions();
 
         // 加载模型
         if (project.models && project.models.length > 0) {
@@ -4978,17 +8876,56 @@ class BedPreview {
         // 记录临时目录路径，用于后续清理
         this._extractDir = project._extractDir || null;
 
+        // 按当前盘调整各模型显隐并刷新盘 tab 与对象列表
+        this.applyCurrentPlateVisibility();
+        // 异步模型加载完成前先刷新当前盘 UI；模型加载回调会继续更新对象列表。
+        this.updatePlateBoardOpacity();
+
         this.saveState('加载项目');
+    }
+
+    // 应用当前盘的显隐规则并刷新列表
+    applyCurrentPlateVisibility() {
+        // 所有模型一直可见（不跨盘隐藏），仅刷新对象列表
+        this.models.forEach((model) => {
+            model.mesh.visible = true;
+            if (model._transformProxy) model._transformProxy.visible = true;
+        });
+        this.updateObjectList();
     }
 
     // 从项目嵌入的模型数据加载（MKP格式）
     _loadModelFromProjectData(modelData) {
         const data = modelData._modelData;
-        if (!data || !data.obj) {
+        if (!data) {
             console.error('[loadProject] 模型数据为空，跳过:', modelData.name);
             return;
         }
-        console.log('[loadProject] 正在加载模型:', modelData.name);
+
+        // GLTF / GLB 格式
+        if (data.gltf) {
+            console.log('[loadProject] 正在加载 GLTF 模型:', modelData.name);
+            const loader = new GLTFLoader();
+            loader.load(data.gltf,
+                (gltf) => {
+                    console.log('[loadProject] GLTF加载成功:', modelData.name);
+                    this._addModelFromProject(gltf.scene, modelData);
+                },
+                undefined,
+                (err) => {
+                    console.error('[loadProject] GLTF加载失败:', modelData.name, err);
+                    this.showToast('加载模型失败: ' + modelData.name, 'error');
+                }
+            );
+            return;
+        }
+
+        // OBJ 格式
+        if (!data.obj) {
+            console.error('[loadProject] 模型数据无 OBJ/GLTF 内容，跳过:', modelData.name);
+            return;
+        }
+        console.log('[loadProject] 正在加载 OBJ 模型:', modelData.name);
 
         const manager = new THREE.LoadingManager();
         manager.setURLModifier((url) => {
@@ -5033,10 +8970,18 @@ class BedPreview {
     _addModelFromProject(object, modelData) {
         console.log('[loadProject] 应用变换前 - modelData.scale:', JSON.stringify(modelData.scale),
             'modelData.position:', JSON.stringify(modelData.position));
-        this.addModelObject(object, modelData.name);
+        const isSourceAsset = modelData.assetMode === 'source';
+        this.addModelObject(object, modelData.name, modelData._modelFilePath || null, {
+            preserveProjectTransform: !isSourceAsset,
+            projectLoad: true
+        });
         // 应用保存的变换
         const model = this.models.get(this.nextModelId - 1);
         if (model) {
+            // 恢复所属盘
+            if (modelData.plateId != null && this.plates.has(modelData.plateId)) {
+                model.plateId = modelData.plateId;
+            }
             // 恢复可打印状态
             if (modelData.printable !== undefined) {
                 model.printable = modelData.printable;
@@ -5047,14 +8992,18 @@ class BedPreview {
                 requestAnimationFrame(() => this._updateModelPrintAppearance(model));
             }
             const transformSource = model._transformProxy || model.mesh;
-            if (modelData.position) {
-                transformSource.position.set(
-                    modelData.position.x || 0, modelData.position.y || 0, modelData.position.z || 0
-                );
-            }
+            if (!model._accumRotation) model._accumRotation = new THREE.Euler(0, 0, 0, 'XYZ');
             if (modelData.rotation) {
-                transformSource.rotation.set(
-                    modelData.rotation.x || 0, modelData.rotation.y || 0, modelData.rotation.z || 0
+                transformSource.rotation.set(modelData.rotation.x || 0, modelData.rotation.y || 0, modelData.rotation.z || 0);
+                model._accumRotation.set(0, 0, 0);
+            }
+            if (modelData.position) {
+                // 保存的是相对所属盘左下角的局部坐标 → 转回世界坐标
+                const pc = this._getPlateWorldPos(model.plateId || this.freePlateId);
+                transformSource.position.set(
+                    (modelData.position.x || 0) + (pc.x - this.bedSize.x / 2),
+                    (modelData.position.y || 0) + (pc.y - this.bedSize.y / 2),
+                    modelData.position.z || 0
                 );
             }
             if (modelData.scale) {
@@ -5069,6 +9018,8 @@ class BedPreview {
             transformSource.updateMatrixWorld(true);
             this.lockZAxis();
             this.updateSelectionBoxes();
+            // 归位到所属盘容器（保存的 position 是相对该盘的局部坐标）
+            this._reparentModelToPlate(model, model.plateId || this.freePlateId);
         }
     }
 
@@ -5082,9 +9033,22 @@ class BedPreview {
                     setTimeout(() => {
                         const model = this.models.get(this.nextModelId - 1);
                         if (model && modelData) {
+                            if (modelData.plateId != null && this.plates.has(modelData.plateId)) {
+                                model.plateId = modelData.plateId;
+                            }
                             const transformSource = model._transformProxy || model.mesh;
-                            transformSource.position.set(modelData.position.x, modelData.position.y, modelData.position.z);
-                            transformSource.rotation.set(modelData.rotation.x, modelData.rotation.y, modelData.rotation.z);
+                            if (!model._accumRotation) model._accumRotation = new THREE.Euler(0, 0, 0, 'XYZ');
+                            if (modelData.rotation) {
+                                transformSource.rotation.set(modelData.rotation.x || 0, modelData.rotation.y || 0, modelData.rotation.z || 0);
+                                model._accumRotation.set(0, 0, 0);
+                            }
+                            // 保存的是相对所属盘左下角的局部坐标 → 转回世界坐标（与直接嵌入数据的流程一致）
+                            const pc = this._getPlateWorldPos(model.plateId || this.freePlateId);
+                            transformSource.position.set(
+                                (modelData.position.x || 0) + (pc.x - this.bedSize.x / 2),
+                                (modelData.position.y || 0) + (pc.y - this.bedSize.y / 2),
+                                modelData.position.z || 0
+                            );
                             transformSource.scale.set(modelData.scale.x, modelData.scale.y, modelData.scale.z);
                             transformSource.updateMatrixWorld(true);
                             this.lockZAxis();
@@ -5143,11 +9107,6 @@ class BedPreview {
                 if (result.success && result.settings) {
                     const s = result.settings;
                     if (s.maxHistory) this.historyManager.setMaxSize(s.maxHistory);
-                    if (s.bedSize) {
-                        if (s.bedSize.x) this.bedSize.x = s.bedSize.x;
-                        if (s.bedSize.y) this.bedSize.y = s.bedSize.y;
-                        if (s.bedSize.z) this.bedSize.z = s.bedSize.z;
-                    }
                     if (s.showGrid !== undefined) this.showGrid = s.showGrid;
                     if (s.gridSize) this.gridSize = s.gridSize;
                     if (s.gridTheme) this.gridTheme = s.gridTheme;
@@ -5158,8 +9117,6 @@ class BedPreview {
                         this._createCamera(width, height);
                         this.createBed();
                     }
-                    if (s.printerAddress !== undefined) this.printerAddress = s.printerAddress;
-                    if (s.headAddress !== undefined) this.headAddress = s.headAddress;
                     if (s.orcaSlicerPath !== undefined) this.orcaSlicerPath = s.orcaSlicerPath;
                     if (s.snapmakerOrcaPath !== undefined) this.snapmakerOrcaPath = s.snapmakerOrcaPath;
                     if (s.gcodeSlicerType !== undefined) this.gcodeSlicerType = s.gcodeSlicerType;
@@ -5167,6 +9124,24 @@ class BedPreview {
                 }
             } catch (e) {
                 console.error('加载设置失败:', e);
+            }
+        }
+        // 从后端加载打印机设置
+        if (window.pywebview && window.pywebview.api) {
+            try {
+                const result = await window.pywebview.api.load_printer_settings();
+                if (result.success && result.settings) {
+                    const s = result.settings;
+                    if (s.bedSize) {
+                        if (s.bedSize.x) this.bedSize.x = s.bedSize.x;
+                        if (s.bedSize.y) this.bedSize.y = s.bedSize.y;
+                        if (s.bedSize.z) this.bedSize.z = s.bedSize.z;
+                    }
+                    if (s.printerAddress !== undefined) this.printerAddress = s.printerAddress;
+                    if (s.headAddress !== undefined) this.headAddress = s.headAddress;
+                }
+            } catch (e) {
+                console.error('加载打印机设置失败:', e);
             }
         }
 
@@ -5253,7 +9228,6 @@ class BedPreview {
             try {
                 const settings = {
                     maxHistory: this.historyManager.maxSize,
-                    bedSize: { ...this.bedSize },
                     showGrid: this.showGrid,
                     gridTheme: this.gridTheme,
                     gridSize: this.gridSize,
@@ -5261,7 +9235,7 @@ class BedPreview {
                     orcaSlicerPath: this.orcaSlicerPath || '',
                     snapmakerOrcaPath: this.snapmakerOrcaPath || '',
                     gcodeSlicerType: this.gcodeSlicerType || 'orcaslicer',
-                    textureResolution: this.textureResolution || 4000
+                    textureResolution: this.textureResolution || 4000,
                 };
                 const result = await window.pywebview.api.save_settings(JSON.stringify(settings));
                 if (!result.success) {
@@ -5356,7 +9330,6 @@ class BedPreview {
                         }
                         const pathInput = document.getElementById('orcaslicer-path');
                         if (pathInput) pathInput.value = result.path;
-                        this.showToast(`已检测到: ${result.path}`, 'success');
                     } else {
                         this.showToast('未找到切片器快捷方式，请手动选择', 'warning');
                     }
@@ -5388,7 +9361,6 @@ class BedPreview {
                         }
                         const pathInput = document.getElementById('orcaslicer-path');
                         if (pathInput) pathInput.value = result.path;
-                        this.showToast(`已选择: ${result.path}`, 'success');
                     }
                 } catch (e) {
                     this.showToast('选择文件异常: ' + e.message, 'error');
@@ -5530,6 +9502,7 @@ class BedPreview {
         const saveBtn = document.getElementById('printer-save');
         const testPrinterBtn = document.getElementById('test-printer-btn');
         const testHeadBtn = document.getElementById('test-head-btn');
+        const installPluginBtn = document.getElementById('install-plugin-btn');
 
         if (editBtn) {
             editBtn.addEventListener('click', () => {
@@ -5542,10 +9515,13 @@ class BedPreview {
         if (saveBtn) saveBtn.addEventListener('click', () => this.savePrinterSettings());
 
         if (testPrinterBtn) {
-            testPrinterBtn.addEventListener('click', () => this.testConnection('printer-address', 'printer-status'));
+            testPrinterBtn.addEventListener('click', () => this.testConnection('printer-address', 'printer-status', 'printer'));
         }
         if (testHeadBtn) {
-            testHeadBtn.addEventListener('click', () => this.testConnection('head-address', 'head-status'));
+            testHeadBtn.addEventListener('click', () => this.testConnection('head-address', 'head-status', 'head'));
+        }
+        if (installPluginBtn) {
+            installPluginBtn.addEventListener('click', () => this.installPrinterPlugin());
         }
 
         const dialog = document.getElementById('printer-dialog');
@@ -5614,14 +9590,14 @@ class BedPreview {
                     printerAddress: this.printerAddress || '',
                     headAddress: this.headAddress || ''
                 };
-                window.pywebview.api.save_settings(JSON.stringify(settings));
+                window.pywebview.api.save_printer_settings(JSON.stringify(settings));
             } catch (e) {
                 console.error('保存打印机设置异常:', e);
             }
         }
     }
 
-    async testConnection(addressId, statusId) {
+    async testConnection(addressId, statusId, role) {
         const addressInput = document.getElementById(addressId);
         const statusEl = document.getElementById(statusId);
         const testBtn = addressId === 'printer-address'
@@ -5638,34 +9614,150 @@ class BedPreview {
         }
 
         testBtn.disabled = true;
-        statusEl.textContent = '测试中...';
-        statusEl.className = 'test-status testing';
+        testBtn.textContent = '...';
+        statusEl.textContent = '';
 
         try {
             let result;
             if (window.pywebview && window.pywebview.api) {
-                result = await window.pywebview.api.test_connection(address);
+                if (role === 'printer') {
+                    result = await window.pywebview.api.test_printer_fluidd(address);
+                } else {
+                    result = await window.pywebview.api.test_head_mbrush(address);
+                }
             } else {
                 await new Promise(resolve => setTimeout(resolve, 1000));
-                result = { success: true, message: '连接成功' };
+                result = { success: true, message: 'OK' };
             }
 
             if (result.success) {
-                statusEl.textContent = '连接成功';
-                statusEl.className = 'test-status success';
+                testBtn.textContent = 'OK';
+                testBtn.classList.add('test-ok');
+                testBtn.classList.remove('test-fail');
+                if (role === 'printer') this._printerTestPassed = true;
+                else this._headTestPassed = true;
             } else {
-                statusEl.textContent = '无法连接';
-                statusEl.className = 'test-status fail';
+                testBtn.textContent = result.message;
+                testBtn.classList.add('test-fail');
+                testBtn.classList.remove('test-ok');
+                if (role === 'printer') this._printerTestPassed = false;
+                else this._headTestPassed = false;
             }
+
+            this._updatePluginInstallBtn();
         } catch (e) {
-            statusEl.textContent = '测试失败';
+            statusEl.textContent = '失败';
             statusEl.className = 'test-status fail';
         } finally {
             testBtn.disabled = false;
         }
     }
 
+    _updatePluginInstallBtn() {
+        const btn = document.getElementById('install-plugin-btn');
+        if (!btn) return;
+
+        const passed = this._printerTestPassed;
+        if (!passed) {
+            btn.disabled = true;
+            btn.classList.remove('ready', 'installed');
+            btn.textContent = '安装插件';
+            return;
+        }
+
+        // 显示检测中，同时 SSH 检查
+        btn.disabled = true;
+        btn.classList.remove('ready', 'installed');
+        btn.textContent = '检测中...';
+
+        if (window.pywebview && window.pywebview.api) {
+            const printerAddr = document.getElementById('printer-address');
+            if (printerAddr) {
+                window.pywebview.api.check_printer_plugin_installed(printerAddr.value.trim())
+                    .then(result => {
+                        if (result.success && result.installed) {
+                            btn.classList.add('installed');
+                            btn.textContent = '已安装';
+                        } else {
+                            btn.disabled = false;
+                            btn.classList.add('ready');
+                            btn.textContent = '安装插件';
+                        }
+                    })
+                    .catch(() => {
+                        btn.classList.remove('ready', 'installed');
+                        btn.textContent = '安装插件';
+                    });
+            }
+        }
+    }
+
+    async installPrinterPlugin() {
+        const btn = document.getElementById('install-plugin-btn');
+        const printerAddr = document.getElementById('printer-address');
+        if (!btn || !printerAddr) return;
+
+        const address = printerAddr.value.trim();
+        if (!address) return;
+
+        btn.disabled = true;
+        btn.textContent = '安装中...';
+
+        try {
+            let result;
+            if (window.pywebview && window.pywebview.api) {
+                result = await window.pywebview.api.install_printer_plugin(address);
+            } else {
+                result = { success: false, message: 'API不可用' };
+            }
+
+            if (result.success) {
+                btn.classList.add('installed');
+                btn.classList.remove('ready');
+                btn.textContent = '已安装';
+            } else {
+                btn.disabled = false;
+                btn.classList.add('ready');
+                btn.classList.remove('installed');
+                btn.textContent = '安装插件';
+            }
+        } catch (e) {
+            btn.disabled = false;
+            btn.classList.add('ready');
+            btn.classList.remove('installed');
+            btn.textContent = '安装插件';
+        }
+    }
+
     // ===== 切片功能 =====
+
+    // 计算切片聚焦区：当前盘上可见可打印模型的 X/Y 包围盒（OBJ 空间），外扩 20mm padding。
+    // 返回 {x, y, w, h} 单位 mm；无可用模型返回 null。用于后端生成"预览图缩放指导"。
+    _computeSliceFocusMm() {
+        const PAD = 20;
+        const off = this._getPlateExportOffset();
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+        let found = false;
+        this.models.forEach((model) => {
+            if (!model.mesh || !model.visible || !model.printable) return;
+            if (!this._isOnCurrentPlate(model)) return;
+            model.mesh.updateMatrixWorld(true);
+            const box = new THREE.Box3().setFromObject(model.mesh);
+            // Must match _exportOBJWithPlanes(): exported OBJ coords are world + off.
+            minX = Math.min(minX, box.min.x + off.x);
+            minY = Math.min(minY, box.min.y + off.y);
+            maxX = Math.max(maxX, box.max.x + off.x);
+            maxY = Math.max(maxY, box.max.y + off.y);
+            found = true;
+        });
+        if (!found || maxX - minX <= 0 || maxY - minY <= 0) return null;
+        return {
+            x: minX - PAD,
+            y: minY - PAD,
+            w: (maxX - minX) + PAD * 2,
+            h: (maxY - minY) + PAD * 2,
+        };
+    }
 
     async doSlicing() {
         if (!window.pywebview || !window.pywebview.api) {
@@ -5682,6 +9774,35 @@ class BedPreview {
         if (this.models.size === 0) {
             this.showToast('请先导入模型', 'info');
             return;
+        }
+
+        // ★ 模型切片必须先于纹理切片 —— 必须有 gcode 文件才能获取层高/空驶速度/加速度等参数
+        if (!this._testGcodePath || !this._lastGcode) {
+            this.showToast('请先执行模型切片并载入 GCode 文件', 'warning');
+            return;
+        }
+
+        // 检查 gcode 文件是否存在
+        try {
+            const gcodeCheck = await window.pywebview.api.load_gcode_file(this._testGcodePath);
+            if (!gcodeCheck || !gcodeCheck.success) {
+                this.showToast('GCode 文件不存在，请重新执行模型切片', 'warning');
+                return;
+            }
+        } catch (e) {
+            this.showToast('GCode 文件读取失败，请重新执行模型切片', 'warning');
+            return;
+        }
+
+        // ★ 每次激活纹理切片自动锁定当前盘，防止模型与 Orca 位置不一致
+        {
+            const _activePlateId = this.currentPlateId;
+            if (_activePlateId != null && !this.isPlateLocked(_activePlateId)) {
+                const _name = this.plates.get(_activePlateId)?.name || `盘 ${_activePlateId}`;
+                if (this._lockPlateInternal(_activePlateId)) {
+                    this.showToast(`已自动锁定「${_name}」，防止模型位移`, 'info');
+                }
+            }
         }
 
         // 1. 先导出带纹理的 OBJ（模型 + 四角定位面 + MTL + 贴图）
@@ -5703,13 +9824,39 @@ class BedPreview {
             return;
         }
 
-        // 2. 层高参数（固定值）
-        const layerHeight = 0.2;
+        // 2. 从 gcode 中获取切片参数（空驶速度/加速度/层高等）
+        const inkjetSpeedEl = document.getElementById('inkjet-speed');
+        const inkjetSpeed = inkjetSpeedEl ? parseInt(inkjetSpeedEl.value) || 50 : 50;
+        let sliceParams = null;
+        try {
+            const extractResult = await window.pywebview.api.extract_gcode_params(
+                this._testGcodePath, inkjetSpeed
+            );
+            if (extractResult && extractResult.success && extractResult.params) {
+                sliceParams = extractResult.params;
+                this._lastSliceParams = sliceParams;
+                // 打印预估信息
+                console.log('[GCode参数] 层高={}mm 层数={} 空驶速度={}mm/s 加速度={}mm/s² 预估时长={}'.format(
+                    sliceParams.layer_height, sliceParams.total_layers,
+                    sliceParams.travel_speed, sliceParams.travel_accel,
+                    sliceParams.estimated_time
+                ));
+            } else {
+                console.warn('[GCode参数] 提取失败:', extractResult?.error);
+            }
+        } catch (e) {
+            console.warn('[GCode参数] 提取异常:', e);
+        }
 
-        // 3. 获取纹理分辨率设置
+        // 3. 层高参数 —— 优先使用从 gcode 中读取的值
+        const layerHeight = (sliceParams && sliceParams.layer_height)
+            ? sliceParams.layer_height
+            : 0.2;
+
+        // 4. 获取纹理分辨率设置
         const resolution = this.textureResolution || 4000;
 
-        // 4. 启动子进程切片（非阻塞）
+        // 5. 启动子进程切片（非阻塞）
         this._sliceRunning = true;
         this._sliceCancelled = false;
         this._pollTimer = null;
@@ -5736,14 +9883,25 @@ class BedPreview {
             progressText.textContent = '0 / 0 层';
         }
 
-        this.showToast('正在纹理切片中...', 'info');
-
         try {
             const config = {
                 obj_path: objPath,
                 layer_height: layerHeight,
                 resolution: resolution,
             };
+            // ★ 传模型聚焦区（OBJ 空间 bbox + padding，mm）→ 后端换算成预览图缩放指导
+            const focusMm = this._computeSliceFocusMm();
+            if (focusMm) config.focus_mm = focusMm;
+            // ★ 将切片参数传递到后端纹理切片，用于运动规划和时间预测
+            if (sliceParams) {
+                config.travel_speed = sliceParams.travel_speed;
+                config.travel_accel = sliceParams.travel_accel;
+                config.print_speed = Math.max(
+                    sliceParams.inner_wall_speed || 300,
+                    sliceParams.outer_wall_speed || 200
+                );
+                config.inkjet_speed = inkjetSpeed;
+            }
             const startResult = await window.pywebview.api.texture_slice_start(JSON.stringify(config));
             if (!startResult || !startResult.success) {
                 this.showToast('纹理切片启动失败: ' + (startResult ? startResult.error : '无返回'), 'error');
@@ -5752,7 +9910,7 @@ class BedPreview {
                 return;
             }
 
-            // 5. 轮询进度
+            // 6. 轮询进度
             await this._pollSliceProgress(progressEl, progressFill, progressText);
         } catch (e) {
             console.error('纹理切片异常:', e);
@@ -5787,7 +9945,7 @@ class BedPreview {
                     if (status.state === 'error') {
                         this._hideSliceProgress();
                         this._setPreviewTabDisabled(false);
-                        this.showToast('纹理切片失败: ' + (status.error || '未知错误'), 'error');
+                        this.showToast('切片+后处理失败: ' + (status.error || '未知错误'), 'error');
                         resolve();
                         return;
                     }
@@ -5796,28 +9954,74 @@ class BedPreview {
                     if (status.total > 0) {
                         const pct = Math.round((status.progress / status.total) * 100);
                         if (progressFill) progressFill.style.width = pct + '%';
-                        if (progressText) progressText.textContent = `${status.progress} / ${status.total} 层`;
+                        const done = status.progress >= status.total;
+                        const stageText = done ? '分配纹理块中' :
+                                          status.stage === 'postprocess' ? '后处理中' :
+                                          status.stage === 'strip' ? '条带切割中' :
+                                          '切片中';
+                        if (progressText) progressText.textContent = done ? '分配纹理块中' : `${stageText} ${status.progress} / ${status.total} 层`;
                     }
 
-                    if (status.state === 'done') {
-                        // 加载生成的图片
-                        const imgResult = await window.pywebview.api.texture_slice_load_images();
+                    // 一体化完成：切片 + 条带 + 后处理全部完成
+                    if (status.state === 'complete') {
                         this._hideSliceProgress();
                         this._setPreviewTabDisabled(false);
 
-                        if (imgResult && imgResult.success && imgResult.images && imgResult.images.length > 0) {
-                            this.showToast(`纹理切片完成，共 ${imgResult.count} 层`, 'success');
-                            this.switchToPreview();
-                            this.displaySliceImages(imgResult.images);
-                        } else {
-                            this.showToast('纹理切片完成，但未生成图片', 'warning');
+                        // 标记切片已完成
+                        this._sliceCompleted = true;
+
+                        // 立即上传后处理 GCode 到打印机（不启动打印）
+                        if (status.gcode_path) {
+                            try {
+                                const uploadResult = await window.pywebview.api.upload_gcode_to_printer();
+                                if (uploadResult && uploadResult.success) {
+                                    this.showToast('GCode 已上传至打印机，等待用户启动打印', 'success');
+                                } else {
+                                    console.warn('[SlicePoll] 上传 GCode 失败:', uploadResult?.error);
+                                    this.showToast('GCode 上传失败: ' + (uploadResult?.error || '未知错误'), 'warning');
+                                }
+                            } catch (e) {
+                                console.error('[SlicePoll] 上传 GCode 异常:', e);
+                            }
                         }
-                        resolve();
-                        return;
+
+                        // 加载切片预览图 — 先存图片再切换页面，避免 switchToPreview
+                        // 中的异步 _loadPreviewFolderImages 覆盖切片结果（竞态条件）
+                        const imgResult = await window.pywebview.api.texture_slice_load_images();
+                        if (imgResult && imgResult.success && imgResult.files && imgResult.files.length > 0) {
+                            this.showToast(`切片+后处理完成，共 ${imgResult.count} 层`, 'success');
+                            this.displaySliceImages(imgResult);
+                            this.switchToPreview();
+                        }
+
+                        // 加载最终 GCode 到预览
+                        if (status.gcode_path) {
+                            try {
+                                const gcodeResult = await window.pywebview.api.load_gcode_file(status.gcode_path);
+                                if (gcodeResult && gcodeResult.success) {
+                                    console.log('[SlicePoll] 加载后处理 GCode 成功:', status.gcode_path);
+                                    this._lastGcode = gcodeResult.gcode;
+                                    this._testGcodePath = status.gcode_path;
+                                    this._updatePrintStatusText();
+                                    // 隐藏占位符
+                                    const placeholder = document.getElementById('gcode-drop-placeholder');
+                                    if (placeholder) placeholder.style.display = 'none';
+                                    // 渲染 3D 轨迹
+                                    setTimeout(() => {
+                                        if (this._gcode3DRenderer) this._renderToolpath3D();
+                                    }, 200);
+                                }
+                            } catch (e) {
+                                console.error('[SlicePoll] 加载后处理 GCode 失败:', e);
+                            }
+
+                            resolve();
+                            return;
+                        }
                     }
 
-                    // 继续轮询
-                    this._pollTimer = setTimeout(poll, 300);
+                    // 继续轮询（done / strips_done 状态也继续等待 postprocess 完成）
+                    this._pollTimer = setTimeout(poll, 500);
                 } catch (e) {
                     console.error('轮询切片状态异常:', e);
                     this._hideSliceProgress();
@@ -5845,9 +10049,152 @@ class BedPreview {
         }
     }
 
+    /** 开始轮询头样子进程（Orca 调起的后处理）进度 */
+    _startHeadlessPolling() {
+        // 如果已有内部切片在运行，不启动
+        if (this._sliceRunning) {
+            console.log('[HeadlessPoll] 内部切片运行中，跳过启动');
+            return;
+        }
+        // 如果已经在轮询，不重复启动
+        if (this._headlessPollTimer) {
+            console.log('[HeadlessPoll] 已在轮询，跳过重复启动');
+            return;
+        }
+        console.log('[HeadlessPoll] 启动轮询');
+
+        const poll = async () => {
+            // 已取消切片，停止轮询
+            if (this._sliceCancelled) {
+                console.log('[HeadlessPoll] 切片已取消，停止头状轮询');
+                this._stopHeadlessPolling();
+                return;
+            }
+            // 内部切片开始了，停止本轮询
+            if (this._sliceRunning) {
+                console.log('[HeadlessPoll] 内部切片启动，停止头状轮询');
+                this._stopHeadlessPolling();
+                return;
+            }
+            try {
+                const status = await window.pywebview.api.texture_slice_get_status();
+                console.log('[HeadlessPoll] 收到状态:', JSON.stringify(status));
+                // API 调用期间可能已取消，再次检查
+                if (this._sliceCancelled) {
+                    console.log('[HeadlessPoll] 切片已取消（API 返回后检出），停止头状轮询');
+                    this._stopHeadlessPolling();
+                    return;
+                }
+                if (!status || status.state === 'idle') {
+                    // 未检测到头样子进程，继续轮询
+                    this._headlessPollTimer = setTimeout(poll, 2000);
+                    return;
+                }
+
+                // 如果已经处理过完成/错误状态，不再重复处理
+                if (this._headlessDone && (status.state === 'complete' || status.state === 'error')) {
+                    this._hideSliceProgress();
+                    return;
+                }
+
+                console.log('[HeadlessPoll] 状态:', status.state, status.stage);
+
+                if (status.state === 'complete') {
+                    console.log('[HeadlessPoll] 头样子进程完成');
+                    this._headlessDone = true;
+                    this._headlessPollTimer = null;
+                    this._hideSliceProgress();
+                    this._sliceCompleted = true;
+
+                    // 加载预览图和 GCode，完成后跳转预览页
+                    const imgResult = await window.pywebview.api.texture_slice_load_images();
+                    if (imgResult && imgResult.success && imgResult.files && imgResult.files.length > 0) {
+                        this.showToast(`后处理完成，共 ${imgResult.count} 层`, 'success');
+                        this.displaySliceImages(imgResult);
+                    }
+                    if (status.gcode_path) {
+                        try {
+                            const gcodeResult = await window.pywebview.api.load_gcode_file(status.gcode_path);
+                            if (gcodeResult && gcodeResult.success) {
+                                this._lastGcode = gcodeResult.gcode;
+                                this._testGcodePath = status.gcode_path;
+                                this._updatePrintStatusText();
+                                const placeholder = document.getElementById('gcode-drop-placeholder');
+                                if (placeholder) placeholder.style.display = 'none';
+                                setTimeout(() => {
+                                    if (this._gcode3DRenderer) this._renderToolpath3D();
+                                }, 200);
+                            }
+                        } catch (e) {
+                            console.error('[HeadlessPoll] 加载 GCode 失败:', e);
+                        }
+                        // 自动上传后处理好的 GCode 到打印机
+                        try {
+                            const uploadResult = await window.pywebview.api.upload_gcode_to_printer();
+                            if (uploadResult && uploadResult.success) {
+                                this.showToast('GCode 已上传至打印机', 'success');
+                            } else {
+                                console.warn('[HeadlessPoll] 上传失败:', uploadResult?.error);
+                            }
+                        } catch (e) {
+                            console.error('[HeadlessPoll] 上传异常:', e);
+                        }
+                    }
+                    // 自动跳转预览页
+                    this.switchToPreview();
+                    return;
+                }
+
+                if (status.state === 'error') {
+                    this._headlessDone = true;
+                    this._headlessPollTimer = null;
+                    this._hideSliceProgress();
+                    this.showToast('后处理失败: ' + (status.error || '未知错误'), 'error');
+                    return;
+                }
+
+                // 运行中：在所有页面显示进度条（不仅限预览页）
+                const progressEl = document.getElementById('slice-progress');
+                const progressFill = document.getElementById('slice-progress-fill');
+                const progressText = document.getElementById('slice-progress-text');
+                if (progressEl) progressEl.classList.remove('hidden');
+                const done = status.total > 0 && status.progress >= status.total;
+                const stageText = done ? '分配纹理块中' :
+                                  status.stage === 'postprocess' ? '分配纹理块中' :
+                                  status.stage === 'texture' ? '切片中' : '准备中';
+                if (status.total > 0) {
+                    progressFill && progressFill.classList.remove('indeterminate');
+                    const pct = Math.round((status.progress / status.total) * 100);
+                    if (progressFill) progressFill.style.width = pct + '%';
+                    if (progressText) progressText.textContent = done ? '分配纹理块中' : `${stageText} ${status.progress} / ${status.total} 层`;
+                } else {
+                    // 未知总量时显示滑动动画（indeterminate）
+                    progressFill && progressFill.classList.add('indeterminate');
+                    if (progressText) progressText.textContent = `${stageText}...`;
+                }
+
+                this._headlessPollTimer = setTimeout(poll, 1000);
+            } catch (e) {
+                console.error('[HeadlessPoll] 轮询异常:', e);
+                this._headlessPollTimer = setTimeout(poll, 2000);
+            }
+        };
+
+        poll();
+    }
+
+    /** 停止头样子进程进度轮询 */
+    _stopHeadlessPolling() {
+        if (this._headlessPollTimer) {
+            clearTimeout(this._headlessPollTimer);
+            this._headlessPollTimer = null;
+        }
+    }
+
     _hideSliceProgress() {
         this._sliceRunning = false;
         this._sliceCancelled = true; // 确保轮询不再继续
+        this._stopHeadlessPolling();
         const progressEl = document.getElementById('slice-progress');
         if (progressEl) progressEl.classList.add('hidden');
         if (this._pollTimer) {
@@ -5879,7 +10226,6 @@ class BedPreview {
         }
 
         // 1. 导出 STL
-        this.showToast('正在导出 STL...', 'info');
         const stlResult = await this._exportSTLWithPlanes();
         if (!stlResult || !stlResult.success) {
             this.showToast('STL 导出失败: ' + (stlResult ? stlResult.error : ''), 'error');
@@ -5914,11 +10260,47 @@ class BedPreview {
             return;
         }
 
-        // 3. 打开 OrcaSlicer GUI 并加载 STL
+        // 3. 导出纹理 OBJ 到固定路径，写入 pending_slice.json 供 Orca 调起的子进程读取
+        try {
+            const objExportResult = await this._exportOBJWithPlanes();
+            if (objExportResult && objExportResult.success && objExportResult.path) {
+                const objPath = objExportResult.path;
+                const resolution = this.textureResolution || 4000;
+                // 一并传入聚焦区（模型包围盒+padding），让后端写 pending 时同步算好聚焦指导
+                const focusMm = this._computeSliceFocusMm();
+                const writeResult = await window.pywebview.api.write_pending_slice(
+                    objPath, 0.2, resolution, focusMm
+                );
+                console.log('[Slice] write_pending_slice OK, obj:', objPath, writeResult);
+            } else {
+                console.warn('[Slice] OBJ 导出失败，子进程无法执行纹理切片');
+            }
+        } catch (e) {
+            console.error('[Slice] write_pending_slice 失败:', e);
+        }
+
+        // 3.5 ★ 打开 Orca 前锁定当前盘，防止 Orca 中与本地位置不一致
+        {
+            const _pid = this.currentPlateId;
+            if (_pid != null && !this.isPlateLocked(_pid)) {
+                const _name = this.plates.get(_pid)?.name || `盘 ${_pid}`;
+                if (this._lockPlateInternal(_pid)) {
+                    this.showToast(`已自动锁定「${_name}」，防止模型位移`, 'info');
+                }
+            }
+        }
+
+        // 4. 打开 OrcaSlicer GUI 并加载 STL
         try {
             const openResult = await window.pywebview.api.open_with_orca_slicer(stlResult.path, slicerPath);
             if (openResult.success) {
-                this.showToast('已打开 OrcaSlicer', 'success');
+                this.showToast('已打开 OrcaSlicer，请在 Orca 中切片并执行后处理', 'success');
+                // 启动后台轮询，监听 Orca 调起的后处理进度
+                this._stopHeadlessPolling();
+                this._sliceRunning = false;
+                this._sliceCancelled = false;
+                this._headlessDone = false;
+                this._startHeadlessPolling();
             } else {
                 this.showToast('打开 OrcaSlicer 失败: ' + (openResult.error || ''), 'error');
             }
@@ -5927,24 +10309,105 @@ class BedPreview {
         }
     }
 
-    /** 开始打印 */
-    async startPrint() {
+    /** 重试切片：不重新唤起 OrcaSlicer，仅重建 pending_slice 并开始轮询 */
+    async retrySlice() {
         if (!window.pywebview || !window.pywebview.api) {
             this.showToast('后端API不可用', 'error');
             return;
         }
-        this.showToast('正在准备打印...', 'info');
+        if (this.models.size === 0) {
+            this.showToast('场景中没有模型', 'warning');
+            return;
+        }
+
+        // 重新导出纹理 OBJ 并写入 pending_slice.json
         try {
-            // 调用后端打印接口
-            const result = await window.pywebview.api.start_print();
-            if (result && result.success) {
-                this.showToast('打印已开始', 'success');
+            const objExportResult = await this._exportOBJWithPlanes();
+            if (objExportResult && objExportResult.success && objExportResult.path) {
+                const objPath = objExportResult.path;
+                const resolution = this.textureResolution || 4000;
+                // 一并传入聚焦区，让后端写 pending 时同步算好聚焦指导
+                const focusMm = this._computeSliceFocusMm();
+                const writeResult = await window.pywebview.api.write_pending_slice(
+                    objPath, 0.2, resolution, focusMm
+                );
+                console.log('[Retry] write_pending_slice OK, obj:', objPath, writeResult);
             } else {
-                this.showToast('打印启动失败: ' + (result ? result.error : '未知错误'), 'error');
+                this.showToast('OBJ 导出失败，无法重试', 'error');
+                return;
             }
         } catch (e) {
-            console.error('打印异常:', e);
+            console.error('[Retry] write_pending_slice 失败:', e);
+            this.showToast('重试准备失败: ' + e.message, 'error');
+            return;
+        }
+
+        this.showToast('请在 OrcaSlicer 中重新切片', 'success');
+        // 重置状态并启动头状轮询
+        this._stopHeadlessPolling();
+        this._sliceRunning = false;
+        this._sliceCancelled = false;
+        this._headlessDone = false;
+        this._startHeadlessPolling();
+    }
+
+    /** 开始打印（简化版：失败直接显示无法连接） */
+    async startPrint() {
+        const el = document.getElementById('print-status-text');
+        if (!el || !window.pywebview || !window.pywebview.api) return;
+        try {
+            el.textContent = '正在打印...';
+            el.disabled = true;
+            const result = await window.pywebview.api.start_print();
+            if (result && result.success) {
+                el.textContent = '立即打印';
+                this.showToast('打印已启动', 'success');
+            } else {
+                el.textContent = '无法连接';
+                this.showToast('打印失败: ' + (result?.error || '无法连接'), 'error');
+            }
+        } catch (e) {
+            el.textContent = '无法连接';
             this.showToast('打印异常: ' + e.message, 'error');
+        } finally {
+            el.disabled = false;
+        }
+    }
+
+    /** 更新打印状态按钮（导航栏"立即打印"按钮）。
+     *  仅当处于预览页且有 GCode 时才显示，避免在其他标签页提前出现。 */
+    _updatePrintStatusText() {
+        const btn = document.getElementById('btn-print-gcode');
+        if (!btn) return;
+        const previewPage = document.getElementById('preview-page');
+        const onPreview = !(previewPage && previewPage.classList.contains('hidden'));
+        if (this._lastGcode && onPreview) {
+            btn.classList.remove('hidden');
+        } else {
+            btn.classList.add('hidden');
+        }
+    }
+
+    /** 开始打印（导航栏"立即打印"按钮） */
+    async startPrint() {
+        const btn = document.getElementById('btn-print-gcode');
+        if (!btn || !window.pywebview || !window.pywebview.api) return;
+        try {
+            btn.textContent = '正在打印...';
+            btn.disabled = true;
+            const result = await window.pywebview.api.start_print();
+            if (result && result.success) {
+                btn.textContent = '立即打印';
+                this.showToast('打印已启动', 'success');
+            } else {
+                btn.textContent = '无法连接';
+                this.showToast('打印失败: ' + (result?.error || '无法连接'), 'error');
+            }
+        } catch (e) {
+            btn.textContent = '无法连接';
+            this.showToast('打印异常: ' + e.message, 'error');
+        } finally {
+            btn.disabled = false;
         }
     }
 
@@ -5975,6 +10438,9 @@ class BedPreview {
 
     doAutoArrange() {
         const spacing = parseFloat(document.getElementById('arrange-spacing')?.value || '5');
+        // 距打印板边界的留白（边界边距），独立于模型间距
+        const margin = parseFloat(document.getElementById('arrange-margin')?.value);
+        const pad = Number.isFinite(margin) ? Math.max(0, Math.min(margin, 50)) : 5;
         this.hideArrangeCard();
 
         const modelCount = this.models.size;
@@ -5983,24 +10449,27 @@ class BedPreview {
             return;
         }
 
-        // 获取每个模型相对自身局部原点的真实尺寸（不受 position 影响）
+        // 操作前取消所有选中：deselectModelInternal 会把 proxy 子级偏移折叠回 mesh 世界
+        // position 并销毁 proxy，避免下面直接写 item.mesh.position 时改的是 proxy 局部偏移
+        if (this.selectedModels.size > 0) {
+            this.clearSelection();
+        }
+
+        // 获取当前盘的世界方位：自动摆放在「当前盘」范围内部署，而不是床面原点
+        const plateCy = this._getPlateWorldPos(this.currentPlateId);
+        const plateOx = plateCy.x - this.bedSize.x / 2;
+        const plateOy = plateCy.y - this.bedSize.y / 2;
+
+        // 仅排列当前盘上的模型；用世界包围盒求真实尺寸与中心（含已烘焙/缩放），保证居中
         const items = [];
-        this.models.forEach((modelObj, id) => {
-            const localBox = new THREE.Box3();
-            modelObj.mesh.traverse((child) => {
-                if (child.isMesh && child.geometry) {
-                    child.geometry.computeBoundingBox();
-                    if (child.geometry.boundingBox) {
-                        const gb = child.geometry.boundingBox.clone();
-                        gb.applyMatrix4(child.matrix);
-                        localBox.expandByPoint(gb.min);
-                        localBox.expandByPoint(gb.max);
-                    }
-                }
-            });
-            const size = localBox.getSize(new THREE.Vector3());
+        this.models.forEach((modelObj) => {
+            if (!this._isOnCurrentPlate(modelObj)) return;
+            modelObj.mesh.updateMatrixWorld(true);
+            const box = new THREE.Box3().setFromObject(modelObj.mesh);
+            const size = box.getSize(new THREE.Vector3());
+            const center = box.getCenter(new THREE.Vector3());
             if (size.x > 0 && size.y > 0) {
-                items.push({ mesh: modelObj.mesh, size, area: size.x * size.y });
+                items.push({ model: modelObj, size, center, area: size.x * size.y });
             }
         });
 
@@ -6011,7 +10480,6 @@ class BedPreview {
 
         const bedW = this.bedSize.x;
         const bedH = this.bedSize.y;
-        const pad = Math.min(spacing, 8);
         const cols = Math.ceil(Math.sqrt(items.length));
 
         // 计算网格列宽行高
@@ -6032,47 +10500,111 @@ class BedPreview {
         const bedMaxX = bedW - pad;
         const bedMaxY = bedH - pad;
 
-        // 网格起始 XY（尽可能居中，且至少留 pad 边距）
+        // 网格起始 XY（尽可能居中于盘内，且至少留 pad 边距）
         const originX = Math.max(pad, (bedW - gridW) / 2);
         const originY = Math.max(pad, (bedH - gridH) / 2);
 
-        // 计算每个格子左上角
-        const gx = [];
+        // 计算每个格子中心（盘内局部坐标）
+        const gxc = [];
         let cx = originX;
         for (let c = 0; c < colW.length; c++) {
-            gx[c] = cx;
+            gxc[c] = cx + colW[c] / 2;
             cx += colW[c] + spacing;
         }
-        const gy = [];
+        const gyc = [];
         let cy = originY;
         for (let r = 0; r < rowH.length; r++) {
-            gy[r] = cy;
+            gyc[r] = cy + rowH[r] / 2;
             cy += rowH[r] + spacing;
         }
 
-        // 摆放
+        // 擦料塔避让：以塔的 XY 包围盒为禁区，模型格子中心不得落入塔盒
+        let towerBox = null;
+        {
+            const towerPos = this._getCurrentPlateTowerPos();
+            const towerSize = 32;
+            const thw = towerSize / 2, thd = towerSize / 2;
+            // 塔盒（世界坐标 XY），留出 spacing 作为额外间隙
+            towerBox = {
+                minX: towerPos.x - thw - spacing,
+                maxX: towerPos.x + thw + spacing,
+                minY: towerPos.y - thd - spacing,
+                maxY: towerPos.y + thd + spacing,
+            };
+        }
+        const _intersectsTower = (cx, cy, hw, hh) => {
+            const minX = cx - hw, maxX = cx + hw, minY = cy - hh, maxY = cy + hh;
+            return !(maxX < towerBox.minX || minX > towerBox.maxX || maxY < towerBox.minY || minY > towerBox.maxY);
+        };
+
+        // 摆放：把每个模型的世界包围盒中心移动到对应格子中心（盘内相对坐标 + 盘原点），避让擦料塔
         items.forEach((item, i) => {
             const c = i % cols;
             const r = Math.floor(i / cols);
 
-            // 格子中心
-            let px = gx[c] + colW[c] / 2;
-            let py = gy[r] + rowH[r] / 2;
+            let tx = gxc[c];
+            let ty = gyc[r];
 
-            // 确保整模型在热床内
+            // 确保整模型在盘内
             const hw = item.size.x / 2;
             const hh = item.size.y / 2;
-            px = Math.max(hw + pad, Math.min(bedMaxX - hw, px));
-            py = Math.max(hh + pad, Math.min(bedMaxY - hh, py));
+            tx = Math.max(pad + hw, Math.min(bedMaxX - hw, tx));
+            ty = Math.max(pad + hh, Math.min(bedMaxY - hh, ty));
 
-            console.log(`[auto-arrange] model#${i}: size(${item.size.x.toFixed(1)},${item.size.y.toFixed(1)}) pos(${px.toFixed(1)},${py.toFixed(1)})`);
-            item.mesh.position.x = px;
-            item.mesh.position.y = py;
-            item.mesh.position.z = item.size.z / 2;
+            let targetWorldX = plateOx + tx;
+            let targetWorldY = plateOy + ty;
+
+            // 若与擦料塔相交，沿 +X 方向逐格右移寻找空位；不行再沿 +Y 上移
+            if (_intersectsTower(targetWorldX, targetWorldY, hw, hh)) {
+                let placed = false;
+                // 优先在同行向右扫
+                for (let cc = c + 1; cc < colW.length && !placed; cc++) {
+                    let ntx = gxc[cc];
+                    ntx = Math.max(pad + hw, Math.min(bedMaxX - hw, ntx));
+                    const nx = plateOx + ntx;
+                    if (!_intersectsTower(nx, targetWorldY, hw, hh)) {
+                        targetWorldX = nx; placed = true;
+                    }
+                }
+                // 再尝试下一行行首开始扫
+                if (!placed) {
+                    for (let rr = r + 1; rr < rowH.length && !placed; rr++) {
+                        for (let cc = 0; cc < colW.length && !placed; cc++) {
+                            let ntx = gxc[cc], nty = gyc[rr];
+                            ntx = Math.max(pad + hw, Math.min(bedMaxX - hw, ntx));
+                            nty = Math.max(pad + hh, Math.min(bedMaxY - hh, nty));
+                            const nx = plateOx + ntx, ny = plateOy + nty;
+                            if (!_intersectsTower(nx, ny, hw, hh)) {
+                                targetWorldX = nx; targetWorldY = ny; placed = true;
+                            }
+                        }
+                    }
+                }
+                // 仍无空位则贴塔边缘推开（取塔盒外最近点）
+                if (!placed) {
+                    const candX = towerBox.maxX + hw + 1;
+                    const candY = towerBox.maxY + hh + 1;
+                    // 选更近且仍在盘内的候选
+                    const inX = candX >= plateOx + pad + hw && candX <= plateOx + bedMaxX - hw;
+                    const inY = candY >= plateOy + pad + hh && candY <= plateOy + bedMaxY - hh;
+                    if (inX && (!inY || Math.abs(candX - targetWorldX) <= Math.abs(candY - targetWorldY))) {
+                        targetWorldX = Math.max(plateOx + pad + hw, Math.min(plateOx + bedMaxX - hw, candX));
+                    } else if (inY) {
+                        targetWorldY = Math.max(plateOy + pad + hh, Math.min(plateOy + bedMaxY - hh, candY));
+                    }
+                }
+            }
+
+            // 以“中心对齐”方式移动，而不是硬设 position，避免模型原点不在几何中心时整体偏移
+            item.model.mesh.position.x += targetWorldX - item.center.x;
+            item.model.mesh.position.y += targetWorldY - item.center.y;
+            item.model.mesh.position.z = item.size.z / 2;
+            item.model.mesh.updateMatrixWorld(true);
+
+            console.log(`[auto-arrange] model#${i}: size(${item.size.x.toFixed(1)},${item.size.y.toFixed(1)}) target(${targetWorldX.toFixed(1)},${targetWorldY.toFixed(1)})`);
         });
 
         this.saveState('自动摆放');
-        this.showToast(`自动摆放完成（${items.length} 个模型，间距 ${spacing}mm）`, 'success');
     }
 
     /** 启动时从配置文件加载已保存的偏好设置并应用到场景 */
@@ -6112,25 +10644,6 @@ class BedPreview {
                 needsUpdate = true;
             }
 
-            // 应用热床大小
-            if (s.bedSize) {
-                let bedChanged = false;
-                if (s.bedSize.x && s.bedSize.x !== this.bedSize.x) {
-                    this.bedSize.x = s.bedSize.x; bedChanged = true;
-                }
-                if (s.bedSize.y && s.bedSize.y !== this.bedSize.y) {
-                    this.bedSize.y = s.bedSize.y; bedChanged = true;
-                }
-                if (s.bedSize.z && s.bedSize.z !== this.bedSize.z) {
-                    this.bedSize.z = s.bedSize.z; bedChanged = true;
-                }
-                if (bedChanged) {
-                    this.createBed();
-                    this.createGrid();
-                    needsUpdate = false; // already updated
-                }
-            }
-
             if (needsUpdate) {
                 this.createBed();
                 this.createGrid();
@@ -6139,6 +10652,34 @@ class BedPreview {
             console.log('已加载偏好设置:', s);
         } catch (e) {
             console.error('加载偏好设置失败:', e);
+        }
+
+        // 独立加载打印机设置
+        try {
+            const pResult = await window.pywebview.api.load_printer_settings();
+            if (pResult.success && pResult.settings) {
+                const ps = pResult.settings;
+                let bedChanged = false;
+                if (ps.bedSize) {
+                    if (ps.bedSize.x && ps.bedSize.x !== this.bedSize.x) {
+                        this.bedSize.x = ps.bedSize.x; bedChanged = true;
+                    }
+                    if (ps.bedSize.y && ps.bedSize.y !== this.bedSize.y) {
+                        this.bedSize.y = ps.bedSize.y; bedChanged = true;
+                    }
+                    if (ps.bedSize.z && ps.bedSize.z !== this.bedSize.z) {
+                        this.bedSize.z = ps.bedSize.z; bedChanged = true;
+                    }
+                }
+                if (ps.printerAddress !== undefined) this.printerAddress = ps.printerAddress;
+                if (ps.headAddress !== undefined) this.headAddress = ps.headAddress;
+                if (bedChanged) {
+                    this.createBed();
+                    this.createGrid();
+                }
+            }
+        } catch (e) {
+            console.error('加载打印机设置失败:', e);
         }
     }
 
@@ -6209,8 +10750,8 @@ class BedPreview {
                 try {
                     const settings = {
                         maxHistory: this.historyManager.maxSize,
-                        bedSize: { ...this.bedSize },
                         showGrid: this.showGrid,
+                        gridTheme: this.gridTheme,
                         gridSize: this.gridSize,
                         cameraMode: this.cameraMode,
                         orcaSlicerPath: this.orcaSlicerPath || '',
@@ -6231,21 +10772,176 @@ class BedPreview {
     }
 
     /**
+     * 将单个模型的当前几何体烘焙为临时 OBJ 文件
+     * 克隆所有子 mesh，应用世界矩阵到顶点，导出为 OBJ 并保存到后端临时目录
+     * @param {Object} model - 模型对象
+     * @returns {{ success: boolean, path?: string, error?: string }}
+     */
+    async _bakeSingleModelToOBJ(model) {
+        const meshes = [];
+        const texMap = {};
+        let textureCounter = 0;
+
+        model.mesh.updateWorldMatrix(true, true);
+        // 烘焙到“模型自身局部空间”：仅保留模型局部变换，去掉盘/世界偏移，
+        // 使烘焙结果与未烘焙的文件一致，配合保存的“盘相对位置”在加载时统一换算。
+        const invModelWorld = model.mesh.matrixWorld.clone().invert();
+        model.mesh.traverse((child) => {
+            if (!child.isMesh) return;
+            const geo = child.geometry.clone();
+            geo.applyMatrix4(child.matrixWorld);
+            geo.applyMatrix4(invModelWorld);
+            geo.computeVertexNormals();
+
+            let materialName = 'default';
+            let textureUrl = null;
+            let textureName = null;
+            let textureFlipY = true;
+
+            if (child.material) {
+                materialName = child.material.name || 'default';
+                if (child.material.map && child.material.map.image) {
+                    textureFlipY = child.material.map.flipY !== false;
+                    const b64 = this._textureToBase64(child.material.map.image);
+                    if (b64) {
+                        textureName = `tex_${textureCounter}.png`;
+                        textureCounter++;
+                        texMap[textureName] = b64;
+                        textureUrl = textureName;
+                    }
+                }
+            }
+
+            meshes.push({ geometry: geo, materialName, textureUrl, textureName, textureFlipY });
+        });
+
+        if (meshes.length === 0) return { success: false, error: '没有可导出的网格' };
+
+        // 生成 OBJ 内容（mtllib 引用需与后端保存的文件名一致）
+        const modelBase = model.name ? model.name.replace(/\.[^.]+$/, '') : 'model';
+        let objStr = '# Baked by MKPSpectrum\n';
+        const hasTextures = Object.keys(texMap).length > 0;
+        if (hasTextures) {
+            objStr += `mtllib ${modelBase}.mtl\n\n`;
+        }
+
+        let mtlStr = '# MTL generated by MKPSpectrum\n';
+        let vertexOffset = 0;
+        const usedMatNames = new Set();
+
+        for (const { geometry, materialName, textureUrl, textureName, textureFlipY } of meshes) {
+            const pos = geometry.getAttribute('position');
+            const uv = geometry.getAttribute('uv');
+            const norm = geometry.getAttribute('normal');
+            const index = geometry.index;
+
+            if (!pos || pos.count === 0) continue;
+
+            let matName;
+            if (textureName) {
+                matName = textureName.replace('.png', '_mat');
+            } else {
+                matName = 'default_mat';
+            }
+
+            if (!usedMatNames.has(matName)) {
+                usedMatNames.add(matName);
+                mtlStr += `\nnewmtl ${matName}\n`;
+                mtlStr += 'Kd 0.8 0.8 0.8\n';
+                mtlStr += 'Ks 0.0 0.0 0.0\n';
+                mtlStr += 'Ns 0\n';
+                mtlStr += 'd 1.0\n';
+                mtlStr += 'illum 2\n';
+                if (textureName) {
+                    mtlStr += `map_Kd ${textureName}\n`;
+                    mtlStr += `MKP_flipY ${textureFlipY ? 1 : 0}\n`;
+                }
+            }
+            objStr += `usemtl ${matName}\n`;
+
+            // 写顶点
+            for (let i = 0; i < pos.count; i++) {
+                objStr += `v ${pos.getX(i).toFixed(6)} ${pos.getY(i).toFixed(6)} ${pos.getZ(i).toFixed(6)}\n`;
+            }
+            // 写 UV
+            const hasUv = uv && uv.count > 0;
+            if (hasUv) {
+                for (let i = 0; i < uv.count; i++) {
+                    objStr += `vt ${uv.getX(i).toFixed(6)} ${uv.getY(i).toFixed(6)}\n`;
+                }
+            }
+            // 写法线
+            const hasNorm = norm && norm.count > 0;
+            if (hasNorm) {
+                for (let i = 0; i < norm.count; i++) {
+                    objStr += `vn ${norm.getX(i).toFixed(6)} ${norm.getY(i).toFixed(6)} ${norm.getZ(i).toFixed(6)}\n`;
+                }
+            }
+
+            // 写面
+            const faceCount = index ? index.count : pos.count;
+            for (let i = 0; i < faceCount; i += 3) {
+                let a, b, c;
+                if (index) {
+                    a = index.getX(i) + 1 + vertexOffset;
+                    b = index.getX(i + 1) + 1 + vertexOffset;
+                    c = index.getX(i + 2) + 1 + vertexOffset;
+                } else {
+                    a = i + 1 + vertexOffset;
+                    b = i + 2 + vertexOffset;
+                    c = i + 3 + vertexOffset;
+                }
+                if (hasUv && hasNorm) {
+                    objStr += `f ${a}/${a}/${a} ${b}/${b}/${b} ${c}/${c}/${c}\n`;
+                } else if (hasUv) {
+                    objStr += `f ${a}/${a} ${b}/${b} ${c}/${c}\n`;
+                } else {
+                    objStr += `f ${a} ${b} ${c}\n`;
+                }
+            }
+
+            vertexOffset += pos.count;
+        }
+
+        // 发送到后端保存
+        const payload = {
+            obj: objStr,
+            mtl: hasTextures ? mtlStr : '',
+            textures: texMap,
+            name: model.name,
+        };
+
+        try {
+            const result = await window.pywebview.api.save_baked_model_to_temp(JSON.stringify(payload));
+            return result || { success: false, error: '后端返回空' };
+        } catch (e) {
+            console.error('烘焙模型保存失败:', e);
+            return { success: false, error: e.message };
+        }
+    }
+
+    /**
      * 导出 STL（模型 + 四角定位平面）到 Documents/MKPSpectrum/Temp/
      * 网格本身不会被导出，只导出模型和四个 1mm×1mm 的定位平面
      */
     async _exportSTLWithPlanes() {
         const geometries = [];
 
-        // 1. 收集所有模型的几何体（应用世界变换，仅导出可打印模型）
+        // 0. 当前盘原点偏移：导出时把当前盘对齐到床面原点，且只导出当前盘上的模型
+        const off = this._getPlateExportOffset();
+        const normalT = new THREE.Matrix4().makeTranslation(off.x, off.y, 0);
+
+        // 1. 只收集当前盘上的可打印模型几何体（应用世界变换，不混入其他盘的模型）
         this.models.forEach((model) => {
             if (!model.visible || !model.printable) return;
+            if (!this._isOnCurrentPlate(model)) return;
             // 确保世界矩阵是最新的（处理近期变换操作后未刷新矩阵的情况）
             model.mesh.updateWorldMatrix(true, true);
             model.mesh.traverse((child) => {
                 if (child.isMesh) {
                     const geo = child.geometry.clone();
                     geo.applyMatrix4(child.matrixWorld);
+                    geo.applyMatrix4(normalT);
                     geo.computeVertexNormals();
                     geometries.push(geo);
                 }
@@ -6328,24 +11024,32 @@ class BedPreview {
         const texMap = {};       // textureName → base64 data URL (去重)
         let textureCounter = 0;
 
-        // 1. 收集所有模型的几何体 + 材质贴图（仅导出可打印模型）
+        // 0. 当前盘原点偏移：导出时把当前盘对齐到床面原点，且只导出当前盘上的模型
+        const off = this._getPlateExportOffset();
+        const normalT = new THREE.Matrix4().makeTranslation(off.x, off.y, 0);
+
+        // 1. 只收集当前盘上的可打印模型的几何体 + 材质贴图（不混入其他盘的模型）
         this.models.forEach((model) => {
             if (!model.visible || !model.printable) return;
+            if (!this._isOnCurrentPlate(model)) return;
             model.mesh.updateWorldMatrix(true, true);
             model.mesh.traverse((child) => {
                 if (!child.isMesh) return;
                 const geo = child.geometry.clone();
                 geo.applyMatrix4(child.matrixWorld);
+                geo.applyMatrix4(normalT);
                 geo.computeVertexNormals();
 
                 let materialName = 'default';
                 let textureUrl = null;
                 let textureName = null;
+                let textureFlipY = true;
 
                 if (child.material) {
                     materialName = child.material.name || 'default';
                     // 提取贴图
                     if (child.material.map && child.material.map.image) {
+                        textureFlipY = child.material.map.flipY !== false;
                         const b64 = this._textureToBase64(child.material.map.image);
                         if (b64) {
                             textureName = `tex_${textureCounter}.png`;
@@ -6356,7 +11060,7 @@ class BedPreview {
                     }
                 }
 
-                meshes.push({ geometry: geo, materialName, textureUrl, textureName });
+                meshes.push({ geometry: geo, materialName, textureUrl, textureName, textureFlipY });
             });
         });
 
@@ -6381,6 +11085,7 @@ class BedPreview {
                 materialName: 'corner_plane',
                 textureUrl: null,
                 textureName: null,
+                textureFlipY: true,
             });
         }
 
@@ -6395,7 +11100,7 @@ class BedPreview {
         let usedMatNames = new Set();
         let totalFaces = 0;
 
-        for (const { geometry, materialName, textureUrl, textureName } of meshes) {
+        for (const { geometry, materialName, textureUrl, textureName, textureFlipY } of meshes) {
             const pos = geometry.getAttribute('position');
             const uv = geometry.getAttribute('uv');
             const norm = geometry.getAttribute('normal');
@@ -6425,6 +11130,7 @@ class BedPreview {
                 mtlStr += 'illum 2\n';
                 if (textureName) {
                     mtlStr += `map_Kd ${textureName}\n`;
+                    mtlStr += `MKP_flipY ${textureFlipY ? 1 : 0}\n`;
                 }
             }
             objStr += `usemtl ${matName}\n`;
@@ -6437,7 +11143,7 @@ class BedPreview {
             let hasUv = uv && uv.count > 0;
             if (hasUv) {
                 for (let i = 0; i < uv.count; i++) {
-                    objStr += `vt ${uv.getX(i).toFixed(6)} ${(1 - uv.getY(i)).toFixed(6)}\n`;
+                    objStr += `vt ${uv.getX(i).toFixed(6)} ${uv.getY(i).toFixed(6)}\n`;
                 }
             }
             // 写法线
@@ -6583,14 +11289,9 @@ class BedPreview {
                 console.log(`[测试] 已加载 GCode 文件: ${this._testGcodePath}, 大小: ${result.gcode.length} 字节`);
                 this._lastGcode = result.gcode;
                 this.switchToPreview();
-                this.displayGcode(result.gcode);
+                await this.displayGcode(result.gcode);
                 // 加载完成后更新层数滑块信息
                 setTimeout(() => this._updateLayerSlider(), 100);
-                // 初始化 3D 视图
-                setTimeout(() => {
-                    this._setupGcode3DView();
-                    this._renderToolpath3D();
-                }, 200);
             } else {
                 console.warn('[测试] 加载 GCode 失败:', result?.error || '未知错误');
             }
@@ -6602,9 +11303,13 @@ class BedPreview {
     // ========== GCode 3D 轨迹可视化 ==========
 
     _parseGcodeToolpath(gcode) {
-        if (!gcode) return [];
-        const layers = [];
+        if (!gcode) {
+            console.log('[GCodeDrop] _parseGcodeToolpath: no gcode');
+            return [];
+        }
         const lines = gcode.split('\n');
+        console.log('[GCodeDrop] _parseGcodeToolpath lines count:', lines.length);
+        const layers = [];
 
         let currentLayer = null;
         let currentType = 'travel';
@@ -6758,6 +11463,8 @@ class BedPreview {
         }
 
         _flushSegment();
+        const totalSegments = layers.reduce((sum, l) => sum + l.segments.length, 0);
+        console.log('[GCodeDrop] _parseGcodeToolpath returning layers:', layers.length, 'total segments:', totalSegments);
         return layers;
     }
 
@@ -6773,30 +11480,117 @@ class BedPreview {
         return colors[type] || 0x666666;
     }
 
+    /** 销毁 3D 轨迹预览，释放 WebGL 资源 */
+    _disposeGcode3DView() {
+        // 取消动画循环
+        if (this._gcode3DAnimId) {
+            cancelAnimationFrame(this._gcode3DAnimId);
+            this._gcode3DAnimId = null;
+        }
+
+        // 清理 OrbitControls
+        if (this._gcode3DControls) {
+            this._gcode3DControls.dispose();
+            this._gcode3DControls = null;
+        }
+
+        // 清理 scene 中的物体
+        if (this._gcode3DGroup) {
+            this._gcode3DGroup.traverse((child) => {
+                if (child.geometry) child.geometry.dispose();
+                if (child.material) {
+                    if (Array.isArray(child.material)) {
+                        child.material.forEach(m => m.dispose());
+                    } else {
+                        child.material.dispose();
+                    }
+                }
+            });
+            if (this._gcode3DScene) {
+                this._gcode3DScene.remove(this._gcode3DGroup);
+            }
+            this._gcode3DGroup = null;
+            this._gcode3DLayerGroups = [];
+        }
+
+        // 移除 canvas
+        if (this._gcode3DRenderer) {
+            const container = document.getElementById('gcode-3d-container');
+            if (container) {
+                const canvas = container.querySelector('canvas');
+                if (canvas) canvas.remove();
+            }
+            this._gcode3DRenderer.dispose();
+            this._gcode3DRenderer = null;
+        }
+
+        this._gcode3DScene = null;
+        this._gcode3DCamera = null;
+        this._gcode3DGrid = null;
+        this._gcode3DAxes = null;
+        this._gcode3DBedOutline = null;
+        this._gcode3DResizeHandler = null;
+    }
+
     _setupGcode3DView() {
         const container = document.getElementById('gcode-3d-container');
-        if (!container) return;
+        console.log('[GCodeDrop] _setupGcode3DView, container exists:', !!container);
+        if (!container) {
+            console.error('[GCodeDrop] _setupGcode3DView: container not found');
+            return;
+        }
+
+        // Cancel previous animation loop
+        if (this._gcode3DAnimId) {
+            cancelAnimationFrame(this._gcode3DAnimId);
+            this._gcode3DAnimId = null;
+            console.log('[GCodeDrop] cancelled old animation frame');
+        }
 
         // Dispose previous if exists
         if (this._gcode3DRenderer) {
+            console.log('[GCodeDrop] disposing old renderer');
             this._gcode3DRenderer.dispose();
             const oldCanvas = container.querySelector('canvas');
-            if (oldCanvas) oldCanvas.remove();
+            if (oldCanvas) {
+                oldCanvas.remove();
+                console.log('[GCodeDrop] removed old canvas');
+            }
         }
+
+        // Reset grid/axes/bed references so they get recreated for the new scene
+        this._gcode3DGrid = null;
+        this._gcode3DAxes = null;
+        this._gcode3DBedOutline = null;
 
         const rect = container.getBoundingClientRect();
         const width = rect.width || 400;
         const height = rect.height || 300;
+        console.log('[GCodeDrop] container size:', width, 'x', height);
+        if (width <= 0 || height <= 0) {
+            console.warn('[GCodeDrop] container has zero size, using fallback 400x300');
+        }
 
         const scene = new THREE.Scene();
         scene.background = new THREE.Color(0x111111);
 
         const camera = new THREE.PerspectiveCamera(45, width / height, 0.1, 10000);
+        // 与主视口一致：Z 向上，XY 为床面。OrbitControls 的绕轴依赖 camera.up，
+        // 若保持默认 Y-up，旋转轴和地平面都会与主窗口不一致，这就是前辈禁旋转的根因
+        camera.up.set(0, 0, 1);
 
-        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        let renderer;
+        try {
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            console.log('[GCodeDrop] WebGLRenderer created successfully');
+        } catch (e) {
+            console.error('[GCodeDrop] WebGLRenderer creation failed:', e);
+            return;
+        }
         renderer.setSize(width, height);
         renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
         container.insertBefore(renderer.domElement, container.firstChild);
+        console.log('[GCodeDrop] canvas inserted, size:', width, 'x', height, 'canvas element:', !!renderer.domElement);
 
         // Lighting
         const ambient = new THREE.AmbientLight(0xffffff, 0.6);
@@ -6805,16 +11599,6 @@ class BedPreview {
         dirLight.position.set(200, 200, 300);
         scene.add(dirLight);
 
-        // Grid and axes helper
-        // Scale: GCode coords are in mm, bed is ~150x150
-        const gridHelper = new THREE.GridHelper(200, 20, 0x444444, 0x333333);
-        gridHelper.rotation.x = Math.PI / 2; // make it horizontal
-        scene.add(gridHelper);
-
-        // Axes
-        const axesHelper = new THREE.AxesHelper(30);
-        scene.add(axesHelper);
-
         this._gcode3DScene = scene;
         this._gcode3DCamera = camera;
         this._gcode3DRenderer = renderer;
@@ -6822,10 +11606,25 @@ class BedPreview {
         this._gcode3DLayerGroups = [];
         scene.add(this._gcode3DGroup);
 
+        // OrbitControls for rotate/zoom/pan — 与主视口保持一致：左键旋转 / 中键平移 / 滚轮缩放
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.05;
+        controls.enableRotate = true;
+        controls.enableZoom = true;
+        controls.enablePan = true;
+        controls.mouseButtons = {
+            LEFT: THREE.MOUSE.ROTATE,
+            MIDDLE: THREE.MOUSE.PAN,
+            RIGHT: null
+        };
+        this._gcode3DControls = controls;
+
         // Animate the 3D view
         const animate = () => {
             if (!this._gcode3DRenderer) return;
             this._gcode3DAnimId = requestAnimationFrame(animate);
+            if (this._gcode3DControls) this._gcode3DControls.update();
             this._gcode3DRenderer.render(this._gcode3DScene, this._gcode3DCamera);
         };
         animate();
@@ -6838,20 +11637,33 @@ class BedPreview {
                 this._gcode3DCamera.aspect = r.width / r.height;
                 this._gcode3DCamera.updateProjectionMatrix();
                 this._gcode3DRenderer.setSize(r.width, r.height);
+                // Update LineMaterial resolution for all Line2 objects
+                if (this._gcode3DGroup) {
+                    this._gcode3DGroup.traverse((obj) => {
+                        if (obj.isLine2 && obj.material && obj.material.resolution) {
+                            obj.material.resolution.set(r.width, r.height);
+                        }
+                    });
+                }
             }
         };
         window.addEventListener('resize', onResize);
         this._gcode3DResizeHandler = onResize;
     }
 
-    _renderToolpath3D() {
-        const gcode = this._lastGcode;
-        if (!gcode) return;
+    async _renderToolpath3D() {
+        console.log('[GCodeDrop] _renderToolpath3D called');
         const scene = this._gcode3DScene;
         const group = this._gcode3DGroup;
-        if (!scene || !group) return;
+        const renderer = this._gcode3DRenderer;
+        console.log('[GCodeDrop] _renderToolpath3D scene/group/renderer exists:', !!scene, !!group, !!renderer);
+        if (!scene || !group || !renderer) {
+            console.error('[GCodeDrop] _renderToolpath3D: missing scene/group/renderer');
+            return;
+        }
 
         // Clear previous
+        console.log('[GCodeDrop] clearing previous geometry, group children:', group.children.length);
         while (group.children.length) {
             const child = group.children[0];
             if (child.geometry) child.geometry.dispose();
@@ -6860,93 +11672,127 @@ class BedPreview {
         }
         this._gcode3DLayerGroups = [];
 
-        const layers = this._parseGcodeToolpath(gcode);
-        if (layers.length === 0) return;
+        // 通过 Python API 解析工具路径（避免 JS 主线程阻塞）
+        let layers;
+        try {
+            const result = await window.pywebview.api.parse_gcode_toolpath();
+            if (!result || !result.success) {
+                console.log('[GCodeDrop] parse_gcode_toolpath failed or no gcode loaded');
+                return;
+            }
+            layers = result.layers;
+        } catch (e) {
+            console.error('[GCodeDrop] parse_gcode_toolpath exception:', e);
+            return;
+        }
+        console.log('[GCodeDrop] parsed layers count:', layers.length);
+        if (layers.length === 0) {
+            console.warn('[GCodeDrop] no layers found in gcode');
+            return;
+        }
+
+        // Log first few layer segment types for debugging
+        const firstLayerTypes = layers[0]?.segments?.slice(0, 5).map(s => s.type) || [];
+        console.log('[GCodeDrop] first layer segment types:', firstLayerTypes);
 
         // Compute bounds for camera auto-fit
         let minX = Infinity, maxX = -Infinity;
         let minY = Infinity, maxY = -Infinity;
         let minZ = Infinity, maxZ = -Infinity;
 
-        for (const layer of layers) {
-            const layerGroup = new THREE.Group();
-            for (const seg of layer.segments) {
-                if (seg.points.length < 2) continue;
+        let totalSegments = 0;
+        let totalPoints = 0;
 
-                for (const p of seg.points) {
-                    if (p.x < minX) minX = p.x;
-                    if (p.x > maxX) maxX = p.x;
-                    if (p.y < minY) minY = p.y;
-                    if (p.y > maxY) maxY = p.y;
-                    if (p.z < minZ) minZ = p.z;
-                    if (p.z > maxZ) maxZ = p.z;
-                }
+        try {
+            for (let li = 0; li < layers.length; li++) {
+                const layer = layers[li];
+                const layerGroup = new THREE.Group();
+                for (const seg of layer.segments) {
+                    if (seg.points.length < 2) continue;
+                    totalSegments++;
+                    totalPoints += seg.points.length;
 
-                const positions = [];
-                for (const p of seg.points) {
-                    positions.push(p.x, p.y, p.z);
-                }
+                    // Python 返回 [[x,y,z], [x,y,z], ...] 格式
+                    for (const p of seg.points) {
+                        if (p[0] < minX) minX = p[0];
+                        if (p[0] > maxX) maxX = p[0];
+                        if (p[1] < minY) minY = p[1];
+                        if (p[1] > maxY) maxY = p[1];
+                        if (p[2] < minZ) minZ = p[2];
+                        if (p[2] > maxZ) maxZ = p[2];
+                    }
 
-                const geometry = new THREE.BufferGeometry();
-                geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+                    const positions = [];
+                    for (const p of seg.points) {
+                        positions.push(p[0], p[1], p[2]);
+                    }
 
-                let color = seg.color || 0x666666;
+                    const geometry = new LineGeometry();
+                    geometry.setPositions(positions);
 
-                // Brighten travel moves
-                let material;
-                if (seg.type === 'travel') {
-                    material = new THREE.LineDashedMaterial({
-                        color: color,
-                        dashSize: 0.5,
-                        gapSize: 0.5,
+                    const isTravel = seg.type === 'travel';
+                    const material = new LineMaterial({
+                        color: 0xffffff,
+                        linewidth: isTravel ? 2 : 6,
                         transparent: true,
-                        opacity: 0.4,
+                        opacity: isTravel ? 0.04 : 0.22,
+                        depthWrite: false,
                     });
-                } else {
-                    material = new THREE.LineBasicMaterial({
-                        color: color,
-                        linewidth: 1,
-                    });
-                }
+                    if (this._gcode3DRenderer) {
+                        const canvas = this._gcode3DRenderer.domElement;
+                        material.resolution.set(canvas.width, canvas.height);
+                    }
 
-                const line = new THREE.Line(geometry, material);
-                if (seg.type === 'travel') {
-                    line.computeLineDistances();
+                    const line = new Line2(geometry, material);
+                    layerGroup.add(line);
                 }
-                layerGroup.add(line);
+                group.add(layerGroup);
+                this._gcode3DLayerGroups.push(layerGroup);
             }
-            group.add(layerGroup);
-            this._gcode3DLayerGroups.push(layerGroup);
+        } catch (e) {
+            console.error('[GCodeDrop] _renderToolpath3D geometry creation exception:', e);
+            return;
         }
 
-        // Auto-fit camera
+        console.log('[GCodeDrop] total segments:', totalSegments, 'total points:', totalPoints);
+        console.log('[GCodeDrop] bounds:', { minX, maxX, minY, maxY, minZ, maxZ });
+
+        // Auto-fit camera using bounding sphere
         if (minX !== Infinity && maxX !== Infinity) {
             const cx = (minX + maxX) / 2;
             const cy = (minY + maxY) / 2;
             const cz = (minZ + maxZ) / 2;
-            const size = Math.max(maxX - minX, maxY - minY, maxZ - minZ, 10);
-            const dist = size * 1.5;
+            const bx = (maxX - minX) / 2;
+            const by = (maxY - minY) / 2;
+            const bz = (maxZ - minZ) / 2;
+            const radius = Math.sqrt(bx * bx + by * by + bz * bz);
+            const fov = this._gcode3DCamera.fov * (Math.PI / 180);
+            const dist = Math.max(radius / Math.sin(fov / 2), 10);
 
-            this._gcode3DCamera.position.set(cx, cy - dist * 0.7, cz + dist * 0.7);
+            this._gcode3DCamera.position.set(cx, cy - dist, cz + dist);
             this._gcode3DCamera.lookAt(cx, cy, cz);
-
-            // Add a small bed outline
-            if (!this._gcode3DBedOutline) {
-                const bedGeo = new THREE.BufferGeometry();
-                const halfX = 75, halfY = 75;
-                const bedVerts = new Float32Array([
-                    -halfX, -halfY, 0,
-                    halfX, -halfY, 0,
-                    halfX, halfY, 0,
-                    -halfX, halfY, 0,
-                    -halfX, -halfY, 0,
-                ]);
-                bedGeo.setAttribute('position', new THREE.Float32BufferAttribute(bedVerts, 3));
-                const bedMat = new THREE.LineBasicMaterial({ color: 0x555555, transparent: true, opacity: 0.5 });
-                const bedLine = new THREE.Line(bedGeo, bedMat);
-                scene.add(bedLine);
-                this._gcode3DBedOutline = bedLine;
+            if (this._gcode3DControls) {
+                this._gcode3DControls.target.set(cx, cy, cz);
+                this._gcode3DControls.update();
             }
+            console.log('[GCodeDrop] camera positioned at:', this._gcode3DCamera.position.x, this._gcode3DCamera.position.y, this._gcode3DCamera.position.z, 'looking at:', cx, cy, cz);
+
+            // Add grid and axes only when we have GCode to show
+            // Large grid centered at origin, extending heavily in all directions
+            if (!this._gcode3DGrid) {
+                const gridSize = 5000;
+                const gridDivisions = 500;
+                const gridHelper = new THREE.GridHelper(gridSize, gridDivisions, 0x444444, 0x333333);
+                gridHelper.rotation.x = Math.PI / 2;
+                scene.add(gridHelper);
+                this._gcode3DGrid = gridHelper;
+
+                const axesHelper = new THREE.AxesHelper(30);
+                scene.add(axesHelper);
+                this._gcode3DAxes = axesHelper;
+            }
+
+            // 不再添加床面方框轮廓（bed outline），仅保留网格和坐标轴
         }
 
         // Apply current slider
@@ -6954,33 +11800,130 @@ class BedPreview {
     }
 
     _updateGcode3DLayers() {
+        // 节流：400ms 内不重复更新，避免滑块拖动时 GCode 预览频繁刷新导致卡顿
+        const now = performance.now();
+        if (this._lastGcode3DUpdateTime && (now - this._lastGcode3DUpdateTime) < 400) {
+            if (!this._gcode3DUpdatePending) {
+                this._gcode3DUpdatePending = true;
+                setTimeout(() => {
+                    this._gcode3DUpdatePending = false;
+                    this._lastGcode3DUpdateTime = null;
+                    this._updateGcode3DLayers();
+                }, 400 - (now - this._lastGcode3DUpdateTime));
+            }
+            return;
+        }
+        this._lastGcode3DUpdateTime = now;
+
         const layerGroups = this._gcode3DLayerGroups;
-        if (!layerGroups || layerGroups.length === 0) return;
+        if (!layerGroups || layerGroups.length === 0) {
+            console.log('[GCodeDrop] _updateGcode3DLayers: no layer groups');
+            return;
+        }
 
         const slider = document.getElementById('layer-slider');
         const pct = slider ? parseFloat(slider.value) : 100;
         const total = layerGroups.length;
         const showCount = Math.max(1, Math.round(total * pct / 100));
+        console.log('[GCodeDrop] _updateGcode3DLayers total:', total, 'showCount:', showCount, 'slider pct:', pct);
 
         layerGroups.forEach((lg, idx) => {
             lg.visible = idx < showCount;
         });
     }
 
-    displayGcode(gcode) {
+    async displayGcode(gcode) {
+        console.log('[GCodeDrop] displayGcode called, gcode length:', gcode?.length);
         this._lastGcode = gcode;
         // 重新渲染 3D 轨迹视图
         if (this._gcode3DRenderer) {
-            this._renderToolpath3D();
+            console.log('[GCodeDrop] renderer exists, calling _renderToolpath3D');
+            try {
+                await this._renderToolpath3D();
+            } catch (e) {
+                console.error('[GCodeDrop] _renderToolpath3D error:', e);
+            }
+        } else {
+            console.log('[GCodeDrop] renderer not exists, skip render');
         }
     }
 
-    displaySliceImages(images) {
-        this._sliceImages = images || [];
-        this._showSliceImage(0);
+    displaySliceImages(meta) {
+        // 懒加载模式：存储元数据 + 缓存，按需从后端加载单张图片
+        // meta: { count, output_dir, files: [filenames], focus_rect }
+        // 清理旧缓存和 DOM（释放内存）
+        this._previewImagesCache = null;
+        this._sliceImagesCache = {};
+        this._sliceFullImagesCache = {};
+        this._sliceImages = null;
+        this._sliceImagesCount = 0;
+        this._sliceFocusRect = (meta && meta.focus_rect
+            && meta.focus_rect.x != null && meta.focus_rect.w > 0)
+            ? meta.focus_rect : null;
+        this._sliceFocusApplied = false;
+        // 清理容器内的旧 img 元素，释放 base64 data URL 引用
+        const container = document.getElementById('slice-images-container');
+        if (container) container.innerHTML = '';
+
+        this._sliceImages = meta && meta.files ? meta.files : [];
+        this._sliceImagesCount = (meta && meta.count) || 0;
+        this._sliceZoomState = { scale: 1, panX: 0, panY: 0 };
+        if (this._sliceFullLoadDebounce) { clearTimeout(this._sliceFullLoadDebounce); this._sliceFullLoadDebounce = null; }
+        if (this._sliceImagesCount === 0) {
+            this._showSliceImage(0);
+            return;
+        }
+        
+        // 先同步加载首张缩略图，再渲染（消除"加载中"闪烁）
+        const loadFirstThenPreload = async () => {
+            try {
+                const result = await window.pywebview.api.texture_slice_load_single_image(0);
+                if (result && result.success && result.image) {
+                    this._sliceImagesCache[0] = result.image;
+                }
+            } catch (e) {
+                console.error('[displaySliceImages] 首张加载失败:', e);
+            }
+            // 渲染首张（此时缓存已命中，秒出）
+            this._showSliceImage(0);
+            // 全部缩略图都要预加载（不论层数），保证翻层/缩放时立即可用，无需再逐张懒加载
+            this._preloadAllThumbnails(this._sliceImagesCount);
+        };
+        loadFirstThenPreload();
+    }
+
+    async _preloadAllThumbnails(count) {
+        // 批量并发预加载所有缩略图到 _sliceImagesCache（全部层都预加载，翻层/缩放立即可用）。
+        const CONC = 8;  // 同时并发请求数，兼顾速度与后端压力
+        for (let start = 0; start < count; start += CONC) {
+            const batch = [];
+            for (let i = start; i < Math.min(start + CONC, count); i++) {
+                if (this._sliceImagesCache[i]) continue;
+                batch.push((async () => {
+                    try {
+                        const result = await window.pywebview.api.texture_slice_load_single_image(i);
+                        if (result && result.success && result.image) {
+                            this._sliceImagesCache[i] = result.image;
+                        }
+                    } catch (e) {
+                        console.error('[PreloadThumb] 预加载失败:', i, e);
+                    }
+                })());
+            }
+            await Promise.all(batch);
+            // 每批后让出主线程，避免长时间阻塞 UI
+            await new Promise(r => setTimeout(r, 0));
+        }
+        const loaded = Object.keys(this._sliceImagesCache).length;
+        console.log(`[PreloadThumb] 预加载完成: ${loaded}/${count}`);
     }
 
     _showSliceImage(index) {
+        if (this._previewImagesCache) {
+            this._loadAndShowPreviewImage(index);
+            return;
+        }
+
         const container = document.getElementById('slice-images-container');
         if (!container) return;
 
@@ -6991,8 +11934,115 @@ class BedPreview {
         }
 
         const i = Math.max(0, Math.min(index, images.length - 1));
-        const imgData = images[i];
+        this._currentSliceImageIndex = i;
 
+        const cached = this._sliceImagesCache[i];
+        if (cached) {
+            this._renderSliceImageToContainer(container, i, cached);
+        } else {
+            container.innerHTML = `<div class="slice-image-item">
+                <div class="slice-image-label">切片层 ${i + 1}</div>
+                <div class="slice-image-zoom-wrapper">
+                    <div class="slice-image-placeholder">加载中...</div>
+                </div>
+            </div>`;
+            const reqId = ++this._sliceLoadRequestId;
+            this._loadAndCacheSliceImage(i).then(imgData => {
+                if (imgData && this._sliceLoadRequestId === reqId) {
+                    this._renderSliceImageToContainer(container, i, imgData);
+                }
+            });
+        }
+    }
+
+    async _loadAndCacheSliceImage(index) {
+        try {
+            const result = await window.pywebview.api.texture_slice_load_single_image(index);
+            if (result && result.success && result.image) {
+                this._sliceImagesCache[index] = result.image;
+                return result.image;
+            }
+        } catch (e) {
+            console.error('[SliceImage] 加载失败:', index, e);
+        }
+        return null;
+    }
+
+    // 缩放停稳 60ms 后换完整原图：直接替换 src，并立即"重放"一次当前的 scale/pan，
+    // 强制这一帧按原图渲染且过渡关闭 -> 视觉不变但变清晰。
+    // 加载完整原图并替换到 img 元素（内联在缩放 60ms 流程里，不脱离缩放状态机）。
+    // 直接使用绑定的 img 引用；拿到源后立即替换 src 并保持当前 scale/pan，视觉不变只变清晰。
+    async _loadFullApplied(imgEl, index, scale, panX, panY) {
+        if (!window.pywebview || !window.pywebview.api || !imgEl) return;
+        if (!document.body.contains(imgEl)) return;
+        // 缓存命中直接换
+        const cached = (this._sliceFullImagesCache && this._sliceFullImagesCache[index]) || null;
+        if (cached) {
+            this._applyFullSrc(imgEl, cached, scale, panX, panY);
+            return;
+        }
+        let fullUrl = null;
+        try {
+            const result = await window.pywebview.api.texture_slice_load_full_image(index);
+            if (!result || !result.success) return;
+            // 后端已用 PIL 重压缩成小体积 base64 data URL：bridge 传输稳定、
+            // 同源无跨源问题，图片不会因跨源加载失败而消失。
+            fullUrl = result.image || null;
+            if (!fullUrl) return;
+        } catch (e) {
+            console.error('[FullImage] 原图加载请求失败:', index, e);
+            return;
+        }
+        if (!document.body.contains(imgEl)) return;
+        if (!this._sliceFullImagesCache) this._sliceFullImagesCache = {};
+        this._sliceFullImagesCache[index] = fullUrl;
+        this._applyFullSrc(imgEl, fullUrl, scale, panX, panY);
+    }
+
+    // 换 src：直接用当前 scale/pan，保证这一帧马上升级为原图（清晰）。不脱离缩放流程。
+    _applyFullSrc(img, fullSrc, scale, panX, panY) {
+        if (!img || img.src === fullSrc) return;
+        img.src = fullSrc;
+        img.style.transition = 'none';
+        img.style.transform = `scale(${scale}) translate(${panX}px, ${panY}px)`;
+    }
+
+    // 缩放指导：把后端返回的聚焦归一化矩形（模型包围盒+padding，相对整张预览图）铺满当前视口。
+    // 用测量的 wrapper/img 盒算出 scale 与 pan，保证聚焦区正好充满预览窗口。
+    // 返回 {scale, panX, panY}；无法测量时返回 null。
+    _applyPreviewFocusToZoom(wrapper, img) {
+        const rect = this._sliceFocusRect;
+        if (!rect || rect.w <= 0 || rect.h <= 0) return null;
+        try {
+            const wRect = wrapper.getBoundingClientRect();
+            const iRect = img.getBoundingClientRect();
+            if (wRect.width < 2 || wRect.height < 2 || iRect.width < 2 || iRect.height < 2) return null;
+            // 缩放：让 rect 至少在某一轴铺满视口，两轴取大保证整体填满
+            const sx = wRect.width / (rect.w * iRect.width);
+            const sy = wRect.height / (rect.h * iRect.height);
+            const scale = Math.max(sx, sy);
+            const clamped = Math.max(1, Math.min(10, scale));
+            // 聚焦区中心 -> 视口中心
+            const rcX = rect.x + rect.w / 2;
+            const rcY = rect.y + rect.h / 2;
+            const imgCenterX = iRect.left + iRect.width / 2;
+            const imgCenterY = iRect.top + iRect.height / 2;
+            const wrapCenterX = wRect.left + wRect.width / 2;
+            const wrapCenterY = wRect.top + wRect.height / 2;
+            // 未变换时 rect 中心在屏幕上的位置
+            const pX = iRect.left + rcX * iRect.width;
+            const pY = iRect.top + rcY * iRect.height;
+            // 变换 scale(s) translate(t)，原点在图片中心：screen = center + (P + t - center)*s
+            // 令 P -> 视口中心，解得 t = (wrapCenter - imgCenter)/s - (P - imgCenter)
+            const panX = (wrapCenterX - imgCenterX) / clamped - (pX - imgCenterX);
+            const panY = (wrapCenterY - imgCenterY) / clamped - (pY - imgCenterY);
+            return { scale: clamped, panX, panY };
+        } catch (e) {
+            return null;
+        }
+    }
+
+    _renderSliceImageToContainer(container, i, imgData) {
         container.innerHTML = '';
 
         const item = document.createElement('div');
@@ -7016,38 +12066,122 @@ class BedPreview {
         item.appendChild(zoomWrapper);
         container.appendChild(item);
 
-        // 绑定缩放/平移事件
-        this._setupImageZoom(zoomWrapper, img);
+        // 绑定缩放/平移事件，传入索引以支持放大时加载原图
+        this._setupImageZoom(zoomWrapper, img, i);
     }
 
-    _setupImageZoom(wrapper, img) {
-        let scale = 1;
-        let panX = 0;
-        let panY = 0;
+    _setupImageZoom(wrapper, img, index) {
+        if (this._currentZoomCleanup) {
+            this._currentZoomCleanup();
+            this._currentZoomCleanup = null;
+        }
+
+        if (!this._sliceZoomState) this._sliceZoomState = { scale: 1, panX: 0, panY: 0 };
+        let scale = this._sliceZoomState.scale || 1;
+        let panX = this._sliceZoomState.panX || 0;
+        let panY = this._sliceZoomState.panY || 0;
         let isDragging = false;
         let startX = 0;
         let startY = 0;
         let lastPanX = 0;
         let lastPanY = 0;
+        let fullResLoaded = false;
+        const thumbnailSrc = img.src;
 
         const MIN_SCALE = 1;
         const MAX_SCALE = 10;
         const ZOOM_STEP = 0.15;
 
-        const applyTransform = () => {
-            const tr = isDragging ? 'none' : 'transform 0.12s ease-out';
-            img.style.transform = `scale(${scale}) translate(${panX}px, ${panY}px)`;
-            img.style.transition = tr;
+        const syncState = () => {
+            this._sliceZoomState.scale = scale;
+            this._sliceZoomState.panX = panX;
+            this._sliceZoomState.panY = panY;
         };
 
-        // 滚轮缩放
+        const applyTransform = () => {
+            // 全程关闭过渡：缩放/平移/切图都要即时生效，保证视觉连续（不做任何动画）
+            img.style.transition = 'none';
+            img.style.transform = `scale(${scale}) translate(${panX}px, ${panY}px)`;
+        };
+
+        if (scale > 1) {
+            wrapper.style.cursor = 'grab';
+            requestAnimationFrame(() => applyTransform());
+        }
+
+        // 放大即立即加载完整原图（缓存命中立即换，未命中请求一次并存缓存）。
+        // 不等待、不防抖 —— 无论是滚轮缩放操作中还是停留在放大视口，只要 scale>1 就换清晰原图。
+        const loadFullResIfNeeded = async () => {
+            if (scale > 1) {
+                // 正在做缩放操作也要立即加载原图放大到这个大小，不需要等待。
+                this._loadFullApplied(img, index, scale, panX, panY).then(() => {
+                    fullResLoaded = true;
+                });
+            } else if (scale <= 1 && fullResLoaded) {
+                // 缩回 1 倍时恢复缩略图
+                fullResLoaded = false;
+                if (this._sliceFullLoadDebounce) { clearTimeout(this._sliceFullLoadDebounce); this._sliceFullLoadDebounce = null; }
+                img.src = thumbnailSrc;
+                requestAnimationFrame(() => applyTransform());
+            }
+        };
+
+        // 缩放指导：首次显示且尚未应用聚焦时，让模型聚焦区铺满视口。
+        // 待图片完成布局后再测量并应用，避免 rect 尚未就绪时量到 0。
+        // 聚焦即放大（scale>1），应用后进入 60ms 原图加载流程。
+        // 用 try/catch 兜底：聚焦应用绝不因异常影响下方 wheel/mouse 的缩放监听绑定。
+        let focusRanHere = false;
+        try {
+            if (this._sliceFocusRect && !this._sliceFocusApplied) {
+                focusRanHere = true;
+                const waitForLayout = (attempt) => {
+                    try {
+                        const z = this._applyPreviewFocusToZoom(wrapper, img);
+                        if (z) {
+                            scale = z.scale;
+                            panX = z.panX;
+                            panY = z.panY;
+                            syncState();
+                            applyTransform();
+                            this._sliceFocusApplied = true;
+                            loadFullResIfNeeded();
+                        } else if (attempt < 12) {
+                            setTimeout(() => waitForLayout(attempt + 1), 80);
+                        }
+                    } catch (e) {
+                        console.error('[Focus] 聚焦应用出错:', e);
+                    }
+                };
+                waitForLayout(0);
+            }
+        } catch (e) {
+            console.error('[Focus] 聚焦块异常:', e);
+        }
+
+        // 切层/首次显示新图且当前已放大：立即按当前放大倍数加载原图，不等 60ms。
+        // 这是"保持放大视口切下一张"的需求 —— 上一张放大到 1.5x 后翻层，
+        // 新缩略图一显示就让原图按 1.5x 放大到这个大小。
+        // 仅当本轮没有聚焦块抢先处理（聚焦已在上面用 debounce 安排过原图）时执行。
+        if (scale > 1 && !focusRanHere) {
+            const loadFullNow = () => {
+                this._loadFullApplied(img, index, scale, panX, panY).then(() => {
+                    fullResLoaded = true;
+                });
+            };
+            // 等图片完成布局（完整尺寸已知）再接，避免 height 未定时换 src 跳动
+            if (img.complete && img.naturalWidth > 0) {
+                loadFullNow();
+            } else {
+                img.addEventListener('load', loadFullNow, { once: true });
+            }
+        }
+
         wrapper.addEventListener('wheel', (e) => {
             e.stopPropagation();
             e.preventDefault();
             const delta = e.deltaY > 0 ? -ZOOM_STEP : ZOOM_STEP;
             const newScale = Math.max(MIN_SCALE, Math.min(MAX_SCALE, scale + delta));
 
-            // 以鼠标位置为缩放中心
             if (newScale !== scale && scale >= MIN_SCALE) {
                 const rect = wrapper.getBoundingClientRect();
                 const mx = e.clientX - rect.left - rect.width / 2;
@@ -7058,20 +12192,19 @@ class BedPreview {
             }
             scale = newScale;
 
-            // 缩放到 1 时重置平移
             if (scale <= MIN_SCALE) {
                 scale = MIN_SCALE;
                 panX = 0;
                 panY = 0;
                 wrapper.style.cursor = 'default';
+                if (this._sliceFullLoadDebounce) { clearTimeout(this._sliceFullLoadDebounce); this._sliceFullLoadDebounce = null; }
             } else {
                 wrapper.style.cursor = 'grab';
             }
-
+            syncState();
             applyTransform();
+            loadFullResIfNeeded();
         });
-
-        // 鼠标拖拽平移
         wrapper.addEventListener('mousedown', (e) => {
             if (scale <= MIN_SCALE || e.button !== 0) return;
             isDragging = true;
@@ -7089,20 +12222,23 @@ class BedPreview {
             panX = lastPanX + (e.clientX - startX) / scale;
             panY = lastPanY + (e.clientY - startY) / scale;
             img.style.transform = `scale(${scale}) translate(${panX}px, ${panY}px)`;
+            syncState();
         };
 
         const onMouseUp = () => {
             if (!isDragging) return;
             isDragging = false;
             wrapper.style.cursor = scale > MIN_SCALE ? 'grab' : 'default';
-            img.style.transition = 'transform 0.12s ease-out';
+            img.style.transition = 'none';
+            syncState();
+            loadFullResIfNeeded();
         };
 
         window.addEventListener('mousemove', onMouseMove);
         window.addEventListener('mouseup', onMouseUp);
 
-        // 保存引用以便清理（可选）
-        wrapper._zoomCleanup = () => {
+        this._currentZoomCleanup = () => {
+            if (this._sliceFullLoadDebounce) { clearTimeout(this._sliceFullLoadDebounce); this._sliceFullLoadDebounce = null; }
             window.removeEventListener('mousemove', onMouseMove);
             window.removeEventListener('mouseup', onMouseUp);
         };
@@ -7111,7 +12247,7 @@ class BedPreview {
     async _saveGcodeToProject(gcode) {
         if (!window.pywebview || !window.pywebview.api) return;
         try {
-            const project = this.exportProject();
+            const project = await this.exportProject();
             project.gcode = gcode;
             const result = await window.pywebview.api.save_gcode_to_project(JSON.stringify(project));
             if (result && result.success) {
@@ -7122,8 +12258,720 @@ class BedPreview {
         }
     }
 
+    // ========== 平面打印（多图片画布） ==========
+
+    /* ============================================================
+       平面打印 — 多图片画布，原生 8 点控制框 + 旋转手柄
+       ============================================================ */
+
+    _initFlatPage() {
+        const canvas = document.getElementById('flat-canvas');
+        if (!canvas) return;
+        this._flatCanvasCtx = canvas.getContext('2d');
+        this._setupFlatControls();
+        this._setupFlatSizeInput();
+        if (this._flatImages.length > 0) {
+            this._showFlatCanvas();
+            this._sizeFlatCanvas();
+            this._renderFlatCanvas();
+        }
+    }
+
+    _showFlatCanvas() {
+        document.getElementById('flat-canvas-placeholder').style.display = 'none';
+        document.getElementById('flat-canvas').style.display = '';
+    }
+
+    _setupFlatControls() {
+        if (this._flatControlsBound) return;
+        this._flatControlsBound = true;
+
+        document.getElementById('flat-upload-btn')?.addEventListener('click', () => {
+            document.getElementById('flat-image-input')?.click();
+        });
+        document.getElementById('flat-image-input')?.addEventListener('change', (e) => {
+            this._addFlatImage(e);
+        });
+        document.getElementById('flat-del-btn')?.addEventListener('click', () => {
+            this._removeActiveFlatImage();
+        });
+        document.getElementById('flat-grid-btn')?.addEventListener('click', () => {
+            this._flatGridOn = !this._flatGridOn;
+            const btn = document.getElementById('flat-grid-btn');
+            if (btn) btn.classList.toggle('active', this._flatGridOn);
+            this._renderFlatCanvas();
+        });
+        document.getElementById('btn-flat-slice')?.addEventListener('click', () => {
+            this._runFlatPrint();
+        });
+
+        // canvas 鼠标事件
+        const canvas = document.getElementById('flat-canvas');
+        if (canvas) {
+            canvas.addEventListener('mousedown', (e) => this._flatMouseDown(e));
+            window.addEventListener('mousemove', (e) => this._flatMouseMove(e));
+            window.addEventListener('mouseup', () => this._flatMouseUp());
+        }
+    }
+
+    _sizeFlatCanvas() {
+        const area = document.querySelector('.flat-canvas-area');
+        if (!area) return;
+        const canvas = document.getElementById('flat-canvas');
+        if (!canvas) return;
+        // 实际分辨率取用户设定的 textureResolution（默认 4000），保证打印清晰度
+        const res = this.textureResolution || 4000;
+        canvas.width = res;
+        canvas.height = res;
+        // CSS 显示尺寸适配 UI 容器
+        const displaySize = Math.min(area.clientWidth - 32, area.clientHeight - 32);
+        canvas.style.width = displaySize + 'px';
+        canvas.style.height = displaySize + 'px';
+    }
+
+    /* ---- 坐标转换 ---- */
+
+    _flatMouseToCanvas(e) {
+        const canvas = document.getElementById('flat-canvas');
+        const rect = canvas.getBoundingClientRect();
+        return {
+            x: (e.clientX - rect.left) * (canvas.width / rect.width),
+            y: (e.clientY - rect.top) * (canvas.height / rect.height)
+        };
+    }
+
+    /* ---- 图片增删 ---- */
+
+    _addFlatImage(e) {
+        const file = e.target.files?.[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = (ev) => {
+            const img = new Image();
+            img.onload = () => {
+                this._showFlatCanvas();
+                this._sizeFlatCanvas();
+                const canvas = document.getElementById('flat-canvas');
+                const size = canvas ? canvas.width : 540;
+                const fit = Math.max(size / img.width, size / img.height);
+                const initW = img.width * fit * 0.30;
+                const initH = img.height * fit * 0.30;
+                this._flatImages.push({
+                    img, x: size / 2, y: size / 2,
+                    w: initW, h: initH, rot: 0
+                });
+                this._flatActiveIdx = this._flatImages.length - 1;
+                this._renderFlatCanvas();
+            };
+            img.src = ev.target.result;
+        };
+        reader.readAsDataURL(file);
+        e.target.value = '';
+    }
+
+    _removeActiveFlatImage() {
+        if (this._flatActiveIdx < 0) return;
+        this._flatImages.splice(this._flatActiveIdx, 1);
+        this._flatActiveIdx = this._flatImages.length > 0 ? 0 : -1;
+        if (this._flatImages.length === 0) {
+            document.getElementById('flat-canvas-placeholder').style.display = '';
+            document.getElementById('flat-canvas').style.display = 'none';
+        }
+        document.getElementById('flat-del-btn').classList.toggle('hidden', this._flatActiveIdx < 0);
+        this._renderFlatCanvas();
+    }
+
+    /* ---- 命中检测 ---- */
+
+    _flatHitTest(mx, my) {
+        const canvas = document.getElementById('flat-canvas');
+        const s = (canvas ? canvas.width : 4000) / 700;  // 控件尺寸缩放因子，基准 700px
+        const HIT_R = 8 * s;          // 控制点半径
+        const ROT_DIST = 28 * s;      // 旋转手柄离顶边距离
+        const ROT_R = 9 * s;          // 旋转手柄半径
+
+        // 从后往前查（上层优先）
+        for (let i = this._flatImages.length - 1; i >= 0; i--) {
+            const item = this._flatImages[i];
+            const dx = mx - item.x;
+            const dy = my - item.y;
+            const cos = Math.cos(-item.rot * Math.PI / 180);
+            const sin = Math.sin(-item.rot * Math.PI / 180);
+            const lx = dx * cos - dy * sin;
+            const ly = dx * sin + dy * cos;
+
+            // 1) 旋转手柄
+            const rdx = lx;
+            const rdy = ly - (-item.h / 2 - ROT_DIST);
+            if (Math.sqrt(rdx * rdx + rdy * rdy) <= ROT_R) {
+                return { type: 'rotate', idx: i };
+            }
+
+            // 2) 8 个控制点
+            const handles = [
+                [-item.w / 2, -item.h / 2],
+                [0, -item.h / 2],
+                [item.w / 2, -item.h / 2],
+                [item.w / 2, 0],
+                [item.w / 2, item.h / 2],
+                [0, item.h / 2],
+                [-item.w / 2, item.h / 2],
+                [-item.w / 2, 0]
+            ];
+            for (let h = 0; h < 8; h++) {
+                if (this._flatSizeLocked && (h === 3 || h === 5)) continue;
+                const hx = lx - handles[h][0];
+                const hy = ly - handles[h][1];
+                if (Math.sqrt(hx * hx + hy * hy) <= HIT_R) {
+                    return { type: 'resize', idx: i, handle: h };
+                }
+            }
+
+            // 3) 图片内部
+            if (Math.abs(lx) <= item.w / 2 && Math.abs(ly) <= item.h / 2) {
+                return { type: 'move', idx: i };
+            }
+        }
+        return { type: 'none', idx: -1 };
+    }
+
+    /* ---- 鼠标事件 ---- */
+
+    _flatMouseDown(e) {
+        const pos = this._flatMouseToCanvas(e);
+        const hit = this._flatHitTest(pos.x, pos.y);
+
+        if (hit.type === 'none') {
+            this._flatActiveIdx = -1;
+            document.getElementById('flat-del-btn').classList.add('hidden');
+            this._renderFlatCanvas();
+            return;
+        }
+
+        this._flatActiveIdx = hit.idx;
+        document.getElementById('flat-del-btn').classList.remove('hidden');
+
+        const item = this._flatImages[hit.idx];
+        const dx = pos.x - item.x;
+        const dy = pos.y - item.y;
+        const cos = Math.cos(-item.rot * Math.PI / 180);
+        const sin = Math.sin(-item.rot * Math.PI / 180);
+        this._flatDrag = {
+            mode: hit.type,
+            idx: hit.idx,
+            startX: pos.x,
+            startY: pos.y,
+            startLocalX: dx * cos - dy * sin,
+            startLocalY: dx * sin + dy * cos,
+            startItem: { x: item.x, y: item.y, w: item.w, h: item.h, rot: item.rot },
+            handle: hit.handle ?? -1
+        };
+        this._renderFlatCanvas();
+    }
+
+    _flatMouseMove(e) {
+        if (!this._flatDrag || this._flatDrag.mode === 'none') return;
+        const pos = this._flatMouseToCanvas(e);
+        const d = this._flatDrag;
+        const item = this._flatImages[d.idx];
+
+        if (d.mode === 'move') {
+            item.x = d.startItem.x + (pos.x - d.startX);
+            item.y = d.startItem.y + (pos.y - d.startY);
+            // 网格吸附：开启网格参考时，左上角吸附到最近的 10mm 网格点
+            if (this._flatGridOn) {
+                const canvas = document.getElementById('flat-canvas');
+                const cellPx = canvas.width / 27;  // 270mm / 10mm = 27 cells
+                const tlX = item.x - item.w / 2;
+                const tlY = item.y - item.h / 2;
+                const snapTLX = Math.round(tlX / cellPx) * cellPx;
+                const snapTLY = Math.round(tlY / cellPx) * cellPx;
+                item.x = snapTLX + item.w / 2;
+                item.y = snapTLY + item.h / 2;
+            }
+        } else if (d.mode === 'rotate') {
+            const dx = pos.x - item.x;
+            const dy = pos.y - item.y;
+            let angle = Math.atan2(dy, dx) * 180 / Math.PI + 90;
+            item.rot = angle;
+        } else if (d.mode === 'resize') {
+            const dx = pos.x - item.x;
+            const dy = pos.y - item.y;
+            const cos = Math.cos(-item.rot * Math.PI / 180);
+            const sin = Math.sin(-item.rot * Math.PI / 180);
+            const lx = dx * cos - dy * sin;
+            const ly = dx * sin + dy * cos;
+            const deltaLx = lx - d.startLocalX;
+            const deltaLy = ly - d.startLocalY;
+            const h = d.handle;
+            const si = d.startItem;
+
+            if (h === 0 || h === 2 || h === 4 || h === 6) {
+                let sx, sy;
+                if (h === 0) { sx = (si.w / 2 - deltaLx) / (si.w / 2); sy = (si.h / 2 - deltaLy) / (si.h / 2); }
+                else if (h === 2) { sx = (si.w / 2 + deltaLx) / (si.w / 2); sy = (si.h / 2 - deltaLy) / (si.h / 2); }
+                else if (h === 4) { sx = (si.w / 2 + deltaLx) / (si.w / 2); sy = (si.h / 2 + deltaLy) / (si.h / 2); }
+                else { sx = (si.w / 2 - deltaLx) / (si.w / 2); sy = (si.h / 2 + deltaLy) / (si.h / 2); }
+                const scale = Math.max(sx, sy, 0.05);
+                item.w = si.w * scale;
+                item.h = si.h * scale;
+            } else {
+                let newW = si.w, newH = si.h;
+                if (h === 7) newW = si.w - deltaLx * 2;
+                if (h === 3) newW = si.w + deltaLx * 2;
+                if (h === 1) newH = si.h - deltaLy * 2;
+                if (h === 5) newH = si.h + deltaLy * 2;
+                if (newW > 10) item.w = newW;
+                if (newH > 10) item.h = newH;
+            }
+        }
+
+        this._renderFlatCanvas();
+    }
+
+    _flatMouseUp() {
+        this._flatDrag = null;
+    }
+
+    /* ---- 渲染 ---- */
+
+    _renderFlatCanvas() {
+        const canvas = document.getElementById('flat-canvas');
+        const ctx = this._flatCanvasCtx;
+        if (!canvas || !ctx) return;
+        const size = canvas.width;
+        ctx.clearRect(0, 0, size, size);
+
+        // 网格（纯视觉辅助，不导出）
+        if (this._flatGridOn && !this._flatSuppressGrid) {
+            const BED_MM = 270;
+            const CELL_MM = 10;
+            const cellCount = BED_MM / CELL_MM;  // 27
+            const cellPx = size / cellCount;
+            ctx.strokeStyle = 'rgba(74, 158, 255, 0.30)';
+            ctx.lineWidth = Math.max(1, size / 1000);
+            ctx.beginPath();
+            for (let i = 1; i < cellCount; i++) {
+                const pos = i * cellPx;
+                ctx.moveTo(pos, 0);
+                ctx.lineTo(pos, size);
+                ctx.moveTo(0, pos);
+                ctx.lineTo(size, pos);
+            }
+            ctx.stroke();
+        }
+
+        for (let i = 0; i < this._flatImages.length; i++) {
+            const item = this._flatImages[i];
+            ctx.save();
+            ctx.translate(item.x, item.y);
+            ctx.rotate(item.rot * Math.PI / 180);
+            ctx.drawImage(item.img, -item.w / 2, -item.h / 2, item.w, item.h);
+            ctx.restore();
+        }
+
+        // 绘制选中框
+        if (this._flatActiveIdx >= 0) {
+            this._drawFlatSelection(ctx, this._flatImages[this._flatActiveIdx]);
+        }
+
+        // 更新尺寸输入卡片
+        this._updateFlatSizeCard();
+    }
+
+    _drawFlatSelection(ctx, item) {
+        const canvas = document.getElementById('flat-canvas');
+        const s = (canvas ? canvas.width : 4000) / 700;  // 控件尺寸缩放因子
+        const ROT_DIST = 28 * s;
+        const H_R = 5 * s;      // 控制点半径
+        const ROT_R = 7 * s;    // 旋转手柄半径
+        const LW = 1.5 * s;     // 线宽
+        const dashLen = 5 * s;
+        const dashGap = 3 * s;
+
+        ctx.save();
+        ctx.translate(item.x, item.y);
+        ctx.rotate(item.rot * Math.PI / 180);
+
+        // 虚线边框
+        ctx.strokeStyle = '#4a9eff';
+        ctx.lineWidth = LW;
+        ctx.setLineDash([dashLen, dashGap]);
+        ctx.strokeRect(-item.w / 2, -item.h / 2, item.w, item.h);
+        ctx.setLineDash([]);
+
+        // 8 个控制点（3=右中、5=下中 为红色，锁定长宽比时隐藏红色控件）
+        const pts = [
+            [-item.w / 2, -item.h / 2], [0, -item.h / 2], [item.w / 2, -item.h / 2],
+            [item.w / 2, 0], [item.w / 2, item.h / 2], [0, item.h / 2],
+            [-item.w / 2, item.h / 2], [-item.w / 2, 0]
+        ];
+        for (let hi = 0; hi < pts.length; hi++) {
+            const isRed = (hi === 3 || hi === 5);
+            if (this._flatSizeLocked && isRed) continue;
+            const p = pts[hi];
+            ctx.beginPath();
+            ctx.arc(p[0], p[1], H_R, 0, Math.PI * 2);
+            ctx.fillStyle = isRed ? '#ff4444' : '#fff';
+            ctx.fill();
+            ctx.strokeStyle = isRed ? '#cc0000' : '#4a9eff';
+            ctx.lineWidth = LW;
+            ctx.stroke();
+        }
+
+        // 旋转手柄连接线
+        ctx.beginPath();
+        ctx.moveTo(0, -item.h / 2);
+        ctx.lineTo(0, -item.h / 2 - ROT_DIST + ROT_R);
+        ctx.strokeStyle = '#4a9eff';
+        ctx.lineWidth = 1 * s;
+        ctx.stroke();
+
+        // 旋转手柄圆点
+        ctx.beginPath();
+        ctx.arc(0, -item.h / 2 - ROT_DIST, ROT_R, 0, Math.PI * 2);
+        ctx.fillStyle = '#ffd700';
+        ctx.fill();
+        ctx.strokeStyle = '#4a9eff';
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+
+        ctx.restore();
+    }
+
+    // ---- 尺寸输入卡片 ----
+
+    _updateFlatSizeCard() {
+        const card = document.getElementById('flat-size-card');
+        const inputW = document.getElementById('flat-size-w');
+        const inputH = document.getElementById('flat-size-h');
+        const lockBtn = document.getElementById('flat-size-lock');
+        const canvas = document.getElementById('flat-canvas');
+        const wrap = document.getElementById('flat-canvas-wrap');
+        if (!card || !inputW || !canvas || !wrap) return;
+
+        if (this._flatActiveIdx < 0) {
+            card.classList.remove('visible');
+            return;
+        }
+
+        const item = this._flatImages[this._flatActiveIdx];
+        const mmW = Math.round(item.w / canvas.width * 270 * 10) / 10;
+        const mmH = Math.round(item.h / canvas.height * 270 * 10) / 10;
+        const locked = this._flatSizeLocked;
+
+        // 不在输入中时不刷新值
+        if (document.activeElement !== inputW) {
+            inputW.value = mmW;
+        }
+        if (inputH && document.activeElement !== inputH) {
+            inputH.value = mmH;
+        }
+
+        // 锁定状态切换显示
+        if (lockBtn) {
+            lockBtn.classList.toggle('unlocked', !locked);
+            lockBtn.title = locked ? '解除长宽比锁定' : '锁定长宽比';
+            if (locked) {
+                lockBtn.innerHTML = '<svg viewBox="0 0 24 24" width="12" height="12"><path fill="currentColor" d="M18 8h-1V6c0-2.76-2.24-5-5-5S7 3.24 7 6v2H6c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V10c0-1.1-.9-2-2-2zm-6 9c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2zm3.1-9H8.9V6c0-1.71 1.39-3.1 3.1-3.1s3.1 1.39 3.1 3.1v2z"/></svg>';
+            } else {
+                lockBtn.innerHTML = '<svg viewBox="0 0 24 24" width="12" height="12"><path fill="currentColor" d="M12 17c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2zm6-9h-1V6c0-2.76-2.24-5-5-5S7 3.24 7 6h2c0-1.66 1.34-3 3-3s3 1.34 3 3v2H6c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V10c0-1.1-.9-2-2-2zm0 12H6V10h12v10z"/></svg>';
+            }
+        }
+
+        // XY 位置同步：左上角像素 → 左下角原点 mm
+        const inputX = document.getElementById('flat-pos-x');
+        const inputY = document.getElementById('flat-pos-y');
+        const tlCx = item.x - item.w / 2;
+        const tlCy = item.y - item.h / 2;
+        const mmX = Math.round(tlCx / canvas.width * 270 * 10) / 10;
+        const mmY = Math.round((canvas.height - tlCy) / canvas.height * 270 * 10) / 10;
+        if (inputX && document.activeElement !== inputX) {
+            inputX.value = mmX;
+        }
+        if (inputY && document.activeElement !== inputY) {
+            inputY.value = mmY;
+        }
+
+        // 定位：image 中心 → CSS 坐标
+        const cRect = canvas.getBoundingClientRect();
+        const wRect = wrap.getBoundingClientRect();
+        const displayW = cRect.width;
+        const scale = displayW / canvas.width;
+        const imgCX = (cRect.left - wRect.left) + item.x * scale;
+        const imgCY = (cRect.top - wRect.top) + item.y * scale;
+        card.style.left = imgCX + 'px';
+        card.style.top  = imgCY + 'px';
+        card.classList.add('visible');
+    }
+
+    _setupFlatSizeInput() {
+        const inputW = document.getElementById('flat-size-w');
+        if (!inputW || this._flatSizeInputBound) return;
+        this._flatSizeInputBound = true;
+
+        const lockBtn = document.getElementById('flat-size-lock');
+        const inputH = document.getElementById('flat-size-h');
+
+        // 锁定按钮切换
+        if (lockBtn) {
+            lockBtn.addEventListener('click', () => {
+                this._flatSizeLocked = !this._flatSizeLocked;
+                // 切换锁定时，将 H 值同步回当前比例值
+                if (this._flatSizeLocked) {
+                    const item = this._flatImages[this._flatActiveIdx];
+                    if (item && inputW) {
+                        const canvas = document.getElementById('flat-canvas');
+                        const mmW = item.w / (canvas ? canvas.width : 4000) * 270;
+                        inputW.value = Math.round(mmW * 10) / 10;
+                    }
+                }
+                this._renderFlatCanvas();
+            });
+        }
+
+        // W 输入框按键处理
+        if (inputW) {
+            inputW.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter') {
+                    e.preventDefault();
+                    e.target.blur();
+                }
+            });
+            inputW.addEventListener('blur', () => {
+                this._applyFlatSizeInput('w');
+            });
+        }
+
+        // H 输入框按键处理
+        if (inputH) {
+            inputH.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter') {
+                    e.preventDefault();
+                    e.target.blur();
+                }
+            });
+            inputH.addEventListener('blur', () => {
+                this._applyFlatSizeInput('h');
+            });
+        }
+
+        // X 位置输入框
+        const inputX = document.getElementById('flat-pos-x');
+        if (inputX) {
+            inputX.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter') {
+                    e.preventDefault();
+                    e.target.blur();
+                }
+            });
+            inputX.addEventListener('blur', () => {
+                this._applyFlatPosInput('x');
+            });
+        }
+
+        // Y 位置输入框
+        const inputY = document.getElementById('flat-pos-y');
+        if (inputY) {
+            inputY.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter') {
+                    e.preventDefault();
+                    e.target.blur();
+                }
+            });
+            inputY.addEventListener('blur', () => {
+                this._applyFlatPosInput('y');
+            });
+        }
+    }
+
+    _applyFlatSizeInput(source) {
+        const inputW = document.getElementById('flat-size-w');
+        const inputH = document.getElementById('flat-size-h');
+        const canvas = document.getElementById('flat-canvas');
+        if (!inputW || !canvas) return;
+        if (this._flatActiveIdx < 0) return;
+        const item = this._flatImages[this._flatActiveIdx];
+
+        if (this._flatSizeLocked) {
+            // 锁定模式：修改 W 或 H 时按比例同步另一方
+            const ratio = item.h / item.w;
+            if (source === 'h' && inputH) {
+                let mmH = parseFloat(inputH.value);
+                if (isNaN(mmH) || mmH <= 0) {
+                    mmH = item.h / canvas.height * 270;
+                    inputH.value = Math.round(mmH * 10) / 10;
+                    return;
+                }
+                const newH = mmH / 270 * canvas.height;
+                item.h = newH;
+                item.w = newH / ratio;
+            } else {
+                let mmW = parseFloat(inputW.value);
+                if (isNaN(mmW) || mmW <= 0) {
+                    mmW = item.w / canvas.width * 270;
+                    inputW.value = Math.round(mmW * 10) / 10;
+                    return;
+                }
+                const newW = mmW / 270 * canvas.width;
+                item.w = newW;
+                item.h = newW * ratio;
+            }
+        } else {
+            // 解锁模式：W 和 H 独立修改
+            if (source === 'w') {
+                let mmW = parseFloat(inputW.value);
+                if (isNaN(mmW) || mmW <= 0) {
+                    mmW = item.w / canvas.width * 270;
+                    inputW.value = Math.round(mmW * 10) / 10;
+                    return;
+                }
+                item.w = mmW / 270 * canvas.width;
+            } else if (source === 'h' && inputH) {
+                let mmH = parseFloat(inputH.value);
+                if (isNaN(mmH) || mmH <= 0) {
+                    mmH = item.h / canvas.height * 270;
+                    inputH.value = Math.round(mmH * 10) / 10;
+                    return;
+                }
+                item.h = mmH / 270 * canvas.height;
+            }
+        }
+        this._renderFlatCanvas();
+    }
+
+    _applyFlatPosInput(source) {
+        const inputX = document.getElementById('flat-pos-x');
+        const inputY = document.getElementById('flat-pos-y');
+        const canvas = document.getElementById('flat-canvas');
+        if (!canvas) return;
+        if (this._flatActiveIdx < 0) return;
+        const item = this._flatImages[this._flatActiveIdx];
+
+        if (source === 'x' && inputX) {
+            let mmX = parseFloat(inputX.value);
+            if (isNaN(mmX) || mmX < 0) {
+                const tlCx = item.x - item.w / 2;
+                mmX = Math.round(tlCx / canvas.width * 270 * 10) / 10;
+                inputX.value = mmX;
+                return;
+            }
+            const tlCx = mmX / 270 * canvas.width;
+            item.x = tlCx + item.w / 2;
+        } else if (source === 'y' && inputY) {
+            let mmY = parseFloat(inputY.value);
+            if (isNaN(mmY) || mmY < 0) {
+                const tlCy = item.y - item.h / 2;
+                mmY = Math.round((canvas.height - tlCy) / canvas.height * 270 * 10) / 10;
+                inputY.value = mmY;
+                return;
+            }
+            const tlCy = canvas.height - (mmY / 270 * canvas.height);
+            item.y = tlCy + item.h / 2;
+        }
+        this._renderFlatCanvas();
+    }
+
+    /* ---- 生成 & 上传 ---- */
+
+    async _runFlatPrint() {
+        if (this._flatImages.length === 0) {
+            this.showToast('请先添加图片', 'info');
+            return;
+        }
+        this._renderFlatCanvas();
+        const canvas = document.getElementById('flat-canvas');
+        if (!canvas) return;
+
+        if (!window.pywebview || !window.pywebview.api) {
+            this.showToast('后端API不可用', 'error');
+            return;
+        }
+
+        try {
+            // 临时失焦点，避免控点进入导出的 PNG；同时关闭网格
+            const savedActive = this._flatActiveIdx;
+            this._flatActiveIdx = -1;
+            this._flatSuppressGrid = true;
+            this._renderFlatCanvas();
+            const pngBase64 = canvas.toDataURL('image/png');
+            this._flatActiveIdx = savedActive;
+            this._flatSuppressGrid = false;
+            this._renderFlatCanvas();
+            const zHeight = parseFloat(document.getElementById('flat-z-height')?.value) || 0;
+
+            // ---- 显示进度浮层 ----
+            const progressEl = document.getElementById('flat-progress-overlay');
+            const progressFill = document.getElementById('flat-progress-fill');
+            const progressText = document.getElementById('flat-progress-text');
+            let progressVal = 0;
+            let progressTimer = null;
+            let progressDone = false;
+
+            if (progressEl) {
+                progressEl.classList.remove('hidden');
+                progressFill.style.width = '0%';
+                progressText.textContent = '正在准备...';
+                progressTimer = setInterval(() => {
+                    if (progressDone) return;
+                    progressVal += 6 + Math.floor(Math.random() * 11);
+                    if (progressVal > 95) progressVal = 95;
+                    progressFill.style.width = progressVal + '%';
+                }, 1000);
+            }
+
+            // 第1步：预览
+            const preview = await window.pywebview.api.planar_strip_preview(pngBase64);
+            if (!preview || !preview.success) {
+                if (progressTimer) clearInterval(progressTimer);
+                if (progressEl) progressEl.classList.add('hidden');
+                this.showToast('预览失败: ' + (preview?.error || '未知错误'), 'error');
+                return;
+            }
+            if (preview.blocks === 0) {
+                if (progressTimer) clearInterval(progressTimer);
+                if (progressEl) progressEl.classList.add('hidden');
+                this.showToast('画布无可打印内容', 'warning');
+                return;
+            }
+
+            // 第2步：切片+上传+打印
+            if (progressText) progressText.textContent =
+                `正在条带切割并上传 (${preview.blocks} 块)...`;
+            const result = await window.pywebview.api.planar_strip_slice(pngBase64, zHeight);
+
+            // ---- 隐藏进度条 ----
+            progressDone = true;
+            if (progressTimer) clearInterval(progressTimer);
+            if (progressEl) {
+                progressFill.style.width = '100%';
+                if (result && result.success) {
+                    progressText.textContent = '打印已启动';
+                } else {
+                    progressText.textContent = '上传失败';
+                }
+                setTimeout(() => progressEl.classList.add('hidden'), 1200);
+            }
+
+            if (result && result.success) {
+                const msg = result.printer_result?.message || '上传成功';
+                this.showToast(msg, 'success');
+            } else {
+                this.showToast('上传失败: ' + (result?.error || result?.detail || '未知错误'), 'error');
+            }
+        } catch (e) {
+            console.error('平面打印异常:', e);
+            this.showToast('平面打印异常: ' + e.message, 'error');
+        }
+    }
+
     animate() {
         requestAnimationFrame(() => this.animate());
+
+        // 当 3D 容器不可见时（display:none），跳过渲染以节省 GPU 资源。
+        // 在 NVIDIA 硬件上持续渲染不可见画布会触发驱动层面资源累积，导致逐步卡顿。
+        if (this.container.offsetWidth === 0 || this.container.offsetHeight === 0) return;
+
         this.orbitControls.update();
         // 渲染前统一矫正Z轴，确保与渲染原子化，无任何时序间隙
         this.lockZAxis();
@@ -7133,5 +12981,6 @@ class BedPreview {
 }
 
 document.addEventListener('DOMContentLoaded', () => {
-    new BedPreview();
+    window.bp = new BedPreview();
+    window._app = window.bp;
 });

@@ -1,0 +1,1275 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D 热床预览</title>
+    <link rel="icon" href="data:,">
+    <script>window.__STARTUP_MKP_PATH = "C:\\Users\\Administrator\\Desktop\\MKPSpectrum\\maimail.mkp";document.documentElement.classList.add("startup-mkp");</script>
+    <script>
+        if (window.__STARTUP_MKP_PATH || new URLSearchParams(window.location.search).has('startup_mkp')) {
+            document.documentElement.classList.add('startup-mkp');
+        }
+    </script>
+    <link rel="stylesheet" href="style.css">
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "./lib/three/three.module.js",
+            "three/addons/": "./lib/three/addons/"
+        }
+    }
+    </script>
+</head>
+<body>
+    <!-- 顶部标题栏 -->
+    <div id="title-bar">
+        <div class="title-bar-left">
+            <button class="title-btn" id="menu-file">文件</button>
+            <div class="title-separator"></div>
+            <button class="title-btn icon-btn" id="btn-settings" title="设置">
+                <svg viewBox="0 0 24 24" width="16" height="16">
+                    <path fill="currentColor" d="M19.14,12.94c0.04-0.3,0.06-0.61,0.06-0.94c0-0.32-0.02-0.64-0.07-0.94l2.03-1.58c0.18-0.14,0.23-0.41,0.12-0.61 l-1.92-3.32c-0.12-0.22-0.37-0.29-0.59-0.22l-2.39,0.96c-0.5-0.38-1.03-0.7-1.62-0.94L14.4,2.81c-0.04-0.24-0.24-0.41-0.48-0.41 h-3.84c-0.24,0-0.43,0.17-0.47,0.41L9.25,5.35C8.66,5.59,8.12,5.92,7.63,6.29L5.24,5.33c-0.22-0.08-0.47,0-0.59,0.22L2.74,8.87 C2.62,9.08,2.66,9.34,2.86,9.49l2.03,1.58C4.84,11.36,4.8,11.69,4.8,12s0.02,0.64,0.07,0.94l-2.03,1.58 c-0.18,0.14-0.23,0.41-0.12,0.61l1.92,3.32c0.12,0.22,0.37,0.29,0.59,0.22l2.39-0.96c0.5,0.38,1.03,0.7,1.62,0.94l0.36,2.54 c0.05,0.24,0.24,0.41,0.48,0.41h3.84c0.24,0,0.44-0.17,0.47-0.41l0.36-2.54c0.59-0.24,1.13-0.56,1.62-0.94l2.39,0.96 c0.22,0.08,0.47,0,0.59-0.22l1.92-3.32c0.12-0.22,0.07-0.47-0.12-0.61L19.14,12.94z M12,15.6c-1.98,0-3.6-1.62-3.6-3.6 s1.62-3.6,3.6-3.6s3.6,1.62,3.6,3.6S13.98,15.6,12,15.6z"/>
+                </svg>
+            </button>
+            <div class="title-separator"></div>
+            <button class="title-btn icon-btn" id="btn-save" title="保存">
+                <svg viewBox="0 0 24 24" width="16" height="16">
+                    <path fill="currentColor" d="M17 3H5c-1.11 0-2 .9-2 2v14c0 1.1.89 2 2 2h14c1.1 0 2-.9 2-2V7l-4-4zm-5 16c-1.66 0-3-1.34-3-3s1.34-3 3-3 3 1.34 3 3-1.34 3-3 3zm3-10H5V5h10v4z"/>
+                </svg>
+            </button>
+            <div class="title-separator"></div>
+            <button class="title-btn icon-btn" id="btn-undo" title="撤销">
+                <svg viewBox="0 0 24 24" width="16" height="16">
+                    <path fill="currentColor" d="M12.5 8c-2.65 0-5.05.99-6.9 2.6L2 7v9h9l-3.62-3.62c1.39-1.16 3.16-1.88 5.12-1.88 3.54 0 6.55 2.31 7.6 5.5l2.37-.78C21.08 11.03 17.15 8 12.5 8z"/>
+                </svg>
+            </button>
+            <button class="title-btn icon-btn" id="btn-redo" title="重做">
+                <svg viewBox="0 0 24 24" width="16" height="16">
+                    <path fill="currentColor" d="M18.4 10.6C16.55 8.99 14.15 8 11.5 8c-4.65 0-8.58 3.03-9.96 7.22L3.9 16c1.05-3.19 4.05-5.5 7.6-5.5 1.95 0 3.73.72 5.12 1.88L13 16h9V7l-3.6 3.6z"/>
+                </svg>
+            </button>
+            <div class="title-separator"></div>
+            <button class="title-btn icon-btn calib-btn" id="btn-calibrate" title="校准">
+                <svg viewBox="0 0 24 24" width="16" height="16">
+                    <rect x="5" y="5" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5"/>
+                    <line x1="0" y1="12" x2="5" y2="12" stroke="currentColor" stroke-width="1.5"/>
+                    <line x1="19" y1="12" x2="24" y2="12" stroke="currentColor" stroke-width="1.5"/>
+                    <line x1="12" y1="0" x2="12" y2="5" stroke="currentColor" stroke-width="1.5"/>
+                    <line x1="12" y1="19" x2="12" y2="24" stroke="currentColor" stroke-width="1.5"/>
+                </svg>
+            </button>
+        </div>
+        <div class="title-bar-center">
+            <span class="app-title">MKPSpectrum</span>
+        </div>
+        <div class="title-bar-right">
+            <button class="window-ctrl-btn" id="btn-minimize" title="最小化">
+                <svg viewBox="0 0 12 12" width="12" height="12">
+                    <rect y="5" width="12" height="1.5" fill="currentColor"/>
+                </svg>
+            </button>
+            <button class="window-ctrl-btn" id="btn-maximize" title="最大化">
+                <svg viewBox="0 0 12 12" width="12" height="12">
+                    <rect x="1" y="1" width="10" height="10" fill="none" stroke="currentColor" stroke-width="1.2"/>
+                </svg>
+            </button>
+            <button class="window-ctrl-btn window-close-btn" id="btn-close" title="关闭">
+                <svg viewBox="0 0 12 12" width="12" height="12">
+                    <line x1="1" y1="1" x2="11" y2="11" stroke="currentColor" stroke-width="1.2"/>
+                    <line x1="11" y1="1" x2="1" y2="11" stroke="currentColor" stroke-width="1.2"/>
+                </svg>
+            </button>
+        </div>
+    </div>
+
+    <!-- 导航栏 -->
+    <div id="nav-bar">
+        <button class="nav-btn active" id="nav-home">首页</button>
+        <button class="nav-btn" id="nav-prepare">准备</button>
+        <button class="nav-btn" id="nav-preview">预览</button>
+        <button class="nav-btn" id="nav-flat">平面</button>
+        <button class="nav-btn" id="nav-device">设备</button>
+        <button class="nav-btn" id="nav-calibrate">配置</button>
+        <div class="nav-spacer"></div>
+    <button class="slice-btn hidden" id="btn-flat-slice">生成并打印</button>
+    <button class="slice-btn hidden" id="btn-model-slice">纹理切片</button>
+    <button class="slice-btn hidden" id="btn-model-retry" title="重试切片">
+        <svg viewBox="0 0 24 24" width="16" height="16"><path fill="currentColor" d="M17.65 6.35A7.958 7.958 0 0012 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08A5.99 5.99 0 0112 18c-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg>
+    </button>
+    <button class="slice-btn hidden" id="btn-print-gcode">立即打印</button>
+    </div>
+
+    <!-- 首页侧边栏（仅在首页显示） -->
+    <div id="home-sidebar">
+        <div class="sidebar-top">
+            <button class="sidebar-btn active" id="sidebar-nav-home">
+                <svg viewBox="0 0 24 24" width="18" height="18"><path fill="currentColor" d="M10 20v-6h4v6h5v-8h3L12 3 2 12h3v8z"/></svg>
+                <span>首页</span>
+            </button>
+            <button class="sidebar-btn" id="sidebar-nav-prepare">
+                <svg viewBox="0 0 24 24" width="18" height="18"><path fill="currentColor" d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/></svg>
+                <span>准备</span>
+            </button>
+            <button class="sidebar-btn" id="sidebar-nav-flat">
+                <svg viewBox="0 0 24 24" width="18" height="18"><path fill="currentColor" d="M21 19V5c0-1.1-.9-2-2-2H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2zM8.5 13.5l2.5 3.01L14.5 12l4.5 6H5l3.5-4.5z"/></svg>
+                <span>平面</span>
+            </button>
+            <button class="sidebar-btn" id="sidebar-nav-device">
+                <svg viewBox="0 0 24 24" width="18" height="18"><path fill="currentColor" d="M22 9V7h-2V5c0-1.1-.9-2-2-2H4c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2v-2h2v-2h-2v-2h2v-2h-2V9h2zm-4 10H4V5h14v14zM6 13h5v4H6zm6-6h4v3h-4zm0 4h4v6h-4zm-6-4h5v6H6z"/></svg>
+                <span>设备</span>
+            </button>
+            <button class="sidebar-btn" id="sidebar-nav-calibrate">
+                <svg viewBox="0 0 24 24" width="18" height="18"><path fill="currentColor" d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.05-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.56-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22l-1.92 3.32c-.12.21-.07.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.03-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/></svg>
+                <span>配置</span>
+            </button>
+        </div>
+        <div class="sidebar-divider"></div>
+        <div class="sidebar-section-title">项目</div>
+        <div class="sidebar-mid">
+            <button class="sidebar-btn" id="sidebar-import-file">
+                <svg viewBox="0 0 24 24" width="18" height="18"><path fill="currentColor" d="M9 16h6v-6h4l-7-7-7 7h4zm-4 2h14v2H5z"/></svg>
+                <span>导入文件</span>
+            </button>
+            <button class="sidebar-btn" id="sidebar-open-project">
+                <svg viewBox="0 0 24 24" width="18" height="18"><path fill="currentColor" d="M20 6h-8l-2-2H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2zm0 12H4V8h16v10z"/></svg>
+                <span>打开项目</span>
+            </button>
+        </div>
+        <div class="sidebar-divider"></div>
+        <div class="sidebar-section-title">设置</div>
+        <div class="sidebar-bottom">
+            <button class="sidebar-btn" id="sidebar-settings">
+                <svg viewBox="0 0 24 24" width="18" height="18"><path fill="currentColor" d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.05-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.56-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22l-1.92 3.32c-.12.21-.07.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.03-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/></svg>
+                <span>设置</span>
+            </button>
+            <button class="sidebar-btn" id="sidebar-about">
+                <svg viewBox="0 0 24 24" width="18" height="18"><path fill="currentColor" d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/></svg>
+                <span>关于</span>
+            </button>
+        </div>
+    </div>
+
+    <!-- 首页 (与 main-container 同级) -->
+    <div id="home-page">
+        <div class="home-content">
+            <div class="home-header">
+                <div class="home-welcome">欢迎使用</div>
+                <h1 class="home-title">MKPSpectrum</h1>
+                <p class="home-subtitle">喷墨全彩 3D 打印控制中心</p>
+            </div>
+
+            <div class="home-action-cards">
+                <button class="home-action-card" id="home-new-project">
+                    <div class="action-card-icon">
+                        <svg viewBox="0 0 24 24" width="24" height="24"><path fill="currentColor" d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/></svg>
+                    </div>
+                    <div class="action-card-title">新建项目</div>
+                    <div class="action-card-desc">创建一个新项目</div>
+                </button>
+                <button class="home-action-card" id="home-open-project">
+                    <div class="action-card-icon">
+                        <svg viewBox="0 0 24 24" width="24" height="24"><path fill="currentColor" d="M20 6h-8l-2-2H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2zm0 12H4V8h16v10z"/></svg>
+                    </div>
+                    <div class="action-card-title">打开项目</div>
+                    <div class="action-card-desc">打开 MKP 项目文件</div>
+                </button>
+            </div>
+
+            <div class="home-section">
+                <div class="home-section-header">
+                    <span class="home-section-title">近期打开文件</span>
+                    <button class="home-section-clear" id="home-clear-recent">清空</button>
+                </div>
+                <div id="recent-projects" class="recent-grid-thumb">
+                    <div class="recent-empty">暂无最近项目</div>
+                </div>
+            </div>
+
+            <div class="home-hint-card">
+                <div class="home-hint-title">
+                    <svg viewBox="0 0 24 24" width="16" height="16"><path fill="currentColor" d="M9 21c0 .55.45 1 1 1h4c.55 0 1-.45 1-1v-1H9v1zm3-19C8.14 2 5 5.14 5 9c0 2.38 1.19 4.47 3 5.74V17c0 .55.45 1 1 1h6c.55 0 1-.45 1-1v-2.26c1.81-1.27 3-3.36 3-5.74 0-3.86-3.14-7-7-7zm2.85 11.1l-.85.6V16h-4v-2.3l-.85-.6A4.997 4.997 0 0 1 7 9c0-2.76 2.24-5 5-5s5 2.24 5 5c0 1.63-.8 3.16-2.15 4.1z"/></svg>
+                    提示
+                </div>
+                <p class="home-hint-text">从左侧导航栏开始您的工作流程，或新建/打开一个项目。</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- 3D 工作区 -->
+    <div id="main-container" class="hidden">
+        <!-- 左侧对象列表边栏 -->
+        <div id="objects-panel">
+            <div class="printer-selector">
+                <div class="printer-header">
+                    <label>打印机</label>
+                </div>
+                <div class="printer-select-row">
+                    <div class="custom-select" id="printer-select">
+                        <div class="select-trigger">
+                            <span class="select-value">Snapmaker U1</span>
+                            <svg class="select-arrow" viewBox="0 0 24 24" width="14" height="14">
+                                <path fill="currentColor" d="M7 10l5 5 5-5z"/>
+                            </svg>
+                        </div>
+                        <div class="select-options hidden">
+                            <div class="select-option selected" data-value="snapmaker-u1">Snapmaker U1</div>
+                            <div class="select-option" data-value="flashforge-creator-5">FlashForge Creator 5</div>
+                        </div>
+                    </div>
+                    <button class="printer-edit-btn" id="printer-edit-btn" title="修改打印机设置">
+                        <svg viewBox="0 0 24 24" width="18" height="18">
+                            <path fill="currentColor" d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04c.39-.39.39-1.02 0-1.41l-2.34-2.34c-.39-.39-1.02-.39-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z"/>
+                        </svg>
+                    </button>
+                </div>
+            </div>
+
+            <!-- 盘（构建板）切换条 -->
+            <div class="plates-bar">
+                <div id="plates-list"></div>
+            </div>
+            <div class="panel-header">
+                <h2>对象列表</h2>
+                <span id="object-count">0 个对象</span>
+            </div>
+            <div id="objects-list">
+                <!-- 对象列表项将动态添加到这里 -->
+            </div>
+        </div>
+
+        <div id="container">
+            <div id="canvas-container">
+                <!-- Toast 通知（位于3D预览区左上角） -->
+                <div id="toast-container"></div>
+            </div>
+
+            <div id="toolbar">
+                <button id="tool-import" class="tool-btn" title="导入模型">
+                    <svg viewBox="0 0 24 24" width="20" height="20">
+                        <rect x="3" y="3" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"/>
+                        <path fill="currentColor" d="M17 11h-4V7h-2v4H7v2h4v4h2v-4h4z"/>
+                    </svg>
+                </button>
+                <button id="tool-auto-arrange" class="tool-btn" title="自动摆放">
+                    <svg viewBox="0 0 24 24" width="20" height="20">
+                        <rect x="3" y="3" width="7" height="7" rx="1" fill="currentColor"/>
+                        <rect x="14" y="3" width="7" height="7" rx="1" fill="currentColor"/>
+                        <rect x="3" y="14" width="7" height="7" rx="1" fill="currentColor"/>
+                        <rect x="14" y="14" width="7" height="7" rx="1" fill="currentColor"/>
+                    </svg>
+                </button>
+                <div class="toolbar-separator"></div>
+                <button id="tool-rotate" class="tool-btn" title="模型旋转">
+                    <svg viewBox="0 0 24 24" width="20" height="20">
+                        <path fill="currentColor" d="M12 6v3l4-4-4-4v3c-4.42 0-8 3.58-8 8 0 1.57.46 3.03 1.24 4.26L6.7 14.8c-.45-.83-.7-1.79-.7-2.8 0-3.31 2.69-6 6-6zm6.76 1.74L17.3 9.2c.44.84.7 1.79.7 2.8 0 3.31-2.69 6-6 6v-3l-4 4 4 4v-3c4.42 0 8-3.58 8-8 0-1.57-.46-3.03-1.24-4.26z"/>
+                    </svg>
+                </button>
+                <button id="tool-pan" class="tool-btn" title="模型移动">
+                    <svg viewBox="0 0 24 24" width="20" height="20">
+                        <path fill="currentColor" d="M10 9h4V6h3l-5-5-5 5h3v3zm-1 1H6V7l-5 5 5 5v-3h3v-4zm14 2l-5-5v3h-3v4h3v3l5-5zm-9 3h-4v3H7l5 5 5-5h-3v-3z"/>
+                    </svg>
+                </button>
+                <button id="tool-scale" class="tool-btn" title="模型缩放">
+                    <svg viewBox="0 0 24 24" width="20" height="20">
+                        <path fill="currentColor" d="M15 3l2.3 2.3-2.89 2.87 1.42 1.42L18.7 6.7 21 9V3h-6zM3 9l2.3-2.3 2.87 2.89 1.42-1.42L6.7 5.3 9 3H3v6zm6 12l-2.3-2.3 2.89-2.87-1.42-1.42L5.3 17.3 3 15v6h6zm12-6l-2.3 2.3-2.87-2.89-1.42 1.42 2.89 2.87L15 21h6v-6z"/>
+                    </svg>
+                </button>
+                <div class="toolbar-separator"></div>
+                <button id="tool-layonface" class="tool-btn" title="按面放平 (Lay on Face)">
+                    <svg viewBox="0 0 24 24" width="20" height="20">
+                        <polygon points="12,4 20,12 12,20 4,12" fill="none" stroke="currentColor" stroke-width="2"/>
+                        <line x1="2" y1="22" x2="22" y2="22" stroke="currentColor" stroke-width="2"/>
+                    </svg>
+                </button>
+                <div class="toolbar-separator"></div>
+                <button id="tool-reset" class="tool-btn" title="重置视图">
+                    <svg viewBox="0 0 24 24" width="20" height="20">
+                        <path fill="currentColor" d="M12 5V1L7 6l5 5V7c3.31 0 6 2.69 6 6s-2.69 6-6 6-6-2.69-6-6H4c0 4.42 3.58 8 8 8s8-3.58 8-8-3.58-8-8-8z"/>
+                    </svg>
+                </button>
+                <div class="toolbar-separator"></div>
+                <button id="tool-group" class="tool-btn" title="组合选中对象">
+                    <svg viewBox="0 0 24 24" width="20" height="20">
+                        <rect x="3" y="3" width="8" height="8" rx="1" fill="currentColor" opacity="0.5"/>
+                        <rect x="13" y="3" width="8" height="8" rx="1" fill="currentColor" opacity="0.5"/>
+                        <rect x="3" y="13" width="8" height="8" rx="1" fill="currentColor" opacity="0.5"/>
+                        <rect x="13" y="13" width="8" height="8" rx="1" fill="currentColor"/>
+                        <path fill="currentColor" d="M17 13h-2v2h-2v2h2v2h2v-2h2v-2h-2z"/>
+                    </svg>
+                </button>
+                <button id="tool-ungroup" class="tool-btn" title="解组选中组合体">
+                    <svg viewBox="0 0 24 24" width="20" height="20">
+                        <rect x="3" y="3" width="8" height="8" rx="1" fill="none" stroke="currentColor" stroke-width="1.5"/>
+                        <rect x="13" y="3" width="8" height="8" rx="1" fill="none" stroke="currentColor" stroke-width="1.5"/>
+                        <rect x="3" y="13" width="8" height="8" rx="1" fill="none" stroke="currentColor" stroke-width="1.5"/>
+                        <rect x="13" y="13" width="8" height="8" rx="1" fill="none" stroke="currentColor" stroke-width="1.5"/>
+                    </svg>
+                </button>
+            </div>
+
+            <div id="arrange-card" class="arrange-card hidden">
+                <div class="arrange-card-header">自动摆放</div>
+                <div class="arrange-card-body">
+                    <label class="arrange-label" for="arrange-spacing">模型间距</label>
+                    <div class="arrange-input-row">
+                        <input type="number" class="arrange-input" id="arrange-spacing" value="5" min="0" max="50" step="1">
+                        <span class="arrange-unit">mm</span>
+                    </div>
+                    <label class="arrange-label" for="arrange-margin" style="margin-top:8px;">距打印板边界</label>
+                    <div class="arrange-input-row">
+                        <input type="number" class="arrange-input" id="arrange-margin" value="5" min="0" max="50" step="1">
+                        <span class="arrange-unit">mm</span>
+                    </div>
+                </div>
+                <div class="arrange-card-footer">
+                    <button class="arrange-btn-cancel" id="arrange-cancel">取消</button>
+                    <button class="arrange-btn-confirm" id="arrange-confirm">确定</button>
+                </div>
+            </div>
+
+            <div id="transform-panel" class="hidden">
+                <div class="transform-header">
+                    <span class="dropdown-icon">▼</span>
+                    <span class="transform-title">坐标</span>
+                    <div class="axis-labels">
+                        <span class="axis-x">X</span>
+                        <span class="axis-y">Y</span>
+                        <span class="axis-z">Z</span>
+                    </div>
+                </div>
+                <div class="transform-content" id="transform-content-scale">
+                    <div class="transform-row">
+                        <span class="row-label">缩放</span>
+                        <div class="row-inputs">
+                            <input type="number" id="scale-x" value="100.00" step="0.01">
+                            <input type="number" id="scale-y" value="100.00" step="0.01">
+                            <input type="number" id="scale-z" value="100.00" step="0.01">
+                        </div>
+                        <span class="row-unit">%</span>
+                        <button class="reset-btn" id="reset-scale" title="还原缩放">
+                            <svg viewBox="0 0 24 24" width="14" height="14">
+                                <path fill="currentColor" d="M12 5V1L7 6l5 5V7c3.31 0 6 2.69 6 6s-2.69 6-6 6-6-2.69-6-6H4c0 4.42 3.58 8 8 8s8-3.58 8-8-3.58-8-8-8z"/>
+                            </svg>
+                        </button>
+                    </div>
+                    <div class="transform-row">
+                        <span class="row-label">大小</span>
+                        <div class="row-inputs">
+                            <input type="number" id="size-x" value="25.00" step="0.01">
+                            <input type="number" id="size-y" value="25.00" step="0.01">
+                            <input type="number" id="size-z" value="25.00" step="0.01">
+                        </div>
+                        <span class="row-unit">mm</span>
+                    </div>
+                    <div class="transform-checkbox">
+                        <input type="checkbox" id="uniform-scale" checked>
+                        <label for="uniform-scale">等比例缩放</label>
+                    </div>
+                </div>
+                <div class="transform-content hidden" id="transform-content-translate">
+                    <div class="transform-row">
+                        <span class="row-label">位置</span>
+                        <div class="row-inputs">
+                            <input type="number" id="pos-x" value="0.00" step="0.01">
+                            <input type="number" id="pos-y" value="0.00" step="0.01">
+                            <input type="number" id="pos-z" value="0.00" step="0.01" readonly title="Z轴自动贴地，不可手动调整">
+                        </div>
+                        <span class="row-unit">mm</span>
+                        <button class="reset-btn" id="reset-position" title="还原位置">
+                            <svg viewBox="0 0 24 24" width="14" height="14">
+                                <path fill="currentColor" d="M12 5V1L7 6l5 5V7c3.31 0 6 2.69 6 6s-2.69 6-6 6-6-2.69-6-6H4c0 4.42 3.58 8 8 8s8-3.58 8-8-3.58-8-8-8z"/>
+                            </svg>
+                        </button>
+                    </div>
+                </div>
+                <div class="transform-content hidden" id="transform-content-rotate">
+                    <div class="transform-row">
+                        <span class="row-label">旋转</span>
+                        <div class="row-inputs">
+                            <input type="number" id="rot-x" value="0.00" step="0.01">
+                            <input type="number" id="rot-y" value="0.00" step="0.01">
+                            <input type="number" id="rot-z" value="0.00" step="0.01">
+                        </div>
+                        <span class="row-unit">°</span>
+                        <button class="reset-btn" id="reset-rotation" title="还原旋转">
+                            <svg viewBox="0 0 24 24" width="14" height="14">
+                                <path fill="currentColor" d="M12 5V1L7 6l5 5V7c3.31 0 6 2.69 6 6s-2.69 6-6 6-6-2.69-6-6H4c0 4.42 3.58 8 8 8s8-3.58 8-8-3.58-8-8-8z"/>
+                            </svg>
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <div id="viewport-hint">
+                <div>左键拖拽: 旋转视角 | 中键拖拽: 平移视角 | 滚轮: 缩放</div>
+                <div>左键单击模型: 选中 | 选中后拖拽: 操作模型</div>
+            </div>
+
+            <!-- 纹理切片进度条 -->
+            <div id="slice-progress" class="hidden">
+                <div class="slice-progress-header">
+                    <span class="slice-progress-title">纹理切片中...</span>
+                </div>
+                <div class="slice-progress-row">
+                    <div class="slice-progress-bar-bg">
+                        <div class="slice-progress-bar-fill" id="slice-progress-fill"></div>
+                    </div>
+                    <button class="slice-progress-cancel" id="btn-cancel-slice" title="终止切片">
+                        <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+                            <rect x="3" y="3" width="10" height="10" rx="1.5" fill="currentColor"/>
+                        </svg>
+                    </button>
+                </div>
+                <div class="slice-progress-info">
+                    <span id="slice-progress-text">0 / 0 层</span>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 预览页面 -->
+    <div id="preview-page" class="hidden">
+        <div class="preview-split">
+            <div class="preview-right">
+                <div class="preview-header">切片图片预览</div>
+                <div id="slice-images-container" class="slice-images-container">
+                    <div class="slice-images-empty">尚无切片图片，请先进行纹理切片。</div>
+                </div>
+            </div>
+            <div class="preview-divider"></div>
+            <div class="preview-left">
+                <div class="preview-header">3D 轨迹预览<span class="print-status-text" id="print-status-text"></span></div>
+                <div id="gcode-3d-container" class="gcode-3d-container">
+                    <div id="gcode-drop-placeholder" class="gcode-drop-placeholder">
+                        <div class="gcode-drop-icon">&#9660;</div>
+                        <div class="gcode-drop-text">点击导入 .gcode 文件</div>
+                        <button class="btn-import-gcode" id="btn-import-gcode">导入 GCode</button>
+                    </div>
+                    <button class="btn-reload-gcode" id="btn-reload-gcode" title="重新加载"><span class="reload-icon">⟳</span><span class="reload-text">重新加载</span></button>
+                </div>
+                <div class="preview-footer">
+                    <div class="preview-slider-bar">
+                        <div class="layer-info-box" id="layer-info-box">
+                            <span class="layer-info-num" id="layer-info-num">0层</span>
+                            <span class="layer-info-z" id="layer-info-z">Z: 0.00 mm</span>
+                        </div>
+                        <input type="range" id="layer-slider" min="1" max="100" value="100" class="layer-slider-input">
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 平面打印页面 -->
+    <div id="flat-page" class="hidden">
+        <div class="flat-body">
+            <div class="flat-toolbar">
+                <span class="flat-toolbar-title">平面打印</span>
+                <div class="flat-z-group">
+                    <label class="flat-z-label" title="打印时喷嘴Z轴高度，用于在信封、衣物等厚物体上打印。本底 ~62mm（喷墨头抓取位置）">Z高度</label>
+                    <input type="number" id="flat-z-height" value="0" min="0" max="60" step="0.1" title="打印时喷嘴Z轴高度，用于在信封、衣物等厚物体上打印。本底 ~62mm（喷墨头抓取位置）">
+                    <span class="flat-z-unit">mm</span>
+                </div>
+                <div class="flat-toolbar-actions">
+                    <button class="flat-upload-btn" id="flat-upload-btn">
+                        <svg viewBox="0 0 24 24" width="16" height="16"><path fill="currentColor" d="M9 16h6v-6h4l-7-7-7 7h4zm-4 2h14v2H5z"/></svg>
+                        添加图片
+                    </button>
+                    <button class="flat-del-btn hidden" id="flat-del-btn">删除</button>
+                    <button class="flat-grid-btn" id="flat-grid-btn" title="显示/隐藏 10mm 网格参考线">
+                        <svg viewBox="0 0 24 24" width="14" height="14"><path fill="currentColor" d="M3 3v8h8V3H3zm6 6H5V5h4v4zm-6 4v8h8v-8H3zm6 6H5v-4h4v4zm4-16v8h8V3h-8zm6 6h-4V5h4v4zm-6 4v8h8v-8h-8zm6 6h-4v-4h4v4z"/></svg>
+                        网格参考
+                    </button>
+                </div>
+            </div>
+            <div class="flat-canvas-area">
+                <div class="flat-canvas-wrap" id="flat-canvas-wrap">
+                    <div class="flat-canvas-placeholder" id="flat-canvas-placeholder">
+                        <svg viewBox="0 0 24 24" width="64" height="64"><path fill="currentColor" d="M21 19V5c0-1.1-.9-2-2-2H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2zM8.5 13.5l2.5 3.01L14.5 12l4.5 6H5l3.5-4.5z"/></svg>
+                        <p>点击「添加图片」开始</p>
+                    </div>
+                    <canvas id="flat-canvas" style="display:none"></canvas>
+                    <div class="flat-size-card" id="flat-size-card">
+                        <span class="flat-size-label">W</span>
+                        <input type="number" id="flat-size-w" step="0.1" min="1">
+                        <span class="flat-size-label" id="flat-size-h-label">H</span>
+                        <input type="number" id="flat-size-h" step="0.1" min="1">
+                        <span class="flat-size-label">X</span>
+                        <input type="number" id="flat-pos-x" step="0.1" min="0" max="270">
+                        <span class="flat-size-label">Y</span>
+                        <input type="number" id="flat-pos-y" step="0.1" min="0" max="270">
+                        <span class="flat-size-unit">mm</span>
+                        <button class="flat-size-lock" id="flat-size-lock" title="锁定长宽比">
+                            <svg viewBox="0 0 24 24" width="12" height="12"><path fill="currentColor" d="M18 8h-1V6c0-2.76-2.24-5-5-5S7 3.24 7 6v2H6c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V10c0-1.1-.9-2-2-2zm-6 9c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2zm3.1-9H8.9V6c0-1.71 1.39-3.1 3.1-3.1s3.1 1.39 3.1 3.1v2z"/></svg>
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <input type="file" id="flat-image-input" accept="image/*" style="display:none">
+    </div>
+
+    <!-- 设备页面 -->
+    <div id="device-page" class="hidden">
+        <iframe id="device-iframe" class="device-iframe"></iframe>
+        <div class="device-placeholder" id="device-placeholder">
+            <svg viewBox="0 0 24 24" width="48" height="48"><path fill="currentColor" d="M22 9V7h-2V5c0-1.1-.9-2-2-2H4c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2v-2h2v-2h-2v-2h2v-2h-2V9h2zm-4 10H4V5h14v14z"/></svg>
+            <p>请在设置中配置打印机地址</p>
+        </div>
+    </div>
+
+    <!-- 配置页面 -->
+    <div id="calibrate-page" class="hidden">
+        <!-- 顶部配置栏 -->
+        <div class="calibrate-top-bar">
+            <div class="calibrate-top-left">
+                <label class="cal-top-label">喷墨配置</label>
+                <div class="custom-select cal-config-select" id="print-setting-select">
+                    <div class="select-trigger">
+                        <span class="select-value">MKP standard</span>
+                        <svg class="select-arrow" viewBox="0 0 24 24" width="14" height="14">
+                            <path fill="currentColor" d="M7 10l5 5 5-5z"/>
+                        </svg>
+                    </div>
+                    <div class="select-options hidden">
+                    </div>
+                </div>
+                <button class="cal-config-btn" id="btn-save-config" title="保存当前喷墨配置">
+                    <svg viewBox="0 0 24 24" width="14" height="14"><path fill="currentColor" d="M17 3H5c-1.11 0-2 .9-2 2v14c0 1.1.89 2 2 2h14c1.1 0 2-.9 2-2V7l-4-4zm-5 16c-1.66 0-3-1.34-3-3s1.34-3 3-3 3 1.34 3 3-1.34 3-3 3zm3-10H5V5h10v4z"/></svg>
+                    保存
+                </button>
+                <button class="cal-config-btn" id="btn-reset-config" title="还原当前配置">
+                    <svg viewBox="0 0 24 24" width="14" height="14"><path fill="currentColor" d="M12 5V1L7 6l5 5V7c3.31 0 6 2.69 6 6s-2.69 6-6 6-6-2.69-6-6H4c0 4.42 3.58 8 8 8s8-3.58 8-8-3.58-8-8-8z"/></svg>
+                    还原
+                </button>
+            </div>
+            <div class="calibrate-top-right">
+                <span class="cal-config-status" id="config-status"></span>
+            </div>
+        </div>
+
+        <div class="calibrate-body">
+            <!-- 左侧：手动方向键控制 -->
+            <div class="calibrate-left">
+                <div class="calibrate-container">
+                    <h2 class="calibrate-title">喷墨偏移值校准</h2>
+                    <div class="calibrate-layout">
+                        <div class="calibrate-dpad">
+                            <div class="dpad-row">
+                                <div class="dpad-spacer"></div>
+                                <button class="dpad-btn" id="cal-up" title="Y+">
+                                    <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M7.41 15.41L12 10.83l4.59 4.58L18 14l-6-6-6 6z"/></svg>
+                                </button>
+                                <div class="dpad-spacer"></div>
+                            </div>
+                            <div class="dpad-row">
+                                <button class="dpad-btn" id="cal-left" title="X-">
+                                    <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M15.41 7.41L14 6l-6 6 6 6 1.41-1.41L10.83 12z"/></svg>
+                                </button>
+                                <button class="dpad-btn dpad-home" id="cal-home" title="归零">
+                                    <svg viewBox="0 0 24 24" width="16" height="16"><path fill="currentColor" d="M10 20v-6h4v6h5v-8h3L12 3 2 12h3v8z"/></svg>
+                                </button>
+                                <button class="dpad-btn" id="cal-right" title="X+">
+                                    <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z"/></svg>
+                                </button>
+                            </div>
+                            <div class="dpad-row">
+                                <div class="dpad-spacer"></div>
+                                <button class="dpad-btn" id="cal-down" title="Y-">
+                                    <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M7.41 8.59L12 13.17l4.59-4.58L18 10l-6 6-6-6z"/></svg>
+                                </button>
+                                <div class="dpad-spacer"></div>
+                            </div>
+                        </div>
+                        <div class="calibrate-steps">
+                            <div class="step-grid">
+                                <button class="step-btn" data-step="0.02">0.02</button>
+                                <button class="step-btn" data-step="0.05">0.05</button>
+                                <button class="step-btn active" data-step="0.1">0.1</button>
+                                <button class="step-btn" data-step="0.2">0.2</button>
+                                <button class="step-btn" data-step="0.3">0.3</button>
+                                <button class="step-btn" data-step="0.4">0.4</button>
+                            </div>
+                            <div class="step-label">步进 (mm)</div>
+                        </div>
+                    </div>
+                    <div class="calibrate-info">
+                        <div class="calibrate-value">
+                            <span class="value-label">X 偏移</span>
+                            <input type="number" class="value-input" id="offset-x" value="0.00" step="0.01">
+                            <span class="value-unit">mm</span>
+                        </div>
+                        <div class="calibrate-value">
+                            <span class="value-label">Y 偏移</span>
+                            <input type="number" class="value-input" id="offset-y" value="0.00" step="0.01">
+                            <span class="value-unit">mm</span>
+                        </div>
+                    </div>
+                </div>
+                <div class="inkjet-macro-row">
+                    <div class="calibrate-container inkjet-container">
+                        <h2 class="calibrate-title">喷墨参数设置</h2>
+                        <div class="inkjet-params">
+                            <div class="inkjet-row">
+                                <label>打印浓度</label>
+                                <div class="inkjet-input-group">
+                                    <input type="range" min="0.1" max="1" step="0.1" value="0.5" id="inkjet-density">
+                                    <span class="inkjet-val" id="inkjet-density-val">0.5</span>
+                                </div>
+                            </div>
+                            <div class="inkjet-row">
+                                <label>打印速度</label>
+                                <div class="inkjet-input-group">
+                                    <input type="range" min="1" max="100" step="1" value="50" id="inkjet-speed">
+                                    <span class="inkjet-val" id="inkjet-speed-val">50</span>
+                                </div>
+                            </div>
+                            <div class="inkjet-row">
+                                <label>色调调节</label>
+                                <button class="cmy-trigger" id="btn-cmy-open">色调调节</button>
+                            </div>
+                            <div class="inkjet-row">
+                                <label>重复喷墨</label>
+                                <div class="custom-select inkjet-repeat-select" id="inkjet-repeat-select">
+                                    <div class="select-trigger">
+                                        <span class="select-value">1 次（正常）</span>
+                                        <svg class="select-arrow" viewBox="0 0 24 24" width="14" height="14">
+                                            <path fill="currentColor" d="M7 10l5 5 5-5z"/>
+                                        </svg>
+                                    </div>
+                                    <div class="select-options hidden">
+                                        <div class="select-option selected" data-value="1">1 次（正常）</div>
+                                        <div class="select-option" data-value="2">2 次（加倍）</div>
+                                        <div class="select-option" data-value="3">3 次（三重）</div>
+                                        <div class="select-option" data-value="4">4 次</div>
+                                        <div class="select-option" data-value="5">5 次</div>
+                                        <div class="select-option" data-value="6">6 次</div>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="inkjet-row" id="inkjet-dry-row" style="display:none;">
+                                <label>吹干等待</label>
+                                <div class="inkjet-input-group">
+                                    <input type="range" min="1" max="30" step="1" value="3" id="inkjet-dry-time">
+                                    <span class="inkjet-val" id="inkjet-dry-time-val">3</span>
+                                    <span style="font-size:12px;color:#888;margin-left:4px;">秒</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="macro-tower-wrapper">
+                        <div class="calibrate-container macro-container">
+                            <button class="macro-edit-btn" id="btn-macro-edit">取得放回宏修改</button>
+                        </div>
+                        <div class="calibrate-container shear-container">
+                            <h2 class="calibrate-title">平行四边形校准</h2>
+                            <div class="shear-body">
+                                <label>剪切补偿 (mm)</label>
+                                <div class="shear-input-wrapper">
+                                    <input type="number" min="-10" max="10" step="0.01" value="0" id="shear-mm">
+                                    <span class="shear-unit">mm</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <div class="calibrate-container postprocess-container">
+                    <h2 class="calibrate-title">后处理命令</h2>
+                    <div class="postprocess-body">
+                        <div class="postprocess-cmd" id="postprocess-cmd" title="点击复制后处理命令">加载中...</div>
+                        <button class="postprocess-copy-btn" id="btn-copy-postprocess">
+                            <svg viewBox="0 0 24 24" width="14" height="14"><path fill="currentColor" d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/></svg>
+                            <span>复制</span>
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 右侧：图片校准 -->
+            <div class="calibrate-right">
+                <div class="calibrate-image-panel">
+                    <div class="calibrate-image-toolbar">
+                        <button class="cal-img-btn" id="cal-load-img">加载图片</button>
+                        <button class="cal-img-btn" id="cal-apply-offset">确定</button>
+                        <div class="cal-separator"></div>
+                        <button class="cal-img-btn" id="cal-zoom-in" title="放大">
+                            <svg viewBox="0 0 24 24" width="16" height="16"><path fill="currentColor" d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/></svg>
+                        </button>
+                        <button class="cal-img-btn" id="cal-zoom-out" title="缩小">
+                            <svg viewBox="0 0 24 24" width="16" height="16"><path fill="currentColor" d="M19 13H5v-2h14v2z"/></svg>
+                        </button>
+                        <span class="cal-zoom-label" id="cal-zoom-label">100%</span>
+                        <button class="cal-img-btn" id="cal-zoom-reset" title="重置缩放">
+                            <svg viewBox="0 0 24 24" width="16" height="16"><path fill="currentColor" d="M12 5V1L7 6l5 5V7c3.31 0 6 2.69 6 6s-2.69 6-6 6-6-2.69-6-6H4c0 4.42 3.58 8 8 8s8-3.58 8-8-3.58-8-8-8z"/></svg>
+                        </button>
+                        <button class="cal-img-btn cal-help-btn" id="cal-help-btn" title="使用说明">
+                            <svg viewBox="0 0 24 24" width="16" height="16"><path fill="currentColor" d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/></svg>
+                            提示
+                        </button>
+                    </div>
+                    <div class="calibrate-viewport-wrap">
+                        <div class="calibrate-viewport" id="cal-viewport">
+                            <div class="cal-scene" id="cal-scene">
+                                <img id="cal-image" class="cal-image-hidden" alt="校准图片">
+                                <div class="cal-rect cal-rect-blue" id="cal-rect-blue">
+                                    <div class="cal-rect-handle cal-handle-nw"></div>
+                                    <div class="cal-rect-handle cal-handle-ne"></div>
+                                    <div class="cal-rect-handle cal-handle-sw"></div>
+                                    <div class="cal-rect-handle cal-handle-se"></div>
+                                    <div class="cal-rect-center-marker"></div>
+                                </div>
+                                <div class="cal-rect cal-rect-red" id="cal-rect-red">
+                                    <div class="cal-rect-handle cal-handle-nw"></div>
+                                    <div class="cal-rect-handle cal-handle-ne"></div>
+                                    <div class="cal-rect-handle cal-handle-sw"></div>
+                                    <div class="cal-rect-handle cal-handle-se"></div>
+                                    <div class="cal-rect-center-marker"></div>
+                                </div>
+                            </div>
+                            <div class="cal-placeholder" id="cal-placeholder">
+                                <svg viewBox="0 0 24 24" width="48" height="48"><path fill="currentColor" d="M21 19V5c0-1.1-.9-2-2-2H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2zM8.5 13.5l2.5 3.01L14.5 12l4.5 6H5l3.5-4.5z"/></svg>
+                                <p>点击「加载图片」上传校准图片</p>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="calibrate-image-controls">
+                        <button class="cal-draw-btn cal-draw-blue" id="btn-draw-blue">
+                            <span class="draw-indicator blue-indicator"></span>
+                            绘制校准卡范围
+                        </button>
+                        <button class="cal-draw-btn cal-draw-red" id="btn-draw-red">
+                            <span class="draw-indicator red-indicator"></span>
+                            绘制色块范围
+                        </button>
+                        <button class="cal-draw-btn cal-draw-clear" id="btn-clear-rects">
+                            <svg viewBox="0 0 24 24" width="14" height="14"><path fill="currentColor" d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg>
+                            清除
+                        </button>
+                    </div>
+                    <div class="calibrate-image-result" id="cal-result">
+                        <div class="cal-result-row">
+                            <span class="result-label">图片偏移</span>
+                            <span class="result-value" id="cal-img-offset-x">X: ---</span>
+                            <span class="result-value" id="cal-img-offset-y">Y: ---</span>
+                        </div>
+                        <div class="cal-result-status" id="cal-result-status">请绘制校准卡范围(蓝)和色块范围(红)</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <input type="file" id="cal-image-input" accept="image/*" style="display:none">
+    </div>
+
+    <!-- 自定义对话框 -->
+    <div id="cal-dialog-overlay" class="dialog-overlay hidden">
+        <div class="dialog-box">
+            <h3 class="dialog-title">新建配置</h3>
+            <p class="dialog-desc">请输入喷墨配置名称：</p>
+            <input type="text" id="cal-dialog-input" class="dialog-input" placeholder="例如：材料A 精细模式">
+            <div class="dialog-buttons">
+                <button class="dialog-btn dialog-cancel" id="cal-dialog-cancel">取消</button>
+                <button class="dialog-btn dialog-confirm" id="cal-dialog-confirm">确定</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 图片校准使用说明弹窗 -->
+    <div id="cal-help-overlay" class="dialog-overlay hidden">
+        <div class="dialog-box" style="max-width:480px; width:92%;">
+            <h3 class="dialog-title">图片校准使用说明</h3>
+            <div class="dialog-desc cal-help-desc">
+                <p>1. 点击「加载图片」上传校准卡照片。</p>
+                <p>2. 点击「绘制校准卡范围」，在图上框出校准卡区域（蓝色框）。</p>
+                <p>3. 点击「绘制色块范围」，框出色块位置（红色框）。</p>
+                <p>4. 点击「确定」，自动叠加并保存偏移。</p>
+                <p>5. 画错了：点击「清除」重新框选。</p>
+                <p>6. 缩放后图片变大，可按住鼠标右键拖拽平移图片。</p>
+            </div>
+            <div class="dialog-buttons">
+                <button class="dialog-btn dialog-confirm" id="cal-help-close">知道了</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 关闭到托盘确认弹窗 -->
+    <div id="tray-close-overlay" class="dialog-overlay hidden">
+        <div class="dialog-box" style="min-width:360px; text-align:center;">
+            <p class="dialog-desc" style="font-size:15px; line-height:1.8;">
+                打印任务正在进行中。关闭程序将终止当前打印，是否最小化到托盘继续后台运行？
+            </p>
+            <div class="dialog-buttons" style="justify-content:center; gap:12px;">
+                <button class="dialog-btn dialog-cancel" id="tray-close-exit">退出</button>
+                <button class="dialog-btn dialog-confirm" id="tray-close-minimize">最小化到托盘</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 平面打印进度浮层 -->
+    <div id="flat-progress-overlay" class="dialog-overlay hidden">
+        <div class="dialog-box" style="min-width:320px; text-align:center;">
+            <p class="dialog-title">平面打印中...</p>
+            <div class="flat-progress-track" style="margin:14px 0 8px;">
+                <div class="flat-progress-fill" id="flat-progress-fill"></div>
+            </div>
+            <p class="dialog-desc" id="flat-progress-text" style="margin:0;">正在准备...</p>
+        </div>
+    </div>
+
+    <!-- 右键菜单 -->
+    <div id="context-menu" class="hidden">
+        <div class="context-menu-item" data-action="clone">
+            <svg viewBox="0 0 24 24" width="16" height="16">
+                <path fill="currentColor" d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/>
+            </svg>
+            <span>克隆</span>
+        </div>
+        <div class="context-menu-item" data-action="delete">
+            <svg viewBox="0 0 24 24" width="16" height="16">
+                <path fill="currentColor" d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/>
+            </svg>
+            <span>删除</span>
+        </div>
+        <div class="context-menu-item" data-action="reload">
+            <svg viewBox="0 0 24 24" width="16" height="16">
+                <path fill="currentColor" d="M17.65 6.35C16.2 4.9 14.21 4 12 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08c-.82 2.33-3.04 4-5.65 4-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/>
+            </svg>
+            <span>从磁盘重新加载</span>
+        </div>
+        <div class="context-menu-separator ctx-group-sep hidden"></div>
+        <div class="context-menu-item hidden ctx-group-item" data-action="group" id="ctx-group">
+            <svg viewBox="0 0 24 24" width="16" height="16">
+                <rect x="3" y="3" width="8" height="8" rx="1" fill="currentColor" opacity="0.5"/>
+                <rect x="13" y="3" width="8" height="8" rx="1" fill="currentColor" opacity="0.5"/>
+                <rect x="3" y="13" width="8" height="8" rx="1" fill="currentColor" opacity="0.5"/>
+                <rect x="13" y="13" width="8" height="8" rx="1" fill="currentColor"/>
+                <path fill="currentColor" d="M17 13h-2v2h-2v2h2v2h2v-2h2v-2h-2z"/>
+            </svg>
+            <span>组合</span>
+        </div>
+        <div class="context-menu-item hidden ctx-ungroup-item" data-action="ungroup" id="ctx-ungroup">
+            <svg viewBox="0 0 24 24" width="16" height="16">
+                <rect x="3" y="3" width="8" height="8" rx="1" fill="none" stroke="currentColor" stroke-width="1.5"/>
+                <rect x="13" y="3" width="8" height="8" rx="1" fill="none" stroke="currentColor" stroke-width="1.5"/>
+                <rect x="3" y="13" width="8" height="8" rx="1" fill="none" stroke="currentColor" stroke-width="1.5"/>
+                <rect x="13" y="13" width="8" height="8" rx="1" fill="none" stroke="currentColor" stroke-width="1.5"/>
+            </svg>
+            <span>解组</span>
+        </div>
+        <div class="context-menu-separator"></div>
+        <div class="context-menu-item" data-action="toggle_printable">
+            <svg viewBox="0 0 24 24" width="16" height="16">
+                <path fill="currentColor" d="M19 8H5c-1.66 0-3 1.34-3 3v6h4v4h12v-4h4v-6c0-1.66-1.34-3-3-3zm-3 11H8v-5h8v5zm3-7c-.55 0-1-.45-1-1s.45-1 1-1 1 .45 1 1-.45 1-1 1zm-1-9H6v4h12V3z"/>
+            </svg>
+            <span id="ctx-toggle-printable">切换可打印</span>
+        </div>
+        <div class="context-menu-separator"></div>
+        <div class="context-menu-item has-submenu" data-action="export-model">
+            <svg viewBox="0 0 24 24" width="16" height="16">
+                <path fill="currentColor" d="M9 16h6v-6h4l-7-7-7 7h4zm-4 2h14v2H5z"/>
+            </svg>
+            <span>导出所选模型</span>
+            <svg class="submenu-arrow" viewBox="0 0 24 24" width="16" height="16">
+                <path fill="currentColor" d="M8.59 16.59L13.17 12 8.59 7.41 10 6l6 6-6 6-1.41-1.41z"/>
+            </svg>
+        </div>
+        <div class="context-menu-separator"></div>
+        <div class="context-menu-item has-submenu" data-action="mirror">
+            <svg viewBox="0 0 24 24" width="16" height="16">
+                <path fill="currentColor" d="M9 11H7v2h2v-2zm4 0h-2v2h2v-2zm4 0h-2v2h2v-2zm2-7h-1V2h-2v2H8V2H6v2H5c-1.11 0-1.99.9-1.99 2L3 20c0 1.1.89 2 2 2h14c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 16H5V9h14v11z"/>
+            </svg>
+            <span>镜像</span>
+            <svg class="submenu-arrow" viewBox="0 0 24 24" width="16" height="16">
+                <path fill="currentColor" d="M8.59 16.59L13.17 12 8.59 7.41 10 6l6 6-6 6-1.41-1.41z"/>
+            </svg>
+        </div>
+    </div>
+
+    <!-- 导出所选模型 子菜单 -->
+    <div id="export-model-submenu" class="hidden">
+        <div class="context-menu-item export-model-default" data-action="export-glb">
+            <svg viewBox="0 0 24 24" width="16" height="16">
+                <path fill="currentColor" d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/>
+            </svg>
+            <span>导出为 GLB</span>
+            <span class="export-default-badge">默认</span>
+        </div>
+        <div class="context-menu-item" data-action="export-obj">
+            <svg viewBox="0 0 24 24" width="16" height="16">
+                <path fill="currentColor" d="M14 2H6c-1.1 0-1.99.9-1.99 2L4 20c0 1.1.89 2 1.99 2H18c1.1 0 2-.9 2-2V8l-6-6zm2 16H8v-5h8v5zm-3-7V3.5L18.5 9H13z"/>
+            </svg>
+            <span>导出为 OBJ + MTL + 贴图</span>
+        </div>
+    </div>
+
+    <!-- 镜像子菜单 -->
+    <div id="mirror-submenu" class="hidden">
+        <div class="context-menu-item" data-action="mirror-x">
+            <span class="axis-indicator axis-x">X</span>
+            <span>沿 X 轴镜像</span>
+        </div>
+        <div class="context-menu-item" data-action="mirror-y">
+            <span class="axis-indicator axis-y">Y</span>
+            <span>沿 Y 轴镜像</span>
+        </div>
+        <div class="context-menu-item" data-action="mirror-z">
+            <span class="axis-indicator axis-z">Z</span>
+            <span>沿 Z 轴镜像</span>
+        </div>
+    </div>
+
+    <input type="file" id="model-input" accept=".stl,.obj,.gltf,.glb,.fbx,.3mf" style="display: none;">
+    <input type="file" id="model-folder-input" webkitdirectory directory multiple style="display: none;">
+    <input type="file" id="mtl-input" accept=".mtl" style="display: none;">
+    <input type="file" id="project-input" accept=".mkp" style="display: none;">
+
+    <!-- 拖拽提示 -->
+    <div id="drop-overlay" class="hidden">
+        <div class="drop-overlay-content">
+            <svg viewBox="0 0 24 24" width="48" height="48"><path fill="currentColor" d="M14 2H6c-1.1 0-1.99.9-1.99 2L4 20c0 1.1.89 2 1.99 2H18c1.1 0 2-.9 2-2V8l-6-6zm-3.06 16L7.4 14.46l1.41-1.41 2.12 2.12 4.24-4.24 1.41 1.41L10.94 18zM13 9V3.5L18.5 9H13z"/></svg>
+            <p>松开以导入文件</p>
+        </div>
+    </div>
+
+    <!-- 文件菜单 -->
+    <div id="file-menu" class="hidden">
+        <div class="menu-item" data-action="new-project">
+            <svg viewBox="0 0 24 24" width="16" height="16">
+                <path fill="currentColor" d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/>
+            </svg>
+            <span>新建项目</span>
+        </div>
+        <div class="menu-item" data-action="open-project">
+            <svg viewBox="0 0 24 24" width="16" height="16">
+                <path fill="currentColor" d="M20 6h-8l-2-2H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2zm0 12H4V8h16v10z"/>
+            </svg>
+            <span>打开项目</span>
+        </div>
+        <div class="menu-item" data-action="save-project">
+            <svg viewBox="0 0 24 24" width="16" height="16">
+                <path fill="currentColor" d="M17 3H5c-1.11 0-2 .9-2 2v14c0 1.1.89 2 2 2h14c1.1 0 2-.9 2-2V7l-4-4zm-5 16c-1.66 0-3-1.34-3-3s1.34-3 3-3 3 1.34 3 3-1.34 3-3 3zm3-10H5V5h10v4z"/>
+            </svg>
+            <span>保存项目</span>
+        </div>
+        <div class="menu-item" data-action="save-project-as">
+            <svg viewBox="0 0 24 24" width="16" height="16">
+                <path fill="currentColor" d="M19 3H5c-1.11 0-2 .9-2 2v14c0 1.1.89 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm-5 16c-1.66 0-3-1.34-3-3s1.34-3 3-3 3 1.34 3 3-1.34 3-3 3zm3-10H5V5h10v4z"/>
+            </svg>
+            <span>项目另存为</span>
+        </div>
+        <div class="menu-separator"></div>
+        <div class="menu-item" data-action="import-file">
+            <svg viewBox="0 0 24 24" width="16" height="16">
+                <path fill="currentColor" d="M9 16h6v-6h4l-7-7-7 7h4zm-4 2h14v2H5z"/>
+            </svg>
+            <span>导入文件</span>
+        </div>
+        <div class="menu-item" data-action="export-file">
+            <svg viewBox="0 0 24 24" width="16" height="16">
+                <path fill="currentColor" d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/>
+            </svg>
+            <span>导出文件</span>
+        </div>
+    </div>
+
+    <!-- 设置对话框 -->
+    <div id="settings-dialog" class="dialog hidden">
+        <div class="dialog-content">
+            <div class="dialog-header">
+                <h3>设置</h3>
+                <button class="dialog-close" id="settings-close">
+                    <svg viewBox="0 0 24 24" width="20" height="20">
+                        <path fill="currentColor" d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/>
+                    </svg>
+                </button>
+            </div>
+            <div class="dialog-body">
+                <div class="settings-section">
+                    <h4>历史记录</h4>
+                    <div class="setting-item">
+                        <label>最大记录次数</label>
+                        <input type="number" id="max-history-setting" value="20" min="1" max="100">
+                    </div>
+                </div>
+
+                <div class="settings-section">
+                    <h4>显示设置</h4>
+                    <div class="setting-item checkbox">
+                        <input type="checkbox" id="show-grid-setting" checked>
+                        <label for="show-grid-setting">显示网格</label>
+                    </div>
+                    <div class="setting-item">
+                        <label>网格配色</label>
+                        <div class="custom-select settings-select" id="grid-theme-select">
+                            <div class="select-trigger">
+                                <span class="select-value">深色</span>
+                                <svg class="select-arrow" viewBox="0 0 24 24" width="14" height="14">
+                                    <path fill="currentColor" d="M7 10l5 5 5-5z"/>
+                                </svg>
+                            </div>
+                            <div class="select-options hidden">
+                                <div class="select-option selected" data-value="dark">深色</div>
+                                <div class="select-option" data-value="light">浅色</div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="setting-item">
+                        <label>相机视图</label>
+                        <div class="custom-select settings-select" id="camera-mode-select">
+                            <div class="select-trigger">
+                                <span class="select-value">透视视图</span>
+                                <svg class="select-arrow" viewBox="0 0 24 24" width="14" height="14">
+                                    <path fill="currentColor" d="M7 10l5 5 5-5z"/>
+                                </svg>
+                            </div>
+                            <div class="select-options hidden">
+                                <div class="select-option" data-value="orthographic">正交视图</div>
+                                <div class="select-option selected" data-value="perspective">透视视图</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="settings-section">
+                    <h4>文件关联</h4>
+                    <div class="setting-item">
+                        <label>注册 .MKP 文件关联</label>
+                        <button class="btn-primary" id="btn-register-mkp" style="padding:6px 14px;font-size:12px;">注册</button>
+                    </div>
+                </div>
+
+                <div class="settings-section">
+                    <h4>Gcode 切片器</h4>
+                    <div class="setting-item">
+                        <label>切片器类型</label>
+                        <div class="custom-select settings-select" id="gcode-slicer-select">
+                            <div class="select-trigger">
+                                <span class="select-value">Snapmaker Orca</span>
+                                <svg class="select-arrow" viewBox="0 0 24 24" width="14" height="14">
+                                    <path fill="currentColor" d="M7 10l5 5 5-5z"/>
+                                </svg>
+                            </div>
+                            <div class="select-options hidden">
+                                <div class="select-option" data-value="orcaslicer">OrcaSlicer</div>
+                                <div class="select-option selected" data-value="snapmaker_orca">Snapmaker Orca</div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="setting-item">
+                        <label>可执行文件路径</label>
+                        <div class="orcaslicer-path-row">
+                            <input type="text" id="orcaslicer-path" readonly placeholder="未设置，点击右侧按钮选择">
+                            <button class="btn-primary" id="btn-select-orcaslicer" style="padding:6px 14px;font-size:12px;white-space:nowrap;">浏览</button>
+                            <button class="btn-secondary" id="btn-detect-orcaslicer" style="padding:6px 14px;font-size:12px;white-space:nowrap;">自动检测</button>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="settings-section">
+                    <h4>纹理切片</h4>
+                    <div class="setting-item">
+                        <label>输出图片分辨率</label>
+                        <input type="number" id="texture-resolution" value="2000" min="512" max="8000" step="512">
+                    </div>
+                </div>
+            </div>
+            <div class="dialog-footer">
+                <button class="btn-secondary" id="settings-cancel">取消</button>
+                <button class="btn-primary" id="settings-apply">应用</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 关于对话框 -->
+    <div id="about-dialog" class="dialog hidden">
+        <div class="dialog-content about-dialog-content">
+            <div class="dialog-header">
+                <h3>关于 MKPSpectrum</h3>
+                <button class="dialog-close" id="about-close">
+                    <svg viewBox="0 0 24 24" width="20" height="20">
+                        <path fill="currentColor" d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/>
+                    </svg>
+                </button>
+            </div>
+            <div class="dialog-body about-body">
+                <p>MKPSpectrum — 喷墨全彩 3D 打印控制中心</p>
+                <p>本项目没有任何自产硬件，未对墨盒或其他任何产品进行破解，所有操作均通过合规方式调用市售产品及现有开源项目实现。</p>
+                <p>软硬件中由 MKP 团队完成的部分（具体范围将在 repo 中明确列出），我们将按照 Unlicense 协议开源，供任何人自由的参考、分发与修改，并以任意方式使用。其他部分请您遵循对应项目的开源协议。再次感谢上述的开源开发团队。</p>
+                <p>本项目按"现状"提供，不作任何明示或暗示的保证，包括但不限于适销性、特定用途适用性及不侵权的保证。使用本项目所产生的任何直接或间接损失（包括但不限于设备损坏、数据丢失、商业损失、第三方索赔等），项目贡献者不承担任何责任。</p>
+                <p class="about-signature">— MKP 团队</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- 打印机设置对话框 -->
+    <div id="printer-dialog" class="dialog hidden">
+        <div class="dialog-content">
+            <div class="dialog-header">
+                <h3>打印机设置</h3>
+                <button class="dialog-close" id="printer-close">
+                    <svg viewBox="0 0 24 24" width="20" height="20">
+                        <path fill="currentColor" d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/>
+                    </svg>
+                </button>
+            </div>
+            <div class="dialog-body">
+                <div class="settings-section">
+                    <h4>热床尺寸</h4>
+                    <div class="setting-item">
+                        <label>X (mm)</label>
+                        <input type="number" id="printer-bed-x" value="270" min="50" max="1000">
+                    </div>
+                    <div class="setting-item">
+                        <label>Y (mm)</label>
+                        <input type="number" id="printer-bed-y" value="270" min="50" max="1000">
+                    </div>
+                    <div class="setting-item">
+                        <label>Z (mm)</label>
+                        <input type="number" id="printer-bed-z" value="270" min="50" max="1000">
+                    </div>
+                </div>
+                <div class="settings-section">
+                    <h4>网络连接</h4>
+                    <div class="setting-item network-item">
+                        <label>打印机地址</label>
+                        <div class="network-input-row">
+                            <input type="text" id="printer-address" placeholder="例如: 192.168.1.100">
+                            <button class="test-btn" id="test-printer-btn">测试</button>
+                            <button class="test-btn plugin-install-btn" id="install-plugin-btn" disabled>安装插件</button>
+                            <span class="test-status" id="printer-status"></span>
+                        </div>
+                    </div>
+                    <div class="setting-item network-item">
+                        <label>喷墨打印头地址</label>
+                        <div class="network-input-row">
+                            <input type="text" id="head-address" placeholder="例如: 192.168.1.101">
+                            <button class="test-btn" id="test-head-btn">测试</button>
+                            <span class="test-status" id="head-status"></span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="dialog-footer">
+                <button class="btn-secondary" id="printer-cancel">取消</button>
+                <button class="btn-primary" id="printer-save">保存</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 克隆对话框 -->
+    <div id="clone-dialog" class="dialog hidden">
+        <div class="dialog-content dialog-small">
+            <div class="dialog-header">
+                <h3>克隆模型</h3>
+                <button class="dialog-close" id="clone-close">
+                    <svg viewBox="0 0 24 24" width="20" height="20">
+                        <path fill="currentColor" d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/>
+                    </svg>
+                </button>
+            </div>
+            <div class="dialog-body">
+                <div class="clone-input-row">
+                    <label for="clone-count">克隆数量：</label>
+                    <input type="number" id="clone-count" value="1" min="1" max="100">
+                </div>
+                <div class="checkbox-field" style="margin-top:10px;">
+                    <input type="checkbox" id="clone-arrange" checked>
+                    <label for="clone-arrange">克隆后自动排列</label>
+                </div>
+            </div>
+            <div class="dialog-footer">
+                <button class="btn-secondary" id="clone-cancel">取消</button>
+                <button class="btn-primary" id="clone-confirm">确定</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 色调调节对话框 -->
+    <div id="cmy-dialog" class="dialog hidden">
+        <div class="dialog-content" style="width:420px;">
+            <div class="dialog-header">
+                <h3>色调调节</h3>
+                <button class="dialog-close" id="cmy-close">
+                    <svg viewBox="0 0 24 24" width="20" height="20">
+                        <path fill="currentColor" d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/>
+                    </svg>
+                </button>
+            </div>
+            <div class="dialog-body">
+                <div class="cmy-sliders">
+                    <div class="cmy-item">
+                        <span class="cmy-label cmy-c">C</span>
+                        <span class="cmy-desc">青色出墨</span>
+                        <input type="range" min="0" max="3" step="0.01" value="1" id="cmy-c">
+                        <span class="cmy-val" id="cmy-c-val">1.00</span>
+                        <button class="cmy-reset" data-target="cmy-c" data-default="1" title="复位">↺</button>
+                    </div>
+                    <div class="cmy-item">
+                        <span class="cmy-label cmy-m">M</span>
+                        <span class="cmy-desc">洋红出墨</span>
+                        <input type="range" min="0" max="3" step="0.01" value="1" id="cmy-m">
+                        <span class="cmy-val" id="cmy-m-val">1.00</span>
+                        <button class="cmy-reset" data-target="cmy-m" data-default="1" title="复位">↺</button>
+                    </div>
+                    <div class="cmy-item">
+                        <span class="cmy-label cmy-y">Y</span>
+                        <span class="cmy-desc">黄色出墨</span>
+                        <input type="range" min="0" max="3" step="0.01" value="1" id="cmy-y">
+                        <span class="cmy-val" id="cmy-y-val">1.00</span>
+                        <button class="cmy-reset" data-target="cmy-y" data-default="1" title="复位">↺</button>
+                    </div>
+                    <div class="cmy-divider"></div>
+                    <div class="cmy-item">
+                        <span class="cmy-label cmy-sat">S</span>
+                        <span class="cmy-desc">鲜艳度</span>
+                        <input type="range" min="-1" max="1" step="0.01" value="0" id="cmy-saturation">
+                        <span class="cmy-val" id="cmy-saturation-val">0.00</span>
+                        <button class="cmy-reset" data-target="cmy-saturation" data-default="0" title="复位">↺</button>
+                    </div>
+                    <div class="cmy-item">
+                        <span class="cmy-label cmy-bri">B</span>
+                        <span class="cmy-desc">明亮度</span>
+                        <input type="range" min="-1" max="1" step="0.01" value="0" id="cmy-brightness">
+                        <span class="cmy-val" id="cmy-brightness-val">0.00</span>
+                        <button class="cmy-reset" data-target="cmy-brightness" data-default="0" title="复位">↺</button>
+                    </div>
+                    <div class="cmy-divider"></div>
+                    <div class="cmy-item">
+                        <span class="cmy-label cmy-ctr">K</span>
+                        <span class="cmy-desc">对比度</span>
+                        <input type="range" min="0.5" max="2.0" step="0.1" value="1.0" id="inkjet-contrast">
+                        <span class="cmy-val" id="inkjet-contrast-val">1.0</span>
+                        <button class="cmy-reset" data-target="inkjet-contrast" data-default="1.0" title="复位">↺</button>
+                    </div>
+                </div>
+            </div>
+            <div class="dialog-footer">
+                <button class="btn-primary" id="cmy-done">完成</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 全局 JS 错误捕获：把前端异常上报到 Python stdout，便于定位 -->
+    <script>
+        (function () {
+            function _report(fn, msg, where) {
+                try {
+                    if (window.pywebview && window.pywebview.api && window.pywebview.api.report_js_error) {
+                        window.pywebview.api.report_js_error('[' + fn + '] ' + msg + (where ? ' @' + where : ''));
+                    }
+                } catch (eAl) {}
+            }
+            window.addEventListener('error', function (ev) {
+                _report('onerror', (ev.error ? (ev.error.stack || ev.error.message) : (ev.message || 'unknown')), ev.filename + ':' + ev.lineno);
+            });
+            window.addEventListener('unhandledrejection', function (ev) {
+                var r = ev.reason;
+                var msg = (r && r.stack) ? r.stack : (r && r.message ? r.message : String(r));
+                _report('rejection', msg, '');
+            });
+        })();
+    </script>
+
+    <script type="module" src="app.js"></script>
+</body>
+</html>

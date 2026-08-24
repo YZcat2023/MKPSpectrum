@@ -410,6 +410,19 @@ class MaterialCreator {
 
 					break;
 
+				case 'mkp_flipy':
+
+					// MKPSpectrum extension: preserve Three.js texture.flipY
+					// when baked OBJ/MTL assets are saved into and reloaded from .MKP.
+					if ( params.map ) {
+
+						params.map.flipY = ! ( value === '0' || value === 'false' || value === 'no' );
+						params.map.needsUpdate = true;
+
+					}
+
+					break;
+
 				case 'map_ks':
 
 					// Specular map
