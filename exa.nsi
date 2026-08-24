@@ -7,7 +7,7 @@ SetCompressor /SOLID lzma
 SetCompressorDictSize 64
 
 !define PRODUCT_NAME "MKPSpectrum"
-!define PRODUCT_VERSION "0.1"
+!define PRODUCT_VERSION "1.0"
 !define PRODUCT_PUBLISHER "MKPSupport Team"
 !define PRODUCT_WEB_SITE "https://gitee.com/Jhmodel/mkpspectrum"
 !define PRODUCT_EXE "MKPSpectrum.exe"

@@ -498,6 +498,8 @@ def plan_tower(config):
                 plan.height,
                 y_shift=0.0,
                 fillet_wall=plan.use_fillet,
+                layer_height=plan.layer_height,
+                first_layer_height=plan.first_layer_height,
             )
             if rib_poly:
                 min_x = min(p[0] for p in rib_poly)

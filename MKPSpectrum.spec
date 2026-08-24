@@ -57,13 +57,11 @@ extra_datas = [
     # 图标：MKPSpectrum.ico（程序窗口/EXE）+ MKPProgram.ico（.mkp 项目文件）
     (ico_path, '.'),
     (mkp_ico_path, '.'),
-    # MBC WASM PNG→MBD 转换管线（对齐 mbrush_tools/png2mbd.py）
-    ('mbrush_tools/mbc/mbc-head-node.js', 'mbc'),
-    ('mbrush_tools/mbc/mbc-head-persistent.js', 'mbc'),
-    ('mbrush_tools/mbc/mbc.js', 'mbc'),
-    ('mbrush_tools/mbc/mbc.wasm', 'mbc'),
-    # Node.js 独立版（PNG→MBD 转换必须依赖）
-    ('node_portable/node.exe', 'node_portable'),
+    # Pure Python MBD encoder calibration data
+    ('mbrush_tools/mbd_calibration/white.mbd', 'mbd_calibration'),
+    ('mbrush_tools/mbd_calibration/cyan_pair_y_map.json', 'mbd_calibration'),
+    ('mbrush_tools/mbd_calibration/magenta_pair_y_map.json', 'mbd_calibration'),
+    ('mbrush_tools/mbd_calibration/yellow_pair_y_map.json', 'mbd_calibration'),
     # Klipper 插件（可通过 GUI 一键安装到打印机）
     ('gcode_shell_command.py', '.'),
     # 校准模型
@@ -88,10 +86,12 @@ a = Analysis(
         'webview.platforms.winforms',
         'slice_standalone',
         'strip_processor',
+        'mbrush_tools.mbd_clone_runtime',
         'GCodeGenerator',
         '_tower_plan',
         '_tower_writer',
         '_tower_templates',
+        'shapely',
         'clr',
         'PIL',
         'PIL.Image',

@@ -29,7 +29,7 @@ from _tower_plan import (
     WIDTH_TO_NOZZLE_RATIO,
 )
 from _tower_writer import (
-    generate_toolchange_wipe, generate_finish_layer_wall,
+    generate_toolchange_wipe, generate_no_toolchange_cross, generate_finish_layer_wall,
     generate_finish_layer_infill,
 )
 
@@ -2876,9 +2876,12 @@ def process_gcode(gcode_path, inkjet_path=None, output_path=None, params=None, e
 
                     # CP TOOLCHANGE WIPE 擦拭线（Orca toolchange_Wipe，参数化生成，保留）
                     depth_consumed = 0.0
-                    if layer_ld and layer_ld.tool_changes:
+                    real_toolchanges = ([ev for ev in layer_ld.tool_changes
+                                         if ev.old_tool != ev.new_tool]
+                                        if layer_ld else [])
+                    if real_toolchanges:
                         is_first = layer_ld.is_first
-                        for ev in layer_ld.tool_changes:
+                        for ev in real_toolchanges:
                             wipe_lines, used = generate_toolchange_wipe(
                                 tower_plan, ev, {}, is_first, fill_box=False, depth_consumed=depth_consumed)
                             depth_consumed += used
@@ -2891,6 +2894,13 @@ def process_gcode(gcode_path, inkjet_path=None, output_path=None, params=None, e
                     else:
                         depth_consumed = 0.0
                         is_first = (layer_ld.is_first if layer_ld else (tower_layer_count == 1))
+                        clean_lines = generate_no_toolchange_cross(tower_plan, is_first)
+                        if clean_lines:
+                            output_lines.append('G92 E0')
+                            output_lines.extend(_transform_tower_lines(
+                                clean_lines, center_tx, center_ty, rotation,
+                                local_offset=tower_local_offset))
+                            has_any_content = True
 
                     # 稀疏/实心填充（CP EMPTY GRID，若 tower_writer 未提供则波浪模板 EMPTY_GRID 兜底由外墙段承载）
                     try:

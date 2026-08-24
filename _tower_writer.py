@@ -15,6 +15,12 @@ F 值统一 mm/s -> mm/min (×60)，抽取成单点常量以规避免单位 bug�
 
 import math
 
+try:
+    from shapely.geometry import Polygon, LineString
+except ImportError:
+    Polygon = None
+    LineString = None
+
 MMS2MMIN = 60.0
 EPSILON = 1e-3
 WT_EPSILON = 1e-3
@@ -365,26 +371,25 @@ def rounding_polygon(width, depth, rounding=2.0, arc_fit_size=20):
 
 
 def offset_polygon_away_from_center(poly, distance):
-    """Lightweight outward offset for tower brim loops.
+    """Offset a closed polygon by a constant normal distance.
 
-    Orca uses Clipper offset. Here we keep a dependency-free approximation:
-    move each vertex away from the polygon centroid by ``distance``. For the
-    rib wall's rounded footprint this produces continuous brim loops without
-    creating the detached unload line that bit us earlier.
+    Orca uses Clipper's polygon offset here. Shapely's buffer operation has
+    the same geometric meaning and, unlike radial vertex scaling, preserves
+    uniform brim spacing around both convex and concave parts of the rib wall.
     """
     if not poly or abs(distance) < 1e-9:
         return list(poly or [])
-    cx = sum(p[0] for p in poly) / len(poly)
-    cy = sum(p[1] for p in poly) / len(poly)
-    out = []
-    for x, y in poly:
-        vx, vy = x - cx, y - cy
-        ln = math.hypot(vx, vy)
-        if ln < 1e-9:
-            out.append((x, y))
-        else:
-            out.append((x + distance * vx / ln, y + distance * vy / ln))
-    return out
+    if Polygon is None:
+        raise RuntimeError('生成等距擦嘴塔 brim 需要 shapely')
+    shape = Polygon(poly)
+    if not shape.is_valid:
+        shape = shape.buffer(0)
+    expanded = shape.buffer(float(distance), quad_segs=8, join_style='round')
+    if expanded.is_empty:
+        return []
+    if expanded.geom_type == 'MultiPolygon':
+        expanded = max(expanded.geoms, key=lambda geom: geom.area)
+    return [(float(x), float(y)) for x, y in list(expanded.exterior.coords)[:-1]]
 
 
 def rib_section(width, depth, rib_length, rib_width, fillet_wall=True):
@@ -448,7 +453,9 @@ def rib_section(width, depth, rib_length, rib_width, fillet_wall=True):
     return res
 
 
-def generate_rib_polygon(wt_box, rib_length, rib_width, cur_z, total_height, y_shift=0.0, fillet_wall=True):
+def generate_rib_polygon(wt_box, rib_length, rib_width, cur_z, total_height,
+                         y_shift=0.0, fillet_wall=True, layer_height=None,
+                         first_layer_height=None, shrink_t=None):
     """WipeTower2::generate_rib_polygon 移植（mm 域简化）。
 
     wt_box: Box(0,0,width,height) 局部矩形；
@@ -463,9 +470,20 @@ def generate_rib_polygon(wt_box, rib_length, rib_width, cur_z, total_height, y_s
     diag = math.hypot(width, depth)
     # 随高度递减的外伸（官方 get_current_layer_rib_len）
     def _cur_len(cur_h, max_h, max_len):
-        if max_h <= 1e-9:
-            return max_len
-        return abs(max_h - cur_h) / max_h * max_len
+        # Distribute rib shrink uniformly from the first layer to the
+        # penultimate layer. The final layer keeps the penultimate footprint.
+        if shrink_t is not None:
+            return (1.0 - max(0.0, min(1.0, float(shrink_t)))) * max_len
+        layer_h = float(layer_height or 0.0)
+        first_z = float(first_layer_height or layer_h)
+        # total_height is last-layer Z plus one layer height, so the
+        # penultimate layer is total_height - 2 * layer_height.
+        shrink_end = max(first_z, float(max_h) - 2.0 * layer_h)
+        span = shrink_end - first_z
+        if span <= 1e-9:
+            return 0.0 if cur_h >= shrink_end else max_len
+        t = max(0.0, min(1.0, (float(cur_h) - first_z) / span))
+        return (1.0 - t) * max_len
     diagonal_extra = max(0.0, float(rib_length) - diag) / 2.0
     # 按当前层高度缩放外伸
     diagonal_extra = _cur_len(cur_z, total_height, diagonal_extra)
@@ -478,7 +496,7 @@ def generate_rib_polygon(wt_box, rib_length, rib_width, cur_z, total_height, y_s
     return poly
 
 
-def generate_support_rib_wall(plan, wt_box, feedrate, first_layer, rib_wall=True, extrude_perimeter=True):
+def generate_support_rib_wall(plan, wt_box, feedrate, first_layer, rib_wall=True, extrude_perimeter=True, current_z=None):
     """WipeTower2::generate_support_rib_wall 移植（mm 域，writer-less 版）。
 
     返回 (wall_polygon: [(x,y)], wall_polyline: [(x,y)] 闭合)。
@@ -489,18 +507,28 @@ def generate_support_rib_wall(plan, wt_box, feedrate, first_layer, rib_wall=True
     rib_width = getattr(plan, 'rib_width', 8.0)
     rib_length = getattr(plan, 'rib_length', 0.0) or 0.0
     total_h = getattr(plan, 'height', 10.0) or 10.0
-    # 当前层 Z（从 plan.layers 推断 closest）
-    cur_z = 0.0
-    if getattr(plan, 'layers', None):
-        # 取首层或按 first_layer 选
+    # 当前层 Z 必须由调用方传入；Orca 按当前层高度逐层收短 rib。
+    cur_z = float(current_z) if current_z is not None else 0.0
+    if current_z is None and getattr(plan, 'layers', None):
         try:
             cur_z = plan.layers[0].z if first_layer else plan.layers[-1].z
         except Exception:
             cur_z = 0.0
     y_shift = getattr(plan, 'y_shift', 0.0) or 0.0
+    shrink_t = None
+    if current_z is not None and getattr(plan, 'layers', None):
+        rows = plan.layers
+        idx = min(range(len(rows)), key=lambda i: abs(float(rows[i].z) - cur_z))
+        penultimate = max(0, len(rows) - 2)
+        shrink_t = min(1.0, idx / penultimate) if penultimate else 1.0
     use_fillet = getattr(plan, 'use_fillet', False)
     if rib_wall:
-        wall_polygon = generate_rib_polygon(wt_box, rib_length, rib_width, cur_z, total_h, y_shift=y_shift, fillet_wall=use_fillet)
+        wall_polygon = generate_rib_polygon(
+            wt_box, rib_length, rib_width, cur_z, total_h,
+            y_shift=y_shift, fillet_wall=use_fillet,
+            layer_height=getattr(plan, 'layer_height', None),
+            first_layer_height=getattr(plan, 'first_layer_height', None),
+            shrink_t=shrink_t)
         # 官方 fillet 后还会与底矩形做 union，这里 rib_section 已含底矩形，额外并集仅为
         # fillet 收缩时补回矩形边，mm 域下用简单并集近似：若 fillet 导致外轮廓内缩，补回矩形四角
         if use_fillet:
@@ -549,6 +577,37 @@ def generate_finish_layer_infill(plan, layer_depth, is_first_layer, toolchange_d
     fill_box = Box(perimeter, toolchange_depth_consumed + perimeter,
                    plan.cleaning_width(), plan.depth - toolchange_depth_consumed - 2 * perimeter)
 
+    # The rectangular cleaning box is only the nominal purge area. On rib
+    # layers its usable boundary is the current, Z-dependent rib footprint.
+    # Clip bridge lines to that footprint so their ends do not pierce the wall.
+    usable_rib = None
+    if bool(getattr(plan, 'use_rib_wall', False)) and layer_depth is not None:
+        try:
+            wall_poly = generate_support_rib_wall(
+                plan, Box(0.0, 0.0, plan.tower_width, plan.depth + perimeter),
+                feedrate, is_first_layer, rib_wall=True,
+                extrude_perimeter=False, current_z=layer_depth.z)
+            if Polygon is not None and len(wall_poly) >= 3:
+                usable_rib = Polygon(wall_poly).buffer(-0.5 * perimeter)
+                if usable_rib.is_empty:
+                    usable_rib = None
+        except Exception:
+            usable_rib = None
+
+    def _vertical_span(x, y_low, y_high):
+        if usable_rib is None or LineString is None:
+            return y_low, y_high
+        hit = usable_rib.intersection(LineString([(x, y_low), (x, y_high)]))
+        pieces = []
+        geoms = getattr(hit, 'geoms', (hit,))
+        for geom in geoms:
+            if getattr(geom, 'geom_type', '') == 'LineString' and len(geom.coords) >= 2:
+                ys = [float(pt[1]) for pt in geom.coords]
+                pieces.append((min(ys), max(ys)))
+        if not pieces:
+            return None
+        return max(pieces, key=lambda span: span[1] - span[0])
+
     w.append_line(';--------------------')
     w.append_line('; CP EMPTY GRID START')
     w.append_line(';WIDTH:{}'.format(_fmt(perimeter)))
@@ -570,29 +629,63 @@ def generate_finish_layer_infill(plan, layer_depth, is_first_layer, toolchange_d
     if dy > perimeter:
         w.set_wipe_feedrate(feedrate)
         if is_first_layer:
-            # 首层实心（sparse_factor=1，线紧邻并触碰外圈）
+            # 首层实心：每条线独立空驶到起点，保证严格平行且不产生斜向挤出连接。
             left = fill_box.lu[0] - perimeter
             right = fill_box.ru[0] + perimeter
-            w.emit_xy(fill_box.lu[0] - perimeter, fill_box.ld[1], travel=True)
             y = fill_box.ld[1] + perimeter
             n = max(1, int(dy / perimeter))
             spacing_y = (dy - perimeter) / (n - 1) if n > 1 else 0.0
             for i in range(n):
-                w.extrude(left if (i % 2 == 0) else right, y)
+                x_start = left if (i % 2 == 0) else right
+                x_end = right if (i % 2 == 0) else left
+                w.travel(x_start, y)
+                w.extrude(x_end, y)
                 y += spacing_y
-            w.extrude(w.x, fill_box.lu[1])
         else:
             w.emit_xy(fill_box.ld[0] + 2 * perimeter, fill_box.ld[1], travel=True)
             n = 1 + int((right - left) / BRIDGING)
             dx = (right - left) / n if n > 0 else 0.0
             for i in range(1, n + 1):
                 x = left + dx * i
-                y = fill_box.rd[1] if (i % 2) else fill_box.ru[1]
+                span = _vertical_span(x, fill_box.rd[1], fill_box.ru[1])
+                if span is None:
+                    continue
+                low, high = span
+                y = high if (i % 2) else low
                 w.emit_xy(x, w.y, travel=True)
                 w.extrude(x, y)
 
     w.append_line('; CP EMPTY GRID END')
     w.append_line(';------------------')
+    return w.collect()
+
+
+def generate_no_toolchange_cross(plan, is_first_layer):
+    """Print a centered cross to catch ooze after inkjet on no-change layers."""
+    w = WipeTowerWriter(plan)
+    perimeter = plan.perimeter_width
+    lh = plan.first_layer_height if is_first_layer else plan.layer_height
+    w.set_extrusion_flow(line_extrusion_flow(perimeter, lh, plan.extra_flow))
+    w.set_wipe_feedrate(plan.first_layer_speed if is_first_layer else
+                        min(plan.max_purge_speed, plan.infill_speed))
+
+    margin = 2.0 * perimeter
+    x0 = margin
+    x1 = plan.tower_width - margin
+    y0 = margin
+    y1 = plan.depth - margin
+    if x1 <= x0 or y1 <= y0:
+        return []
+    cx = (x0 + x1) / 2.0
+    cy = (y0 + y1) / 2.0
+
+    w.append_line('; CP NO-TOOLCHANGE NOZZLE CLEAN')
+    w.append_line(';WIDTH:{}'.format(_fmt(perimeter)))
+    w.travel(x0, cy)
+    w.extrude(x1, cy)
+    w.travel(cx, y0)
+    w.extrude(cx, y1)
+    w.append_line('; CP NO-TOOLCHANGE NOZZLE CLEAN END')
     return w.collect()
 
 
@@ -620,7 +713,10 @@ def generate_finish_layer_wall(plan, layer_depth, is_first_layer):
     wall_polygon = []
     if use_rib:
         # 官方斜肋外墙（WipeTower::rib_section + rounding_polygon）
-        wall_polygon, polyline = generate_support_rib_wall(plan, wt_box, feedrate, is_first_layer, rib_wall=True, extrude_perimeter=True)
+        current_z = (getattr(layer_depth, 'z', None) if layer_depth is not None else None)
+        wall_polygon, polyline = generate_support_rib_wall(
+            plan, wt_box, feedrate, is_first_layer,
+            rib_wall=True, extrude_perimeter=True, current_z=current_z)
         if polyline:
             w.travel(polyline[0][0], polyline[0][1])
             for (cx, cy) in polyline[1:]:
@@ -657,7 +753,7 @@ def generate_finish_layer_wall(plan, layer_depth, is_first_layer):
 
 
 def _append_first_layer_brim(w, plan, wall_polygon, layer_height):
-    """Append Orca-style first-layer brim loops around the tower footprint."""
+    """Append a compact first-layer brim around the rib-supported footprint."""
     if not wall_polygon:
         return
     brim_width = float(getattr(plan, 'brim_width', 0.0) or 0.0)
@@ -667,14 +763,16 @@ def _append_first_layer_brim(w, plan, wall_polygon, layer_height):
     spacing = plan.perimeter_width - layer_height * (1.0 - M_PI / 4.0)
     if brim_width <= 0 or spacing <= 1e-6:
         return
-    loops_num = int((brim_width + spacing / 2.0) / spacing)
+    # The configured value is the actual brim width, as in Orca. Do not
+    # subtract the rib extension: the brim must retain all configured loops.
+    loops_num = max(1, int((brim_width + spacing / 2.0) / spacing))
     if loops_num <= 0:
         return
     w.append_line('; WIPE_TOWER_BRIM_LOOPS')
     w.append_line(';WIDTH:{}'.format(_fmt(plan.perimeter_width)))
-    poly = list(wall_polygon)
-    for _ in range(loops_num):
-        poly = offset_polygon_away_from_center(poly, spacing)
+    base_poly = list(wall_polygon)
+    for loop_index in range(loops_num):
+        poly = offset_polygon_away_from_center(base_poly, spacing * (loop_index + 1))
         if len(poly) < 2:
             continue
         # Start near the current point, just like Orca uses closest_point_index.

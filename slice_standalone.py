@@ -1156,7 +1156,7 @@ _strip_motion_params = None
 
 
 def _process_single_strip(args):
-    """在 worker 进程中处理单层条带切割 + MBD 转换。"""
+    """在 worker 进程中拆分单层，MBD 块留给后续全局进程池。"""
     import numpy as np
     from PIL import Image
     from strip_processor import process_layer_from_array
@@ -1172,8 +1172,27 @@ def _process_single_strip(args):
         output_zip_dir=_strip_temp_dir,
         motion_params=_strip_motion_params,
         block_output_dir=layer_mbd_dir,
+        defer_mbd=True,
     )
     return layer_name, r
+
+
+def _process_single_mbd(task):
+    """编码一个块；任务足够细，可由全局进程池动态均衡。"""
+    import os as _os
+    import numpy as np
+    from strip_processor import _block_arr_to_mbd
+    source_path, mbd_path, density = task
+    try:
+        arr = np.load(source_path, allow_pickle=False)
+        if not _block_arr_to_mbd(arr, mbd_path, density):
+            raise RuntimeError(f"MBD 编码失败: {mbd_path}")
+        return mbd_path
+    finally:
+        try:
+            _os.remove(source_path)
+        except OSError:
+            pass
 
 
 class SliceCancelledError(RuntimeError):
@@ -1493,12 +1512,14 @@ def run_slice(obj_path, output_dir, layer_height=0.2, resolution=4000,
     else:
         # 流水线：切片与条带/MBD 重叠执行，strip 紧跟切片完成即提交，避免全量堆积
         total_cores = multiprocessing.cpu_count() or 4
-        # 产线配比：切片与条带共享 CPU，留 1 核给 GUI；切片偏重可略多
-        # MBD 转换本身会启动 Node/WASM 计算，条带进程不能按剩余 CPU
-        # 无限扩张，否则每个进程内部的 MBD 线程会造成严重过度并发。
-        # 保留少量切片并行，同时把条带/MBD 侧限制在最多 2 个进程。
-        slice_workers = max(1, min(total_cores - 1, len(layer_args), max(2, (total_cores * 2) // 3)))
-        strip_workers = max(1, min(2, total_cores - slice_workers))
+        # 两个池合计使用逻辑核心数减一。条带阶段只拆块，不再执行 MBD，
+        # 因此可与切片池共同铺满 CPU，而不会叠加内部编码并发。
+        available_workers = max(2, total_cores - 1)
+        requested_slice_workers = int(os.environ.get(
+            'MKPSPECTRUM_SLICE_PROCESSES', str(max(1, available_workers * 2 // 3))
+        ))
+        slice_workers = max(1, min(requested_slice_workers, available_workers - 1, len(layer_args)))
+        strip_workers = max(1, available_workers - slice_workers)
         max_pending_strip = max(8, strip_workers * 3)
         _log(f"流水线模式: 切片 {slice_workers} 产线 + 条带 {strip_workers} 产线，背压阈值 {max_pending_strip} 层，首启需导入模块请稍候...")
         _progress(0, num_layers)
@@ -1616,13 +1637,21 @@ def run_slice(obj_path, output_dir, layer_height=0.2, resolution=4000,
         gcode_lines_all = [r['gcode_lines'] for r in strip_results]
         _log(f"\nStrip done: {len(strip_results)} layers, {total_blocks} blocks")
 
-        # MBD 转换已在条带切割中完成（每层 worker 处理后自动关闭其 MBD 进程）
-        try:
-            from strip_processor import shutdown_mbd_procs
-            shutdown_mbd_procs()
-            _log("MBD 常驻进程已关闭")
-        except Exception:
-            pass
+        # 所有层的块进入同一个动态队列，避免复杂层绑死在单个条带进程。
+        mbd_tasks = [task for r in strip_results for task in r.pop('mbd_tasks', [])]
+        if mbd_tasks:
+            requested_mbd_workers = int(os.environ.get(
+                'MKPSPECTRUM_MBD_PROCESSES', str(max(1, (multiprocessing.cpu_count() or 4) - 1))
+            ))
+            mbd_workers = max(1, min(requested_mbd_workers, (multiprocessing.cpu_count() or 4) - 1, len(mbd_tasks)))
+            _log(f"MBD 全局队列: {len(mbd_tasks)} 块，{mbd_workers} 个编码进程")
+            completed_mbd = 0
+            with multiprocessing.Pool(processes=mbd_workers) as mbd_pool:
+                for _ in mbd_pool.imap_unordered(_process_single_mbd, mbd_tasks, chunksize=1):
+                    completed_mbd += 1
+                    if completed_mbd % 20 == 0 or completed_mbd == len(mbd_tasks):
+                        _log(f"  MBD {completed_mbd}/{len(mbd_tasks)}")
+                    _check_cancel_or_raise("MBD 编码已取消")
 
         # 打包 _temp.zip（若 zip_dir 指定则放在那里，否则放 output_dir）
         _zip_target = zip_dir if zip_dir else output_dir
@@ -1630,6 +1659,8 @@ def run_slice(obj_path, output_dir, layer_height=0.2, resolution=4000,
         with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
             for root, dirs, files in os.walk(strip_temp_dir):
                 for fn in files:
+                    if not fn.lower().endswith('.mbd'):
+                        continue
                     fp = os.path.join(root, fn)
                     arcname = os.path.relpath(fp, strip_temp_dir)
                     zf.write(fp, arcname)

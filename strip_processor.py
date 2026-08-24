@@ -18,6 +18,8 @@ import concurrent.futures as _cf
 import io as _io
 from PIL import Image
 import numpy as np
+from mbrush_tools.mbd_clone_runtime import encode as _encode_mbd_native
+
 
 # ============================================================
 # 物理常量
@@ -431,6 +433,29 @@ _mbd_procs_lock = threading.Lock()     # 保护 _mbd_all_procs
 _mbd_atexit_done = False               # 只注册一次 atexit
 
 
+def _get_mbd_worker_limit(task_count):
+    """返回本次 MBD 转换使用的并发数。
+
+    默认对小块任务稍微激进一点，但保留环境变量兜底：
+    MKPSPECTRUM_MBD_WORKERS=1/2/4/...
+    """
+    if task_count <= 0:
+        return 0
+
+    env_value = os.getenv("MKPSPECTRUM_MBD_WORKERS", "").strip()
+    if env_value:
+        try:
+            env_limit = int(env_value)
+            if env_limit > 0:
+                return min(task_count, env_limit)
+        except ValueError:
+            pass
+
+    default_limit = 1
+
+    return min(task_count, default_limit)
+
+
 def _start_one_mbd_proc():
     """启动一个常驻 MBD 转换进程。返回 (proc, work_dir) 或 (None, None)。"""
     node = _find_node()
@@ -623,7 +648,7 @@ def _convert_png_to_mbd(png_path,
 def _process_layer_core(full_arr, img_w, img_h, layer_name, bed_size_mm,
                          output_zip_dir,
                          motion_params=None, model_regions=None,
-                         block_output_dir=None):
+                         block_output_dir=None, defer_mbd=False):
     """核心：对内存中的图层数组执行条带切割、渐变、找块、timing、G-code。
     注意：不再写出 PNG 块 / MBD / timing.json，仅返回 GCode 行。
 
@@ -691,7 +716,7 @@ def _process_layer_core(full_arr, img_w, img_h, layer_name, bed_size_mm,
     alpha_grad = _build_alpha_gradient(std_strip_h, transition_px)
     _t_layer0 = _time.perf_counter()
     _t_strip_acc = 0.0
-    _mbd_tasks = []  # [(block_arr, mbd_path), ...] 收集后并行转换
+    _mbd_tasks = []  # 即时模式: (array, path); 延迟模式: (npy_path, path, density)
 
     # ---- 按条带处理 ----
     for s in range(strip_count):
@@ -763,7 +788,14 @@ def _process_layer_core(full_arr, img_w, img_h, layer_name, bed_size_mm,
                         block_arr = np.concatenate([white_pad, core_arr], axis=1)
                     else:
                         block_arr = strip_arr[:, x_start_px:x_end_px, :].copy()
-                    _mbd_tasks.append((block_arr, mbd_path))
+                    if defer_mbd:
+                        source_path = os.path.join(
+                            block_output_dir, f".{block_counter - 1:05d}.mbd-source.npy"
+                        )
+                        np.save(source_path, block_arr, allow_pickle=False)
+                        _mbd_tasks.append((source_path, mbd_path, inkjet_density))
+                    else:
+                        _mbd_tasks.append((block_arr, mbd_path))
 
             # 块在热床上的位置（mm）
             x_mm = _px_to_mm(x_start_px, scale)
@@ -780,23 +812,14 @@ def _process_layer_core(full_arr, img_w, img_h, layer_name, bed_size_mm,
                 'strip': s,
             })
 
-    # ---- 并行 MBD 转换（块级线程池，复用常驻 Node 进程池）----
+    # ---- MBD 转换（纯 Python/NumPy 编码，无 Node/JS/WASM）----
     _t_mbd = 0.0
-    if _mbd_tasks:
+    if _mbd_tasks and not defer_mbd:
         _t_mbd0 = _time.perf_counter()
-        # 预热：确保当前进程的 MBD 常驻可用，避免首块冷启动计入并行失真
-        try:
-            _get_thread_mbd_proc()
-        except Exception:
-            pass
-        # 每个条带 worker 都有自己的线程池和 Node/WASM 进程。这里不能
-        # 使用整机 CPU 数，否则多个条带 worker 会把转换任务成倍放大，
-        # CPU 虽然满载但会因调度和内存竞争变慢。
-        _max_mbd_workers = min(len(_mbd_tasks), 2)
+        _max_mbd_workers = _get_mbd_worker_limit(len(_mbd_tasks))
         def _mbd_one(task):
             arr_, path_ = task
             return _block_arr_to_mbd(arr_, path_, inkjet_density)
-        # 使用线程池提交，保证跨块并发走不同 Node 进程（threading.local 隔离）
         with _cf.ThreadPoolExecutor(max_workers=_max_mbd_workers) as _mbd_pool:
             list(_mbd_pool.map(_mbd_one, _mbd_tasks))
         _t_mbd = _time.perf_counter() - _t_mbd0
@@ -874,6 +897,7 @@ def _process_layer_core(full_arr, img_w, img_h, layer_name, bed_size_mm,
         'strip_count': strip_count,
         'total_blocks': len(all_blocks),
         'gcode_lines': gcode_lines,
+        'mbd_tasks': _mbd_tasks if defer_mbd else [],
     }
 
 
@@ -982,8 +1006,7 @@ def generate_blocks_for_layer(image_path, output_dir, motion_params=None):
 
 
 def _block_arr_to_mbd(arr, mbd_path, density):
-    """将 uint8 RGBA numpy 数组直接转为 MBD（内存编码 + 进程池，不写临时文件）。
-    进程池不可用时回退到 legacy 单次 Node 子进程。"""
+    """将 uint8 RGBA 数组用纯 Python/NumPy 编码为 MBD。"""
     try:
         # 将 alpha 通道烘焙到 RGB（整数运算，避免 float32；与白色背景混合）
         a16 = arr[:, :, 3:4].astype(np.uint16)  # 0..255
@@ -996,61 +1019,19 @@ def _block_arr_to_mbd(arr, mbd_path, density):
         # 热路径：块多为窄条，LANCZOS 过重，BILINEAR 快 3~5 倍且视觉差异可忽略
         img = img.resize((new_w, new_h), Image.BILINEAR)
 
-        buf = _io.BytesIO()
-        img.save(buf, format='PNG')
-        png_bytes = buf.getvalue()
-
-        density_n = max(100 - density, 1)
-        params = {
-            'brightness': '100',
-            'saturation': '100',
-            'density_n': str(density_n),
-            'invert': 0, 'c_order': 0, 'c_width': 0, 'dpi_step': 2,
-        }
-        params_json = json.dumps(params).encode('utf-8')
-
-        # 尝试线程专属常驻进程
-        try:
-            proc = _get_thread_mbd_proc()
-
-            frame = struct.pack('<I', len(png_bytes)) + png_bytes + params_json
-            proc.stdin.write(struct.pack('<I', len(frame)) + frame)
-            proc.stdin.flush()
-
-            header = proc.stdout.read(5)
-            if len(header) < 5:
-                raise RuntimeError("常驻 MBD 进程意外断开")
-            status = header[0]
-            data_len = struct.unpack('<I', header[1:5])[0]
-            data = proc.stdout.read(data_len)
-
-            if status == 0:
-                with open(mbd_path, 'wb') as f:
-                    f.write(data)
-                return True
-            else:
-                err_msg = data.decode('utf-8', errors='replace')
-                raise RuntimeError(err_msg)
-
-        except Exception as e:
-            print(f"[MBD] 块转换失败 ({os.path.basename(mbd_path)}): {e}", file=sys.stderr)
-            _invalidate_thread_mbd_proc()  # 废弃坏进程，下次自动重建
-
-        # 回退：写临时 PNG → legacy 单次 Node 子进程
-        try:
-            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tf:
-                img.save(tf, format='PNG')
-                tmp_png = tf.name
-            if _convert_png_to_mbd_legacy(tmp_png, density=density):
-                tmp_mbd = tmp_png.replace('.png', '.mbd')
-                if os.path.exists(tmp_mbd):
-                    os.replace(tmp_mbd, mbd_path)
-                os.unlink(tmp_png)
-                return True
-            else:
-                os.unlink(tmp_png)
-        except Exception as e:
-            print(f"[MBD-legacy] 块转换失败 ({os.path.basename(mbd_path)}): {e}", file=sys.stderr)
+        resource_root = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+        calibration_dir = os.path.join(resource_root, 'mbd_calibration')
+        if not os.path.isdir(calibration_dir):
+            calibration_dir = os.path.join(resource_root, 'mbrush_tools', 'mbd_calibration')
+        data = _encode_mbd_native(
+            img,
+            calibration_dir,
+            os.path.join(calibration_dir, 'white.mbd'),
+            density=density,
+        )
+        with open(mbd_path, 'wb') as f:
+            f.write(data)
+        return True
 
     except Exception as e:
         print(f"[MBD-block] 转换失败 ({mbd_path}): {e}", file=sys.stderr)
@@ -1089,7 +1070,7 @@ def process_layer(image_path, output_zip_dir,
 def process_layer_from_array(arr, layer_name, img_size, bed_size_mm,
                               output_zip_dir,
                               motion_params=None, model_regions=None,
-                              block_output_dir=None):
+                              block_output_dir=None, defer_mbd=False):
     """处理内存中的图层数组（跳过 PNG 文件读写）。
 
     arr:          (img_size, img_size, 4) uint8 或 float32 RGBA numpy 数组
@@ -1110,6 +1091,7 @@ def process_layer_from_array(arr, layer_name, img_size, bed_size_mm,
         motion_params=motion_params,
         model_regions=model_regions,
         block_output_dir=block_output_dir,
+        defer_mbd=defer_mbd,
     )
 
 

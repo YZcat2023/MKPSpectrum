@@ -3666,7 +3666,7 @@ class ModelAPI:
                         shutil.rmtree(d, ignore_errors=True)
                     os.makedirs(d, exist_ok=True)
 
-                mbd_workers = max(4, multiprocessing.cpu_count())
+                mbd_workers = min(4, max(1, multiprocessing.cpu_count() or 1))
                 print(f"[texture_generate_strips] MBD 转换线程数: {mbd_workers}")
                 mbd_total = 0
                 mbd_futures = {}
