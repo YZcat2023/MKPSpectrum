@@ -29,7 +29,6 @@ MKPSpectrum includes a desktop application shell, frontend interface, slicing pi
 | Texture slicing | Reads model textures and converts colored surfaces into layer-by-layer inkjet images |
 | Strip processing | Splits images into printable strips and blocks according to the effective inkjet width |
 | GCode post-processing | Merges inkjet actions, printhead pickup/release actions, and base printer paths |
-| Device communication | Communicates with the printer control interface and inkjet printhead |
 
 ## Hardware Components
 
