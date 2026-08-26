@@ -133,3 +133,141 @@ MKPSpectrum 使用 MKP 项目文件保存任务数据。项目文件通常包含
 ## 开源说明
 
 MKPSpectrum 中由项目团队完成的部分计划按开放协议发布，供研究、学习、改造和再分发使用。项目中引用或配套使用的第三方软件、工具链和硬件产品，应遵循其各自许可证和使用条款。
+
+---
+
+# MKPSpectrum English README
+
+MKPSpectrum is an integrated software and hardware project for inkjet-based full-color 3D printing. It uses the Snapmaker U1 or other open-source Klipper-compatible 3D printers as the motion platform, combines them with a detachable portable CMYK inkjet printhead, and connects FDM printing, surface color printing, flat 2D printing, slicing preview, device control, and calibration into one workflow.
+
+The goal of the project is to give ordinary desktop FDM printers a practical path toward vivid and saturated full-color output. The FDM printer builds the object layer by layer, while the inkjet printhead prints color patterns on selected layers, object surfaces, or flat materials. MKPSpectrum links the model, texture, inkjet data, printer GCode, and hardware actions into a coordinated printing process.
+
+## Key Features
+
+- Import, place, rotate, move, scale, and automatically arrange 3D models.
+- Process textured 3D models and convert surface colors into printable inkjet data.
+- Support flat 2D inkjet printing on envelopes, cards, sheets, and other flat materials.
+- Preview GCode toolpaths and sliced color images before printing.
+- Calibrate inkjet offset, print speed, ink density, repeated printing, and parallelogram distortion.
+- Work with Klipper, Moonraker, and Fluidd-based printer workflows for uploading, starting, and monitoring print jobs.
+- Save MKP project files containing models, placement, textures, slicing data, and print settings.
+
+## Software Components
+
+MKPSpectrum includes a desktop application shell, frontend interface, slicing pipeline, GCode post-processing tools, and device communication modules.
+
+| Component | Role |
+| --- | --- |
+| Desktop application | Starts the local app window and provides file, slicing, and device communication interfaces |
+| Frontend interface | Provides the home, prepare, preview, flat printing, device, and calibration pages |
+| Texture slicing | Reads model textures and converts colored surfaces into layer-by-layer inkjet images |
+| Strip processing | Splits images into printable strips and blocks according to the effective inkjet width |
+| GCode post-processing | Merges inkjet actions, printhead pickup/release actions, and base printer paths |
+| Device communication | Communicates with the printer control interface and inkjet printhead |
+
+## Hardware Components
+
+The hardware system is built around a 3D printer, a portable inkjet printhead, a mounting or pickup mechanism, and printer control connections.
+
+| Hardware | Role |
+| --- | --- |
+| 3D printer | Provides three-axis motion and FDM structural printing |
+| Portable CMYK inkjet printhead | Prints color patterns on object surfaces or flat materials |
+| Pickup and release mechanism | Allows the printer toolhead to acquire and return the inkjet printhead when needed |
+| Inkjet mounting bracket | Fixes the printhead position and aligns the inkjet area with printer motion |
+| Ink-receptive printing material | Carries ink color and affects color saturation, adhesion, and bleeding |
+| Printer control system | Executes GCode, controls motion, and provides network access |
+
+In a typical print, the FDM nozzle forms the structure and the inkjet printhead applies color. MKPSpectrum uses GCode macros to control printhead pickup, printing, and release, and uses offset calibration to align printed color with the model geometry.
+
+## Workflow
+
+1. Import a model on the Prepare page and adjust its position, rotation, and size.
+2. Read the model texture or flat image and generate image data suitable for inkjet printing.
+3. Split the generated image into strips based on the effective printhead width and skip blank areas.
+4. Convert image strips into the data format used by the inkjet printhead.
+5. Insert inkjet actions into the base GCode so the printer can print color at selected positions.
+6. During printing, the machine performs FDM deposition, printhead pickup, inkjet output, and printhead release.
+
+## Main Pages
+
+### Home
+
+The Home page is used to create a new project, open an MKP project file, and access recently opened projects.
+
+### Prepare
+
+The Prepare page is used to import 3D models, adjust placement, rotate and scale objects, arrange models automatically, and choose whether each model participates in printing.
+
+### Preview
+
+The Preview page shows sliced images and 3D GCode paths. Users can check layer images, motion paths, and inkjet positions before starting a print.
+
+### Flat Printing
+
+The Flat page is used for 2D image printing. Users can upload one or more images, adjust position, size, angle, and Z height, then generate and send a flat printing task.
+
+### Device
+
+The Device page is used to view the printer control interface and device status. After the printer address is configured, the printer page can be monitored directly inside MKPSpectrum.
+
+### Calibration
+
+The Calibration page manages inkjet settings such as offset, density, speed, repeated printing, and parallelogram correction. Image-based calibration can also use a photo of a calibration card to help calculate offset values.
+
+## Typical Use Cases
+
+### Full-Color 3D Model Printing
+
+1. Create or open a project.
+2. Import a model on the Prepare page.
+3. Adjust position, rotation, scale, and printability.
+4. Confirm printer address, inkjet printhead address, and inkjet configuration.
+5. Run texture slicing and wait for slicing and post-processing to finish.
+6. Check sliced images and 3D paths on the Preview page.
+7. Send the print job after confirming the preview.
+
+### Flat Image Printing
+
+1. Open the Flat page.
+2. Upload an image.
+3. Adjust image position, size, and angle.
+4. Set Z height according to the material thickness.
+5. Generate and start the print task.
+6. Wait for strip processing, upload, and print startup to complete.
+
+## Calibration Suggestions
+
+- Complete X/Y inkjet offset calibration before first use.
+- Recalibrate after replacing the printhead, bracket, material, or build surface.
+- If the pattern is skewed or edges are misaligned, check parallelogram calibration first.
+- If color is too light or too dark, adjust ink density, print speed, and repeated printing.
+- Before flat printing, confirm material height to avoid blurry output or printhead collision.
+
+## Material Guidance
+
+The project proposes a modified PLA filament designed to absorb and retain ink for vivid and saturated color output. If other filaments are used, an ink-receptive coating may be needed to improve adhesion, reduce bleeding, and keep the printed color stable. For flat printing, use materials with a flat surface, stable ink absorption, and low deformation.
+
+## Project Files
+
+MKPSpectrum uses MKP project files to save task data. A project file can include models, placement, texture information, slicing results, and related configuration, making it easier to continue editing or reprint a previous task.
+
+## Application Areas
+
+- Full-color 3D model printing experiments.
+- Inkjet expansion for desktop 3D printers.
+- Surface patterns, labels, and texture output for printed models.
+- Inkjet printing on envelopes, cards, sheets, and other flat materials.
+- Research on coordinated control between multi-tool printers and external inkjet printheads.
+
+## Notes
+
+- Confirm the printer motion range, printhead mounting position, and inkjet offset before use.
+- Always inspect the GCode preview before printing to avoid paths outside the build plate or collisions with brackets.
+- Fix flat materials securely before printing to prevent movement during the job.
+- Keep the inkjet nozzle clean and store the printhead according to its maintenance requirements when not in use.
+- MKPSpectrum does not manufacture inkjet printheads, cartridges, or printer hardware. The hardware system is based on commercial devices and custom integration parts.
+
+## Open-Source Notice
+
+Project-developed parts of MKPSpectrum are planned for release under an open license for research, learning, modification, and redistribution. Third-party software, toolchains, and hardware products used with the project remain subject to their own licenses and terms.
