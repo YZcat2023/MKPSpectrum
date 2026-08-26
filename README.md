@@ -1,5 +1,9 @@
 # MKPSpectrum
 
+
+https://github.com/user-attachments/assets/4098b29d-1f43-411e-a300-9b0f80b3839a
+
+
 MKPSpectrum is an integrated software and hardware project for inkjet-based full-color 3D printing. It uses the Snapmaker U1 or other open-source Klipper-compatible 3D printers as the motion platform, combines them with a detachable portable CMYK inkjet printhead, and connects FDM printing, surface color printing, flat 2D printing, slicing preview, device control, and calibration into one workflow.
 
 The goal of the project is to give ordinary desktop FDM printers a practical path toward vivid and saturated full-color output. The FDM printer builds the object layer by layer, while the inkjet printhead prints color patterns on selected layers, object surfaces, or flat materials. MKPSpectrum links the model, texture, inkjet data, printer GCode, and hardware actions into a coordinated printing process.
