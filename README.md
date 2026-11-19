@@ -4,11 +4,18 @@
 
 # MKPSpectrum
 
-MKPSpectrum 是基于 **OrcaSlicer 2.5.0** 定制的全彩 FDM 打印软件，面向 **Snapmaker U1 + mBrush 喷墨模组**。切片内核、参数体系和三维预览沿用 Orca 的既有实现，定制集中在三处：顶部新增的五个专用页面、工艺设置中的「喷墨」参数组、打印机设置中的五组工具头偏移。
+MKPSpectrum 是基于 **OrcaSlicer 2.5.0** 定制的全彩 FDM 打印软件，面向**喷墨彩色打印**这一整类场景：切片内核、参数体系和三维预览沿用 Orca 的既有实现，定制集中在喷墨控制、专用作业页面与多工具头偏移。当前适配 **Snapmaker U1 + mBrush 喷墨模组**；后续将换用自研 PCB 喷墨控制板，并把支持扩展到 Bambu Lab A1、A1 mini、P1 等主流机型。
 
 - 当前版本：**v2.6.2**（[发行版](https://github.com/YZcat2023/MKPSpectrum/releases/tag/v2.6.2)）
 - 上游基线：OrcaSlicer v2.5.0（commit `40ecc66f`）
 - 旧 Python 版源码保留在 [`legacy-python`](https://github.com/YZcat2023/MKPSpectrum/tree/legacy-python) 分支
+
+## 兼容性与路线图
+
+- **当前适配**：Snapmaker U1，含 mBrush 喷墨模组与笔刷 / 绘图笔 / 拖刀 / 激光五类工具头
+- **硬件演进**：自研喷墨控制 PCB 替代 mBrush 模组，沿用同一套喷墨参数、校准流程与作业页面
+- **机型扩展**：Bambu Lab A1、A1 mini、P1 系列等主流 FDM 机型，按机型补齐预设、可打印区域与工具头偏移
+- **不变的目标**：喷墨上色、平面喷墨与扩展工具共用同一套切片、预览与发送流程
 
 ## 一台机器能做的五类作业
 
