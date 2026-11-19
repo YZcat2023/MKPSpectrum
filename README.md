@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/readme/banner-wordmark.png" width="560" alt="MKPSpectrum">
+  <img src="docs/readme/logo-mkpspectrum.png" width="420" alt="MKPSpectrum">
 </p>
 
 # MKPSpectrum
