@@ -2,7 +2,7 @@
   <img src="docs/readme/banner-wordmark.png" width="560" alt="MKPSpectrum">
 </p>
 
-# MKPSpectrum（Orca 魔改版）
+# MKPSpectrum
 
 MKPSpectrum 是基于 **OrcaSlicer 2.5.0** 定制的全彩 FDM 打印软件，面向 **Snapmaker U1 + mBrush 喷墨模组**。切片内核、参数体系和三维预览沿用 Orca 的既有实现，定制集中在三处：顶部新增的五个专用页面、工艺设置中的「喷墨」参数组、打印机设置中的五组工具头偏移。
 
