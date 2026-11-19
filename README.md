@@ -1,253 +1,110 @@
-<div align="center">
+<p align="center">
+  <img src="docs/readme/banner-wordmark.png" width="560" alt="MKPSpectrum">
+</p>
 
-<picture>
-  <img alt="OrcaSlicer logo" src="resources/images/OrcaSlicer.png" width="15%" height="15%">
-</picture>
+# MKPSpectrum（Orca 魔改版）
 
-<a href="https://trendshift.io/repositories/15552" target="_blank"><img src="https://trendshift.io/api/badge/repositories/15552" alt="OrcaSlicer%2FOrcaSlicer | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
+MKPSpectrum 是基于 **OrcaSlicer 2.5.0** 定制的全彩 FDM 打印软件，面向 **Snapmaker U1 + mBrush 喷墨模组**。切片内核、参数体系和三维预览沿用 Orca 的既有实现，定制集中在三处：顶部新增的五个专用页面、工艺设置中的「喷墨」参数组、打印机设置中的五组工具头偏移。
 
-[![GitHub Repo stars](https://img.shields.io/github/stars/OrcaSlicer/OrcaSlicer)](https://github.com/OrcaSlicer/OrcaSlicer/stargazers) [![Build all](https://img.shields.io/github/actions/workflow/status/OrcaSlicer/OrcaSlicer/main_build_status.yml?label=Build%20all)](https://github.com/OrcaSlicer/OrcaSlicer/actions/workflows/build_all.yml)
+- 当前版本：**v2.6.2**（[发行版](https://github.com/YZcat2023/MKPSpectrum/releases/tag/v2.6.2)）
+- 上游基线：OrcaSlicer v2.5.0（commit `40ecc66f`）
+- 旧 Python 版源码保留在 [`legacy-python`](https://github.com/YZcat2023/MKPSpectrum/tree/legacy-python) 分支
 
-OrcaSlicer: an open source Next-Gen Slicing Software for Precision 3D Prints.  
-Optimize your prints with ultra-fast slicing, intelligent support generation, and seamless printer compatibility—engineered for perfection.
+## 一台机器能做的五类作业
 
-# Official links and community
+| 作业 | 入口 | 说明 |
+|---|---|---|
+| 彩色 3D 打印 | 准备 / 预览 | 上表面生成吸墨排线，再由喷墨头上色 |
+| 平面喷墨 | 平面喷墨 | 在纸面直接喷印图片，可调 Z 高度与套准 |
+| 绘图仪 | 绘图仪 | 用绘图笔沿 DXF / PLT / SVG 线条输出 |
+| 激光雕刻 | 激光雕刻 | 速度与功率成对调节，按轮廓烧刻 |
+| 拖刀切割 | 拖刀切割 | 沿轮廓切开片材，不切底板 |
 
-#### Official Website:
+顶部标签依次为「准备」「预览」「设备」「项目」「平面喷墨」「绘图仪」「激光雕刻」「拖刀切割」「偏移校准」。左侧是打印机、耗材与工艺参数，右侧是三维工作区。
 
-<a href="https://www.orcaslicer.com/" style="font-size:2em;">OrcaSlicer.com</a>
+## 界面
 
-#### Github Repository:
+### 项目页
 
-<a href="https://github.com/OrcaSlicer/OrcaSlicer"><img src="https://img.shields.io/badge/OrcaSlicer-181717?style=flat&logo=github&logoColor=white" width="200" alt="GitHub Logo"/> </a>
+![项目页](docs/readme/01-projects.png)
 
-#### Follow us:
+启动后可直接新建项目或打开最近的项目；工程保存为 3MF，模型、摆放与全部参数都会一起带走。
 
-<a href="https://twitter.com/real_OrcaSlicer"><img src="https://img.shields.io/badge/real__OrcaSlicer-000000?style=flat&logo=x&logoColor=white" width="200" alt="X Logo"/> </a>  
-<a href="https://www.youtube.com/@OfficialOrcaSlicer"><img src="https://img.shields.io/badge/OfficialOrcaSlicer-FF0000?style=flat&logo=youtube&logoColor=white" width="200" alt="YouTube Logo"/> </a>
+### 准备页
 
-#### Join our Discord community:
+![准备页](docs/readme/02-prepare.png)
 
-<a href="https://discord.gg/P4VE9UY9gJ"><img src="https://img.shields.io/badge/-Discord-5865F2?style=flat&logo=discord&logoColor=fff" width="200" alt="discord logo"/> </a>
+左上角确认打印机预设 **MKPS Snapmaker U1**、变种与喷嘴；导入 3MF / STL / STEP 后在工作区摆放。喷墨作业对朝向敏感：**需要上色的面必须朝上**，表面处理只在上表面生成排线。
 
-<table border="2" style="border-color: #ffa500; background-color:rgb(232, 220, 180); color: #856404;">
-<tr>
-<td>
-<strong>⚠️ CAUTION:</strong><br>
-Several clickbait and malicious websites, such as <b>orca-slicer[.]com</b> and <b>orcaslicer[.]net</b>, are pretending to be the official OrcaSlicer site. These sites may redirect you to dangerous downloads or contain misleading information.<br>
-<b>Our only official website is <a href="https://www.orcaslicer.com/">www.orcaslicer.com</a>.</b><br><br>
-If you come across any of these in search results, please <b>report them</b> as unsafe or phishing to help keep the community secure with:<br>
- - <a href="https://safebrowsing.google.com/safebrowsing/report_phish/">Google Safe Browsing</a><br>
- - <a href="https://www.microsoft.com/en-us/wdsi/support/report-unsafe-site">Microsoft Security Intelligence</a><br>
- - <a href="https://ipthreat.net/tools/reportphishing">IPThreat</a>
-</td>
-</tr>
-</table>
+### 预览页
 
-</div>
+![预览页](docs/readme/03-preview.png)
 
-# Main features
+右侧「走线类型」把「喷墨路径」与「表面处理」单独列出，可分别显示或隐藏；拖动左侧滑块逐层检查首层、悬空与换层位置。模型较高时开启「擦嘴塔与模型等高」，避免高处换色空走。
 
-- **[Advanced Calibration Tools](https://www.orcaslicer.com/wiki/calibration_guide)**  
-  Comprehensive suite: temperature towers, flow rate, retraction & more for optimal performance.
-- **[Precise Wall](https://www.orcaslicer.com/wiki/quality_settings_precision#precise-wall) and [Seam Control](https://www.orcaslicer.com/wiki/quality_settings_seam)**  
-  Adjust outer wall spacing and apply scarf seams to enhance print accuracy.
-- **[Sandwich Mode](https://www.orcaslicer.com/wiki/quality_settings_wall_and_surfaces#innerouterinner) and [Polyholes](https://www.orcaslicer.com/wiki/quality_settings_precision#polyholes) Support**  
-  Use varied infill [patterns](https://www.orcaslicer.com/wiki/strength_settings_patterns) and accurate hole shapes for improved clarity.
-- **[Overhang](https://www.orcaslicer.com/wiki/quality_settings_overhangs) and [Support Optimization](https://www.orcaslicer.com/wiki#support-settings)**  
-  Modify geometry for printable overhangs with precise support placement.
-- **[Granular Controls and Customization](https://www.orcaslicer.com/wiki#process-settings)**  
-  Fine-tune print speed, layer height, pressure, and temperature with precision.
-- **Network Printer Support**  
-  Seamless integration with Klipper, PrusaLink, and OctoPrint for remote control.
-- **[Mouse Ear Brims](https://www.orcaslicer.com/wiki/others_settings_brim) & [Adaptive Bed Mesh](https://www.orcaslicer.com/wiki/printer_basic_information_adaptive_bed_mesh)**  
-  Automatic brims and adaptive mesh calibration ensure consistent adhesion.
-- **User-Friendly Interface**  
-  Intuitive drag-and-drop design with pre-made profiles for popular printers.
-- **[Open-Source](https://github.com/OrcaSlicer/OrcaSlicer) & [Community Driven](https://discord.gg/P4VE9UY9gJ)**  
-  Regular updates fueled by continuous community contributions.
-- **Wide Printer Compatibility**  
-  Supports a broad range of printers: Bambu Lab, Prusa, Creality, Voron, and more.
-- **[Belt Printer Support](https://www.orcaslicer.com/wiki/belt_printing)**  
-  Slice for belt / conveyor (infinite-Z) printers, with belt-aware supports and a tilted-bed preview. Contributed by [Joseph Robertson (@HarrierPigeon)](https://github.com/HarrierPigeon).
-- **[IDEX/IQEX Parallel Printing Support](https://www.orcaslicer.com/wiki/idex_iqex_parallel_printing)**  
-  Print copies or mirror images of a part on every carriage of an IDEX or IQEX printer at once, with the mode chosen per plate and nozzle clearance zones shown on the bed. Contributed by [Clifford (@cgarwood82)](https://github.com/cgarwood82).
-- Additional features can be found in the [change notes](https://github.com/OrcaSlicer/OrcaSlicer/releases/).
+### 平面喷墨
 
-# Wiki
+![平面喷墨页](docs/readme/04-flat-inkjet.png)
 
-The [wiki](https://www.orcaslicer.com/wiki) aims to provide a detailed explanation of the slicer settings, including how to maximize their use and how to calibrate and set up your printer.
+左侧设置喷墨偏移 X/Y、浓度、速度与干燥时间，右侧画布添加图片、按实际尺寸缩放，并用网格对齐纸张。Z 高度是喷头到纸面的距离，换纸厚必须同步调整；发送前确认「设备」页已连上目标 U1。
 
-- **[Access the wiki here](https://www.orcaslicer.com/wiki)**
-- **[Contribute to the wiki](https://www.orcaslicer.com/wiki/how_to_wiki)**
+### 绘图仪 / 激光雕刻 / 拖刀切割
 
-# Download
+![绘图仪页](docs/readme/05-plotter.png)
 
-## Stable Release
+![激光雕刻页](docs/readme/06-laser.png)
 
-📥 **[Download the Latest Stable Release](https://github.com/OrcaSlicer/OrcaSlicer/releases/latest)**  
-Visit our GitHub Releases page for the latest stable version of OrcaSlicer, recommended for most users.  
-Windows and macOS release and nightly builds are code signed.
+![拖刀切割页](docs/readme/07-knife.png)
 
-## Nightly Builds
+三页版式一致，都支持 DXF、PLT、SVG 与 G-code，**图形单位必须是毫米**。激光页额外提供功率百分比，速度提高时要同步提高功率；拖刀与绘图笔依靠各自的 Z 偏移决定压纸深度，换头后先在小块废料上试一次。
 
-🌙 **[Download the Latest Nightly Build](https://github.com/OrcaSlicer/OrcaSlicer/releases/tag/nightly-builds)**  
-Explore the latest developments in OrcaSlicer with our nightly builds. Feedback on these versions is highly appreciated.
+### 偏移校准
 
-# How to install
+![偏移校准页](docs/readme/08-calibration.png)
 
-## Windows
+左半区用方向键加六档步进（0.02 / 0.05 / 0.1 / 0.2 / 0.3 / 0.4 mm）手调喷墨偏移；右半区加载实拍照片，框出模型外框与色块实际位置反算偏移。校准值只是当前会话的修正，确认后要写回打印机设置的「喷墨偏移 / 笔刷偏移 / 绘图笔偏移 / 拖刀偏移 / 激光偏移」，保存预设后才对下次打印生效。
 
-Download the **Windows Installer exe** for your preferred version from the [releases page](https://github.com/OrcaSlicer/OrcaSlicer/releases). Both `x64` and `arm64` installers are published — pick the one matching your CPU.
+### 设备页
 
-- *For convenience there is also a portable build available.*
-    <details>
-    <summary>Troubleshooting</summary>
+![设备页](docs/readme/09-device.png)
 
-  - *If you have troubles to run the build, you might need to install following runtimes:*
-  - [MicrosoftEdgeWebView2RuntimeInstallerX64](https://github.com/OrcaSlicer/OrcaSlicer/releases/download/v1.0.10-sf2/MicrosoftEdgeWebView2RuntimeInstallerX64.exe)
-    - [Details of this runtime](https://aka.ms/webview2)
-    - [Alternative Download Link Hosted by Microsoft](https://go.microsoft.com/fwlink/p/?LinkId=2124703)
-  - [vcredist2019_x64](https://github.com/OrcaSlicer/OrcaSlicer/releases/download/v1.0.10-sf2/vcredist2019_x64.exe)
-    - [Alternative Download Link Hosted by Microsoft](https://aka.ms/vs/17/release/vc_redist.x64.exe)
-    - This file may already be available on your computer if you've installed visual studio.  Check the following location: `%VCINSTALLDIR%Redist\MSVC\v142`
-    </details>
+显示当前任务、耗材用量与预计时间、摄像头画面、各工具头温度、热床与腔体温度、工具头列表与控制台。已上传的文件可在历史列表重新打印，顶部 RE-PRINT 用于重复上一次任务。
 
-### Microsoft Store
+## 喷墨工艺参数
 
-Install from the [Microsoft Store](https://apps.microsoft.com/detail/9mv6gl23xm59) when you prefer a Store-signed package (helps on Windows 11 Smart App Control).
+在「准备」页左侧工艺栏切到「喷墨」，共三组参数：
 
-### Windows Package Manager
+- **表面处理**：把上表面换成按间距排列的走线，形成能吸墨的纹理面；间距越小纹理越细、吸墨越多。
+- **喷墨**：浓度、速度、重复遍数与干燥时间。浓度决定单位面积出墨量，速度决定单位时间走多远；重复喷墨必须留足干燥时间，否则会积墨。
+- **色调调节**：分别调整 C / M / Y 墨量，以及鲜艳度、明亮度、对比度和平行四边形剪切；它只改颜色，不改几何。
 
-```shell
-winget install --id=SoftFever.OrcaSlicer -e
-```
+调参顺序建议：先用试片确定出墨量与表面处理，再用 C / M / Y 修颜色，两个变量不要同时改。
 
-## Mac
+## 与上游 OrcaSlicer 的差异
 
-1. Download the universal DMG, which runs on both Apple Silicon and Intel Macs.
-2. Drag OrcaSlicer.app to Application folder.
-3. *If you want to run a build from a PR, you also need to follow the instructions below:*
+- 新增「项目 / 平面喷墨 / 绘图仪 / 激光雕刻 / 拖刀切割 / 偏移校准」等专用页面（`src/slic3r/GUI/MkpWebPage.*`、`src/libslic3r/MkpInkjet.*`）
+- G-code、擦料塔与工具排序适配五工具头：逐层换色、内壁 / 外壁工具分配、擦嘴塔与模型等高
+- GLB 纹理管线：`GlbBake`、`xatlas`、`meshoptimizer` 与 110 / 140 着色器
+- Snapmaker U1 机型与材料预设、界面资源、zh_CN 本地化
 
-    <details>
-    <summary>Quarantine</summary>
+## 快速开始
 
-    - Option 1 (You only need to do this once. After that the app can be opened normally.):
-      - Step 1: Hold _cmd_ and right click the app, from the context menu choose **Open**.
-      - Step 2: A warning window will pop up, click _Open_
+1. 安装并启动，进入「准备」，打印机选 **MKPS Snapmaker U1**，确认变种与实际机器一致。
+2. 在「设备」页添加 U1 地址并连接，确认温度与工具头状态。
+3. 导入模型并摆放，需要上色的面朝上。
+4. 工艺栏切到「喷墨」，设置表面处理与喷墨参数后点「切片单盘」。
+5. 在「预览」检查喷墨路径与表面处理，确认擦嘴塔高度后导出 G-code 或直接发送打印。
 
-    - Option 2:
-      Execute this command in terminal:
+## 构建
 
-      ```shell
-      xattr -dr com.apple.quarantine /Applications/OrcaSlicer.app
-      ```
+源码位于本仓库根目录，与上游 OrcaSlicer 工程结构一致：
 
-    - Option 3:
-        - Step 1: open the app, a warning window will pop up  
-            ![mac_cant_open](./SoftFever_doc/mac_cant_open.png)
-        - Step 2: in `System Settings` -> `Privacy & Security`, click `Open Anyway`:  
-            ![mac_security_setting](./SoftFever_doc/mac_security_setting.png)
-    </details>
+- Windows：`build_win.bat`（Visual Studio 2026 BuildTools / MSVC v145，CMake 4.4+，Perl）
+- 依赖包缓存在 `deps/DL_CACHE/<组件名>/`，`deps/CMakeLists.txt` 会自动取用
+- 产物：`build/src/Release/orca-slicer.exe`
 
-### Homebrew Cask
+上游构建说明见 [`README.OrcaSlicer-upstream.md`](README.OrcaSlicer-upstream.md)。
 
-```shell
-brew install --cask orcaslicer
-```
+## 许可与致谢
 
-The [Homebrew cask](https://formulae.brew.sh/cask/orcaslicer) installs the official macOS DMG from [GitHub Releases](https://github.com/OrcaSlicer/OrcaSlicer/releases).
-
-## Linux
-
-### Flathub (Recommended)
-
-OrcaSlicer is available through FlatHub:
-
-<a href='https://flathub.org/apps/com.orcaslicer.OrcaSlicer'><img width='240' alt='Download on Flathub' src='https://dl.flathub.org/assets/badges/flathub-badge-en.png'/></a>
-
-Install from the command line:
-
-```shell
-flatpak install flathub com.orcaslicer.OrcaSlicer
-flatpak run com.orcaslicer.OrcaSlicer
-```
-
-It can also be installed through graphical software managers (KDE Discover, GNOME Software, etc.) when Flathub is enabled. Search for **OrcaSlicer** in your software center.
-
-### AppImage
-
-AppImages are published for both **x86_64** and **aarch64** (ARM64). Pick the file matching your CPU — the ARM64 build has `aarch64` in its name (e.g. `OrcaSlicer_Linux_AppImage_Ubuntu2404_aarch64_*.AppImage`).
-
- 1. Download App image from the [releases page](https://github.com/OrcaSlicer/OrcaSlicer/releases).
- 2. Double click the downloaded file to run it.
-
- 3. If you run into trouble executing it, try this command in the terminal:
-    `chmod +x /path_to_appimage/OrcaSlicer_Linux.AppImage`
-
-# How to Compile
-
-All updated build instructions for Windows, macOS, and Linux are now available on the official [OrcaSlicer Wiki - How to build](https://www.orcaslicer.com/wiki/how_to_build) page.
-
-Please refer to the wiki to ensure you're following the latest and most accurate steps for your platform.
-
-# Klipper Note
-
-If you're running Klipper, it's recommended to add the following configuration to your `printer.cfg` file.
-
-```gcode
-# Enable object exclusion
-[exclude_object]
-
-# Enable arcs support
-[gcode_arcs]
-resolution: 0.1
-```
-
-# Supports
-
-**OrcaSlicer** is an open-source project, and we're deeply grateful to all our sponsors and backers.  
-Their generous support helps fund filaments and other essential 3D printing materials for the project.  
-Thank you! :)
-
-## Sponsors
-
-<table>
-<tr>
-<td>
-<a href="https://qidi3d.com/" style="display:inline-block; border-radius:8px; background:#fff;">
-  <img src="SoftFever_doc\sponsor_logos\QIDI.png" alt="QIDI" width="100" height="100">
-</a>
-</td>
-<td>
-<a href="https://bigtree-tech.com/" style="display:inline-block; border-radius:8px; background:#222;">
-    <img src="SoftFever_doc\sponsor_logos\BigTreeTech.png" alt="BIGTREE TECH" width="100" height="100">
-</a>
-</td>
-</tr>
-</table>
-
-## Backers:
-
-**Ko-fi supporters** ☕: [Backers list](https://github.com/user-attachments/files/16147016/Supporters_638561417699952499.csv)
-
-## Support the project
-
-<a href="https://github.com/sponsors/SoftFever"><img src="https://img.shields.io/badge/GitHub%20Sponsors-30363D?style=flat&logo=GitHub-Sponsors&logoColor=EA4AAA" height="50"></a>  
-<a href="https://ko-fi.com/G2G5IP3CP"><img src="https://img.shields.io/badge/Support_me_on_Ko--fi-FF5E5B?style=flat&logo=ko-fi&logoColor=white" height="50"></a>  
-<a href="https://paypal.me/softfever3d"><img src="https://img.shields.io/badge/PayPal-003087?style=flat&logo=paypal&logoColor=fff" height="50"></a>
-
-## Some Background
-
-Open-source slicing has always been built on a tradition of collaboration and attribution. [Slic3r](https://github.com/Slic3r/Slic3r), created by Alessandro Ranellucci and the RepRap community, laid the foundation. [PrusaSlicer](https://github.com/prusa3d/PrusaSlicer) by Prusa Research built on Slic3r and acknowledged that heritage. [Bambu Studio](https://github.com/bambulab/BambuStudio) in turn forked from PrusaSlicer, and [SuperSlicer](https://github.com/supermerill/SuperSlicer) by @supermerill extended PrusaSlicer with community-driven enhancements. Each project carried the work of its predecessors forward, crediting those who came before.
-
-OrcaSlicer began in that same spirit, drawing from BambuStudio, PrusaSlicer, and ideas inspired by CuraSlicer and SuperSlicer. But it has since grown far beyond its origins. Through relentless innovation — introducing advanced calibration tools, precise wall and seam control, tree supports, adaptive slicing, and hundreds of other features — OrcaSlicer has become the most widely used and actively developed open-source slicer in the 3D printing community. Many of its innovations have been adopted by other slicers, making it a driving force for the entire industry.
-
-The OrcaSlicer logo was designed by community member [Justin Levine](https://github.com/jal-co).
-
-# License
-
-- **OrcaSlicer** is licensed under the GNU Affero General Public License, version 3.
-- The **GNU Affero General Public License**, version 3 ensures that if you use any part of this software in any way (even behind a web server), your software must be released under the same license.
-- OrcaSlicer includes a **pressure advance calibration pattern test** adapted from Andrew Ellis' generator, which is licensed under GNU General Public License, version 3. Ellis' generator is itself adapted from a generator developed by Sineos for Marlin, which is licensed under GNU General Public License, version 3.
-- The **Bambu networking plugin** is based on non-free libraries from BambuLab. It is optional to the OrcaSlicer and provides extended functionalities for Bambulab printer users.
+MKPSpectrum 基于 [OrcaSlicer](https://github.com/OrcaSlicer/OrcaSlicer)（SoftFever 分支），遵循 **AGPL-3.0** 许可；本仓库的修改同样按 AGPL-3.0 发布，完整许可证见 [`LICENSE.txt`](LICENSE.txt)。感谢 Bambu Studio、PrusaSlicer、Slic3r 等上游项目。
