@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <math.h>
 #include <limits>
+#include <optional>
 #include <string>
 #include <sstream>
 #include <unordered_map>
@@ -141,6 +142,7 @@ public:
         // (leading to https://github.com/prusa3d/PrusaSlicer/issues/2834) or do
         // an extra retraction-unretraction pair.
         std::vector<Vec2f> wipe_path;
+        std::optional<std::pair<Vec2f, Vec2f>> mkp_grid_refill;
 
 		// BBS
         float purge_volume = 0.f;
@@ -534,6 +536,7 @@ private:
     //float           m_parking_pos_retraction    = 0.f;
     //float           m_extra_loading_move        = 0.f;
     float           m_bridging                  = 0.f;
+    bool            m_mkp_support_lines_first   = false;
     bool            m_sparse_layers_skipped     = false;
     bool            m_sparse_layers_combined    = false;
     // BBS: remove useless config

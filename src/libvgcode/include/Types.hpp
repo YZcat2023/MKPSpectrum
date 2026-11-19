@@ -163,6 +163,9 @@ enum class EGCodeExtrusionRole : uint8_t
       Brim,
       SupportTransition,
       Mixed,
+      // MKPSpectrum
+      InkjetPath,
+      SurfacePath,
     COUNT
 };
 

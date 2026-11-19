@@ -26,6 +26,7 @@
 #include "libslic3r_version.h"
 #include "BuildCommit.hpp"
 #include "Downloader.hpp"
+#include <wx/graphics.h>
 #include <boost/algorithm/string/split.hpp>
 #include <boost/algorithm/string/classification.hpp>
 #include <boost/algorithm/string/replace.hpp>
@@ -478,12 +479,12 @@ public:
         this->SetPosition(pos);
         this->CenterOnScreen();
 
-        scale_font(m_font_version, 1.65f); // only scale this one since it hasnt a preloaded font like Label::Body_24;
+        scale_font(m_font_version, 1.15f); // only scale this one since it hasnt a preloaded font like Label::Body_24;
 
         m_bg_color = StateColor::darkModeColorFor(wxColour("#FFFFFF"));
         m_fg_color = StateColor::darkModeColorFor(wxColour("#6B6A6A"));
         m_progress_bg_color = StateColor::darkModeColorFor(wxColour("#DFDFDF"));
-        m_progress_fg_color = StateColor::darkModeColorFor(wxColour("#009688"));
+        m_progress_fg_color = StateColor::darkModeColorFor(wxColour("#C0392B")); // MKPSpectrum 老红
         m_progress_h = FromDIP(6);
         bool dark_mode = m_fg_color != wxColour("#6B6A6A");
         wxSize sz  = m_window->GetClientSize();
@@ -491,8 +492,246 @@ public:
         m_logo_bmp = *bmp_cache.load_svg(dark_mode ? "splash_logo_dark" : "splash_logo", sz.GetWidth(), sz.GetHeight());
 
         m_window->Bind(wxEVT_PAINT, &SplashScreen::OnPaint, this);
+        m_window->Bind(wxEVT_ERASE_BACKGROUND, &SplashScreen::OnEraseBg, this);
+        m_window->Bind(wxEVT_DESTROY, &SplashScreen::OnAnimStop, this);
+#ifdef __WXMSW__
+        // The splash stays up while the main thread runs Orca's whole init, so the
+        // message loop is blocked and wxTimer events never get delivered: a
+        // timer-driven animation simply froze, only stepping on the rare forced
+        // repaint (measured: 4 frames in 1.9 s). The animation therefore owns a
+        // thread and paints the iridescent band straight into the window DC, which
+        // needs no pumping from the GUI thread.
+        m_win_hwnd   = (HWND) m_window->GetHandle();
+        m_anim_cw    = sz.GetWidth();
+        m_anim_ch    = sz.GetHeight();
+        m_anim_band  = int(m_anim_ch * 0.66);
+        m_ver_pad_r  = FromDIP(14);
+        m_ver_pad_t  = FromDIP(10);
+        // Escape hatch for A/B timing and for anyone who distrusts a worker
+        // thread painting a window: MKPS_SPLASH_ANIM=0 falls back to the plain
+        // (static, timer-less) splash.
+        if (wxGetenv("MKPS_SPLASH_ANIM") != "0") {
+            build_anim_overlay();
+            m_anim_thread = std::thread([this]() { anim_loop(); });
+        }
+#else
+        m_anim_timer.SetOwner(m_window, wxID_HIGHEST + 731);
+        m_window->Bind(wxEVT_TIMER, &SplashScreen::OnAnimTimer, this, wxID_HIGHEST + 731);
+        m_anim_timer.Start(30);
+#endif
         m_window->Refresh();
         m_window->Update();
+    }
+
+    ~SplashScreen()
+    {
+        stop_anim();
+    }
+
+    void stop_anim()
+    {
+        m_anim_stop.store(true);
+        if (m_anim_thread.joinable())
+            m_anim_thread.join();
+    }
+
+#ifdef __WXMSW__
+    // Logo pixels that sit inside the animated band, so the standalone animation
+    // thread can stamp them back on top of every freshly generated wash frame.
+    void build_anim_overlay()
+    {
+        m_overlay.clear();
+        wxImage img = m_logo_bmp.ConvertToImage();
+        if (!img.IsOk())
+            return;
+        if (!img.HasAlpha())
+            img.InitAlpha();
+        const int w = std::min(img.GetWidth(),  m_anim_cw);
+        const int h = std::min(img.GetHeight(), m_anim_band);
+        const unsigned char *pr = img.GetData();
+        const unsigned char *pa = img.GetAlpha();
+        m_overlay.reserve(size_t(w) * size_t(h) / 4);
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < w; ++x) {
+                const int i = y * img.GetWidth() + x;
+                const unsigned char a = pa ? pa[i] : 255;
+                if (!a)
+                    continue;
+                m_overlay.push_back({ x, y, pr[i * 3], pr[i * 3 + 1], pr[i * 3 + 2], a });
+            }
+        if (const wxNativeFontInfo *nfi = m_font_version.GetNativeFontInfo())
+            m_ver_logfont = nfi->lf;
+    }
+
+    void anim_loop()
+    {
+        const int cw = m_anim_cw, ch = m_anim_ch, band = m_anim_band;
+        if (cw <= 0 || ch <= 0 || band <= 0)
+            return;
+        const HWND hwnd = m_win_hwnd;
+        // A small field is generated per frame and blown up by GDI (HALFTONE),
+        // which keeps the four-colour gradient smooth and the loop cheap.
+        const int SW = 128, SH = 96;
+        BITMAPINFO bmi = {};
+        bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+        bmi.bmiHeader.biPlanes      = 1;
+        bmi.bmiHeader.biBitCount    = 32;
+        bmi.bmiHeader.biCompression = BI_RGB;
+        void *bits_big = nullptr, *bits_small = nullptr;
+        HDC dcdst = CreateCompatibleDC(nullptr);
+        if (!dcdst)
+            return;
+        bmi.bmiHeader.biWidth  = cw;
+        bmi.bmiHeader.biHeight = -band;
+        HBITMAP bmp_big = CreateDIBSection(dcdst, &bmi, DIB_RGB_COLORS, &bits_big, nullptr, 0);
+        HDC dcsrc = CreateCompatibleDC(nullptr);
+        bmi.bmiHeader.biWidth  = SW;
+        bmi.bmiHeader.biHeight = -SH;
+        HBITMAP bmp_small = dcsrc ? CreateDIBSection(dcsrc, &bmi, DIB_RGB_COLORS, &bits_small, nullptr, 0) : nullptr;
+        if (!bmp_big || !bmp_small) {
+            if (bmp_big) DeleteObject(bmp_big);
+            if (bmp_small) DeleteObject(bmp_small);
+            if (dcsrc) DeleteDC(dcsrc);
+            DeleteDC(dcdst);
+            return;
+        }
+        HGDIOBJ old_big   = SelectObject(dcdst, bmp_big);
+        HGDIOBJ old_small = SelectObject(dcsrc, bmp_small);
+        HFONT   font      = m_ver_logfont.lfFaceName[0] ? CreateFontIndirectW(&m_ver_logfont) : nullptr;
+        SetStretchBltMode(dcdst, HALFTONE);
+        SetBrushOrgEx(dcdst, 0, 0, nullptr);
+        SetBkMode(dcdst, TRANSPARENT);
+        SetTextColor(dcdst, RGB(240, 240, 244));
+
+        const double tl[3] = { 246, 0, 29 };
+        const double tr[3] = { 11, 95, 231 };
+        const double br[3] = { 74, 194, 18 };
+        const double bl[3] = { 255, 194, 0 };
+        const double period = 6.0;   // seconds per revolution: slow and calm
+        const double ZOOM   = 1.55;
+        unsigned char *psmall = static_cast<unsigned char *>(bits_small);
+        unsigned char *pbig   = static_cast<unsigned char *>(bits_big);
+        while (!m_anim_stop.load(std::memory_order_relaxed) && ::IsWindow(hwnd)) {
+            const double secs = std::chrono::duration<double>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            const double ang  = -std::fmod(secs / period, 1.0) * 6.283185307179586;
+            const double ca   = std::cos(ang), sa = std::sin(ang);
+            for (int y = 0; y < SH; ++y) {
+                const double dyn = (y + 0.5) / SH - 0.5;
+                unsigned char *row = psmall + size_t(y) * SW * 4;
+                for (int x = 0; x < SW; ++x) {
+                    const double dxn = (x + 0.5) / SW - 0.5;
+                    const double u   = std::clamp(0.5 + (dxn * ca - dyn * sa) / ZOOM, 0.0, 1.0);
+                    const double v   = std::clamp(0.5 + (dxn * sa + dyn * ca) / ZOOM, 0.0, 1.0);
+                    unsigned char *px = row + x * 4;
+                    for (int c = 0; c < 3; ++c) {
+                        const double val = tl[c] * (1.0 - u) * (1.0 - v) + tr[c] * u * (1.0 - v)
+                                         + br[c] * u * v + bl[c] * (1.0 - u) * v;
+                        px[c] = (unsigned char) std::clamp(val, 0.0, 255.0);
+                    }
+                    px[3] = 255;
+                }
+            }
+            StretchBlt(dcdst, 0, 0, cw, band, dcsrc, 0, 0, SW, SH, SRCCOPY);
+            for (const OverlayPx &o : m_overlay) {
+                unsigned char *px = pbig + (size_t(o.y) * cw + o.x) * 4;
+                const unsigned int a = o.a;
+                px[0] = (unsigned char) ((o.b * a + px[0] * (255 - a)) / 255);
+                px[1] = (unsigned char) ((o.g * a + px[1] * (255 - a)) / 255);
+                px[2] = (unsigned char) ((o.r * a + px[2] * (255 - a)) / 255);
+            }
+            if (font) {
+                HGDIOBJ old_font = SelectObject(dcdst, font);
+                const int len = (int) m_text_version.length();
+                SIZE ext = {};
+                GetTextExtentPoint32W(dcdst, m_text_version.wc_str(), len, &ext);
+                TextOutW(dcdst, cw - ext.cx - m_ver_pad_r, m_ver_pad_t, m_text_version.wc_str(), len);
+                SelectObject(dcdst, old_font);
+            }
+            {
+                std::lock_guard<std::mutex> lk(m_frame_mutex);
+                const size_t np = size_t(cw) * band;
+                m_frame_rgb.resize(np * 3);
+                unsigned char *dst = m_frame_rgb.data();
+                for (size_t i = 0; i < np; ++i) {
+                    dst[i * 3 + 0] = pbig[i * 4 + 2];
+                    dst[i * 3 + 1] = pbig[i * 4 + 1];
+                    dst[i * 3 + 2] = pbig[i * 4 + 0];
+                }
+                m_frame_w = cw;
+                m_frame_h = band;
+            }
+            if (HDC wdc = ::GetDC(hwnd)) {
+                BitBlt(wdc, 0, 0, cw, band, dcdst, 0, 0, SRCCOPY);
+                ::ReleaseDC(hwnd, wdc);
+                m_anim_painted.store(true, std::memory_order_relaxed);
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(33));
+        }
+        if (font) DeleteObject(font);
+        SelectObject(dcsrc, old_small);
+        SelectObject(dcdst, old_big);
+        DeleteObject(bmp_small);
+        DeleteObject(bmp_big);
+        DeleteDC(dcsrc);
+        DeleteDC(dcdst);
+    }
+#endif // __WXMSW__
+
+    void OnAnimTimer(wxTimerEvent&)
+    {
+        ++m_anim_phase;
+        if (m_window)
+            m_window->Refresh(false);
+    }
+
+    void OnAnimStop(wxWindowDestroyEvent& evt)
+    {
+        stop_anim();
+        m_anim_timer.Stop();
+        evt.Skip();
+    }
+
+    // Paint the animation thread's most recent frame into 'dc'. Returns false when
+    // there is nothing to restore yet (the very first paints), so the caller falls
+    // back to drawing the wash itself.
+    bool restore_band(wxDC& dc)
+    {
+#ifdef __WXMSW__
+        // NOTE: wxImage(w, h, data, static_data = false) takes OWNERSHIP of 'data'
+        // and free()s it later, which would free memory owned by the std::vector
+        // below and wreck the heap. Copy first, then hand the copy over with
+        // static_data = true so wxImage only reads it.
+        std::vector<unsigned char> rgb;
+        int fw = 0, fh = 0;
+        {
+            std::lock_guard<std::mutex> lk(m_frame_mutex);
+            if (m_frame_rgb.empty() || m_frame_w <= 0 || m_frame_h <= 0)
+                return false;
+            rgb    = m_frame_rgb;
+            fw     = m_frame_w;
+            fh     = m_frame_h;
+        }
+        wxImage img(fw, fh, rgb.data(), true);
+        if (!img.IsOk())
+            return false;
+        dc.DrawBitmap(wxBitmap(img), 0, 0, false);
+        return true;
+#else
+        (void) dc;
+        return false;
+#endif
+    }
+
+    // Suppress the background erase: it would punch a background-coloured hole in the
+    // band for one frame on every activation / newly exposed area.
+    void OnEraseBg(wxEraseEvent& evt)
+    {
+#ifdef __WXMSW__
+        if (m_anim_painted.load(std::memory_order_relaxed))
+            return;
+#endif
+        evt.Skip();
     }
 
     void OnPaint(wxPaintEvent& evt)
@@ -501,34 +740,97 @@ public:
         wxSize c_sz = m_window->GetClientSize();
 
         dc.SetBackground(wxBrush(m_bg_color));
-        dc.Clear();
-        if (m_logo_bmp.IsOk())
-            dc.DrawBitmap(m_logo_bmp, 0, 0, true);
+        // NOTE: no dc.Clear() here when the animation thread owns the band. Clear()
+        // repaints the whole client area, which blanked the band for one frame
+        // (a full-window dark flash) on every forced repaint. Only the strip below
+        // the band is cleared then, see below.
 
-        wxRect rc = wxRect(0, 0, c_sz.GetWidth(), 0);
-        dc.SetTextForeground(m_fg_color);
+        // MKPSpectrum: the upper part of the splash is an iridescent wash whose
+        // four corners are red / blue / green / yellow, blended bilinearly so the
+        // colours melt into one another (no hard colour blocks). Ends on a hard
+        // edge (no fade band) at 66% of the height; below stays plain.
+        const int holo_w = c_sz.GetWidth();
+        const int holo_h = int(c_sz.GetHeight() * 0.66);
+        // On Windows the band is continuously redrawn by the splash animation thread
+        // straight into the window DC. Repainting it here as well produced a visible
+        // jump: this path samples the clock with its own phase and its own (coarser)
+        // upscaling, so each forced repaint flashed a differently rotated frame for
+        // one frame before the thread overwrote it. Once the thread has painted, leave
+        // the band alone and only keep the strip below it and the status line in sync.
+        bool band_owned = false;
+#ifdef __WXMSW__
+        band_owned = m_anim_painted.load(std::memory_order_relaxed);
+#endif
+        if (band_owned) {
+            // Windows erases the window with the background brush on activation and on
+            // newly exposed areas, which blanked the band for one frame each time. The
+            // animation thread keeps a snapshot of its latest frame, so just restore it
+            // here: no flicker, no wait for the next 33 ms tick.
+            band_owned = restore_band(dc);
+            dc.SetPen(*wxTRANSPARENT_PEN);
+            dc.SetBrush(wxBrush(m_bg_color));
+            dc.DrawRectangle(0, holo_h, c_sz.GetWidth(), c_sz.GetHeight() - holo_h);
+        }
+        if (!band_owned && holo_w > 0 && holo_h > 0) {
+            dc.Clear();   // only the pre-animation / non-Windows path repaints everything
+            // The wash is a four-colour field (red / blue / green / yellow in the four
+            // corners) sampled through a coordinate frame that turns clockwise around
+            // the centre, so the whole iridescent body rotates instead of standing still.
+            const double period = 6.0;   // seconds per revolution
+            const double secs   = std::chrono::duration<double>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            const double ang    = -std::fmod(secs / period, 1.0) * 6.283185307;
+            const double ca     = std::cos(ang), sa = std::sin(ang);
+            const double ZOOM   = 1.55;
+            const double tl[3] = { 246, 0, 29 };
+            const double tr[3] = { 11, 95, 231 };
+            const double br[3] = { 74, 194, 18 };
+            const double bl[3] = { 255, 194, 0 };
+            const int GW = 96, GH = 64;
+            wxImage wash(GW, GH);
+            unsigned char *d = wash.GetData();
+            for (int y = 0; y < GH; ++y) {
+                const double dyn = (y + 0.5) / GH - 0.5;
+                for (int x = 0; x < GW; ++x) {
+                    const double dxn = (x + 0.5) / GW - 0.5;
+                    const double uu = std::clamp(0.5 + (dxn * ca - dyn * sa) / ZOOM, 0.0, 1.0);
+                    const double vv = std::clamp(0.5 + (dxn * sa + dyn * ca) / ZOOM, 0.0, 1.0);
+                    const double U = uu;
+                    const double V = vv;
+                    for (int c = 0; c < 3; ++c) {
+                        const double val = tl[c] * (1.0 - U) * (1.0 - V) + tr[c] * U * (1.0 - V)
+                                         + br[c] * U * V + bl[c] * (1.0 - U) * V;
+                        d[(y * GW + x) * 3 + c] = (unsigned char)std::clamp(val, 0.0, 255.0);
+                    }
+                }
+            }
+            dc.DrawBitmap(wxBitmap(wash.Scale(holo_w, holo_h, wxIMAGE_QUALITY_BILINEAR)), 0, 0, false);
+        }
 
-        dc.SetFont(m_font_version);
-        rc.y      = c_sz.GetHeight() * 0.72;
-        rc.height = dc.GetTextExtent(m_text_version).GetHeight();
-        dc.DrawLabel(m_text_version, rc, wxALIGN_CENTER);
+        if (!band_owned) {
+            if (m_logo_bmp.IsOk())
+                dc.DrawBitmap(m_logo_bmp, 0, 0, true);
 
+            // Version, top right corner.
+            dc.SetFont(m_font_version);
+            dc.SetTextForeground(wxColour(240, 240, 244));
+            const wxSize ver_sz = dc.GetTextExtent(m_text_version);
+            dc.DrawText(m_text_version, c_sz.GetWidth() - ver_sz.GetWidth() - FromDIP(14), FromDIP(10));
+        }
+
+        // Action line.
         dc.SetFont(m_font_action);
-        rc.y      = c_sz.GetHeight() * 0.85;
-        rc.height = dc.GetTextExtent(m_text_action).GetHeight();
-        dc.DrawLabel(m_text_action, rc, wxALIGN_CENTER);
+        dc.SetTextForeground(m_fg_color);
+        const wxSize act_sz = dc.GetTextExtent(m_text_action);
+        dc.DrawText(m_text_action, (c_sz.GetWidth() - act_sz.GetWidth()) / 2, int(c_sz.GetHeight() * 0.885));
 
-        const wxRect progress_rc(0, c_sz.GetHeight() - m_progress_h, c_sz.GetWidth(), m_progress_h);
-                
+        // Progress bar, pinned to the bottom edge.
+        const int bar_y = c_sz.GetHeight() - m_progress_h;
         dc.SetPen(*wxTRANSPARENT_PEN);
         dc.SetBrush(wxBrush(m_progress_bg_color));
-        dc.DrawRectangle(progress_rc);
-
-        const int fill_width = progress_rc.GetWidth() * m_progress * 0.01;
-        if (fill_width > 0) {
-            dc.SetBrush(wxBrush(m_progress_fg_color));
-            dc.DrawRectangle(0, progress_rc.GetTop(), fill_width, m_progress_h);
-        }
+        dc.DrawRectangle(0, bar_y, c_sz.GetWidth(), m_progress_h);
+        dc.SetBrush(wxBrush(m_progress_fg_color));
+        dc.DrawRectangle(0, bar_y, c_sz.GetWidth() * std::clamp(m_progress, 0, 100) / 100, m_progress_h);
     }
 
     void SetText(const wxString& text, int progress)
@@ -576,6 +878,26 @@ public:
 
 private:
     wxBitmap m_logo_bmp;
+    wxTimer  m_anim_timer;
+    int      m_anim_phase = 0;
+#ifdef __WXMSW__
+    struct OverlayPx { int x, y; unsigned char r, g, b, a; };
+    std::thread            m_anim_thread;
+    std::atomic<bool>      m_anim_stop{ false };
+    std::atomic<bool>      m_anim_painted{ false };
+    HWND                   m_win_hwnd   = nullptr;
+    int                    m_anim_cw    = 0;
+    int                    m_anim_ch    = 0;
+    int                    m_anim_band  = 0;
+    int                    m_ver_pad_r  = 0;
+    int                    m_ver_pad_t  = 0;
+    LOGFONTW               m_ver_logfont = {};
+    std::vector<OverlayPx> m_overlay;
+    std::mutex                 m_frame_mutex;
+    std::vector<unsigned char> m_frame_rgb;   // latest band frame, RGB, cw x band
+    int                        m_frame_w = 0;
+    int                        m_frame_h = 0;
+#endif
     wxColour m_fg_color;
     wxColour m_bg_color;
     wxColour m_progress_bg_color;
@@ -4546,7 +4868,9 @@ bool GUI_App::dark_mode()
     const auto &val = wxGetApp().app_config->get("dark_color_mode");
     if (val == "1") return true;
     if (val == "0") return false;
-    return check_dark_mode();
+    // MKP: dark is the default look, not whatever the system happens to be set to. A user who
+    // wants light mode still gets it, because that choice is stored as an explicit "0" above.
+    return true;
 #endif
 #else
     //BBS disable DarkUI mode

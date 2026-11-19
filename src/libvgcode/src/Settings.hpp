@@ -77,6 +77,9 @@ struct Settings
 		        true, // Brim
 		        true, // SupportTransition
 		        true, // Mixed
+		        // MKPSpectrum
+		        false, // InkjetPath
+		        false, // SurfacePath
 		};
 };
 

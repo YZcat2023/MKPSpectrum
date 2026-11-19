@@ -210,6 +210,10 @@ public:
     Slic3r::PaintedMesh               get_painted_mesh() const;
     std::vector<Slic3r::FilamentMatch> get_matches() const;
     bool                               was_skipped() const { return m_skipped; }
+    // The user chose to draw the model with the texture the file shipped with instead of quantizing
+    // it to printable colours. Nothing is painted in that case; the caller keeps the picture for the
+    // 3D view (ModelVolume::display_texture) and imports the geometry as it is.
+    bool                               keeps_texture() const { return m_keep_texture; }
     bool                               fallback_to_geometry_only() const { return m_fallback_to_geometry_only; }
     // Colors of virtual filaments that need to be created after dialog confirmation.
     // Index i corresponds to filament index (m_existing_filament_count + i).
@@ -298,6 +302,7 @@ private:
     void on_auto_merge_toggled(wxCommandEvent& evt);
     void highlight_view_button(int view_index);
     void on_skip_clicked(wxCommandEvent& evt);
+    void on_keep_original_clicked(wxCommandEvent& evt);
     void on_ok_clicked(wxCommandEvent& evt);
 
     void set_color_count_value(int value, bool update_spin);
@@ -325,6 +330,7 @@ private:
 
     TextureImportState                 m_state = TextureImportState::Idle;
     bool                               m_skipped = false;
+    bool                               m_keep_texture = false;
     bool                               m_fallback_to_geometry_only = false;
     // True iff *the most recent* do_auto_match() ran into the global filament
     // limit and had to drop one or more clusters. Reset to false on every
@@ -385,6 +391,7 @@ private:
     ProgressDialog* m_progress_dlg = nullptr;
 
     Button*       m_btn_skip = nullptr;
+    Button*       m_btn_keep_original = nullptr;
     Button*       m_btn_ok   = nullptr;
     wxStaticText* m_drop_warning_label = nullptr;
 
@@ -401,6 +408,7 @@ private:
     static const int ID_COLOR_AUTO  = wxID_HIGHEST + 203;
     static const int ID_BTN_APPLY   = wxID_HIGHEST + 204;
     static const int ID_BTN_SKIP    = wxID_HIGHEST + 205;
+    static const int ID_BTN_KEEP_ORIGINAL = wxID_HIGHEST + 208;
     static const int ID_VIEW_ORIGINAL   = wxID_HIGHEST + 206;
     static const int ID_VIEW_MULTICOLOR = wxID_HIGHEST + 207;
 

@@ -1058,6 +1058,7 @@ WipeTower2::WipeTower2(const PrintConfig& config, const PrintRegionConfig& defau
     m_z_pos(0.f),
     m_bridging(float(config.wipe_tower_bridging)),
     m_sparse_layers_skipped(wipe_tower_sparse_layers_skipped(config)),
+    m_mkp_full_height(config.mkp_full_height_prime_tower.value),
     m_sparse_layers_combined(wipe_tower_sparse_layers_combined(config)),
     m_gcode_flavor(config.gcode_flavor),
     m_travel_speed(config.travel_speed.get_at(get_extruder_index(config, (unsigned int)initial_tool))),
@@ -1238,6 +1239,11 @@ std::vector<WipeTower::ToolChangeResult> WipeTower2::prime(
 	// If false, the last priming are will be large enough to wipe the last extruder sufficiently.
     bool 						/*last_wipe_inside_wipe_tower*/)
 {
+    // MKP: a single-filament prime tower has no tool change to prime for. The sweep below
+    // indexes tools[idx_tool-1] for the last tool, which is out of bounds with one tool.
+    if (tools.size() < 2)
+        return {};
+
 	this->set_layer(initial_layer_print_height, initial_layer_print_height, tools.size(), true, false);
 	m_current_tool 		= tools.front();
     
@@ -1338,7 +1344,6 @@ WipeTower::ToolChangeResult WipeTower2::tool_change(size_t tool)
 	float wipe_volume = 0.f;
     float ramming_depth = 0.f;
     bool interface_layer = m_enable_tower_interface_features && m_current_layer_has_interface;
-
 	// Finds this toolchange info
 	if (tool != (unsigned int)(-1))
 	{
@@ -2013,7 +2018,13 @@ WipeTower::ToolChangeResult WipeTower2::finish_layer()
     float                      feedrate      = first_layer ? m_first_layer_speed * 60.f : std::min(m_wipe_tower_max_purge_speed * 60.f, m_infill_speed * 60.f);
     if (m_enable_tower_interface_features && m_prev_layer_had_interface)
         feedrate = std::min(feedrate, 20.f * 60.f);
-    float current_depth = m_layer_info->depth - m_layer_info->toolchanges_depth();
+    // MKP: a sizing-only tool change purges nothing, so it takes no room in the tower body and
+    // the whole layer stays available for the native inner perimeter and sparse infill.
+    float consumed_depth = 0.f;
+    for (const auto& mkp_tc : m_layer_info->tool_changes)
+        if (! mkp_tc.fake)
+            consumed_depth += mkp_tc.required_depth;
+    float current_depth = m_layer_info->depth - consumed_depth;
     WipeTower::box_coordinates fill_box(Vec2f(m_perimeter_width, m_layer_info->depth-(current_depth-m_perimeter_width)),
                              m_wipe_tower_width - 2 * m_perimeter_width, current_depth-m_perimeter_width);
 
@@ -2021,10 +2032,10 @@ WipeTower::ToolChangeResult WipeTower2::finish_layer()
     writer.set_initial_position((m_left_to_right ? fill_box.ru : fill_box.lu), // so there is never a diagonal travel
                                  m_wipe_tower_width, m_wipe_tower_depth, m_internal_rotation);
 
-    bool toolchanges_on_layer = m_layer_info->toolchanges_depth() > WT_EPSILON;
+    bool toolchanges_on_layer = consumed_depth > WT_EPSILON;
 
     // inner perimeter of the sparse section, if there is space for it:
-    if (fill_box.ru.y() - fill_box.rd.y() > m_perimeter_width - WT_EPSILON)
+    if (!m_mkp_full_height && fill_box.ru.y() - fill_box.rd.y() > m_perimeter_width - WT_EPSILON)
         writer.rectangle(fill_box.ld, fill_box.rd.x()-fill_box.ld.x(), fill_box.ru.y()-fill_box.rd.y(), feedrate);
 
     // we are in one of the corners, travel to ld along the perimeter:
@@ -2033,6 +2044,7 @@ WipeTower::ToolChangeResult WipeTower2::finish_layer()
 
     // Extrude infill to support the material to be printed above.
     const float dy = (fill_box.lu.y() - fill_box.ld.y() - m_perimeter_width);
+    std::optional<std::pair<Vec2f, Vec2f>> grid_refill;
     float left = fill_box.lu.x() + 2*m_perimeter_width;
     float right = fill_box.ru.x() - 2 * m_perimeter_width;
     if (dy > m_perimeter_width)
@@ -2075,8 +2087,15 @@ WipeTower::ToolChangeResult WipeTower2::finish_layer()
             // Extrude an inverse U at the left of the region and the sparse infill.
             writer.extrude(fill_box.lu + Vec2f(m_perimeter_width * 2, 0.f), feedrate);
 
-            const int n = 1+int((right-left)/m_bridging);
+            // The first stroke plus four spaced strokes makes five support lines.
+            const int n = m_mkp_full_height ? 4 : 1+int((right-left)/m_bridging);
             const float dx = (right-left)/n;
+            if (m_mkp_full_height && !toolchanges_on_layer && n == 4) {
+                const float middle = 0.5f * (fill_box.rd.y() + fill_box.ru.y());
+                const float shift = std::min(2.f, 0.25f * (fill_box.ru.y() - fill_box.rd.y()));
+                grid_refill = std::make_pair(writer.rotated(Vec2f(left + 2.f * dx, middle - shift)),
+                                             writer.rotated(Vec2f(left + 2.f * dx, middle + shift)));
+            }
             for (int i=1;i<=n;++i) {
                 float x=left+dx*i;
                 writer.travel(x,writer.y());
@@ -2087,6 +2106,10 @@ WipeTower::ToolChangeResult WipeTower2::finish_layer()
         writer.append("; CP EMPTY GRID END\n"
                       ";------------------\n\n\n\n\n\n\n");
     }
+
+    // Print the support strokes before either the inner frame or the outer wall.
+    if (m_mkp_full_height && fill_box.ru.y() - fill_box.rd.y() > m_perimeter_width - WT_EPSILON)
+        writer.rectangle(fill_box.ld, fill_box.rd.x()-fill_box.ld.x(), fill_box.ru.y()-fill_box.rd.y(), feedrate);
 
     const float spacing = m_perimeter_width - m_layer_height*float(1.-M_PI_4);
     feedrate = first_layer ? m_first_layer_speed * 60.f : std::min(m_wipe_tower_max_purge_speed * 60.f, m_perimeter_speed * 60.f);
@@ -2150,7 +2173,9 @@ WipeTower::ToolChangeResult WipeTower2::finish_layer()
         m_current_height += m_layer_info->height;
     }
 
-    return construct_tcr(writer, false, old_tool, true, false);
+    auto result = construct_tcr(writer, false, old_tool, true, false);
+    result.mkp_grid_refill = grid_refill;
+    return result;
 }
 
 // Static method to get the radius and x-scaling of the stabilizing cone base.
@@ -2270,7 +2295,7 @@ void WipeTower2::plan_toolchange(float z_par, float layer_height_par, unsigned i
     if (m_first_layer_idx == size_t(-1) && (! m_sparse_layers_skipped || old_tool != new_tool || m_plan.size() == 1))
         m_first_layer_idx = m_plan.size() - 1;
 
-    if (old_tool == new_tool)	// new layer without toolchanges - we are done
+    if (old_tool == new_tool)
         return;
 
     // this is an actual toolchange - let's calculate depth to reserve on the wipe tower
@@ -2351,6 +2376,12 @@ void WipeTower2::save_on_last_wipe()
 
         // Which toolchange will finish_layer extrusions be subtracted from?
         int idx = first_toolchange_to_nonsoluble_nonsupport(m_layer_info->tool_changes);
+
+        // MKP: sizing-only tool changes print nothing, so there is no wipe to save onto them and
+        // recomputing would shrink the forced depth back to nothing.
+        if (std::all_of(m_layer_info->tool_changes.begin(), m_layer_info->tool_changes.end(),
+                        [](const WipeTowerInfo::ToolChange &tch) { return tch.fake; }))
+            continue;
 
         if (idx == -1) {
             // In this case, finish_layer will be called at the very beginning.
@@ -2445,6 +2476,8 @@ static WipeTower::ToolChangeResult merge_tcr(WipeTower::ToolChangeResult& first,
     out.extrusions.insert(out.extrusions.end(), second.extrusions.begin(), second.extrusions.end());
     out.end_pos = second.end_pos;
     out.wipe_path = second.wipe_path;
+    if (second.mkp_grid_refill)
+        out.mkp_grid_refill = second.mkp_grid_refill;
     out.initial_tool = first.initial_tool;
     out.new_tool = second.new_tool;
     return out;
@@ -2462,6 +2495,9 @@ void WipeTower2::compute_wall_skip_points()
     for (size_t layer_id = 0; layer_id < m_plan.size(); ++layer_id) {
         float depth_traversed = 0.f;
         for (const auto& toolchange : m_plan[layer_id].tool_changes) {
+            // MKP: a sizing-only change purges nothing, so it must not cut an entry gap into the wall.
+            if (toolchange.fake)
+                continue;
             m_wall_skip_points[layer_id].emplace_back(
                 toolchange_entry_pos(depth_traversed, toolchange.ramming_depth, layer_id == m_first_layer_idx));
             depth_traversed += toolchange.required_depth;
@@ -2479,6 +2515,44 @@ void WipeTower2::generate(std::vector<std::vector<WipeTower::ToolChangeResult>> 
     // Before planning: the layer heights this rewrites feed the extrusion flow of every later pass.
     if (m_sparse_layers_combined)
         combine_sparse_wipe_tower_plan(m_plan, m_filpar, m_first_layer_idx, m_current_tool);
+
+    // MKP: a full-height tower for a single-material print has no tool change at all, so
+    // plan_tower() derives a zero depth and the tower collapses. Do not invent a geometry: give
+    // every tool-change-free layer one sizing-only tool change that carries exactly the purge
+    // volume the native planner needs for the height table's minimum depth, then let
+    // set_toolchange() / plan_tower() / the rib and brim code derive everything from it, exactly
+    // as they do for a real tower. The change is flagged fake: generate() emits no ram or purge
+    // for it, so the tower body stays the hollow wall the user asked for.
+    if (m_mkp_full_height) {
+        // Nothing really enters or leaves the tower, so there is no entry point to open the wall
+        // for: cutting one would leave the wall as broken arcs.
+        m_use_gap_wall = false;
+        const float target_depth = m_plan.empty() ? 0.f : WipeTower::get_limit_depth_by_height(m_plan.back().z);
+        if (target_depth > EPSILON) {
+            if (m_first_layer_idx == size_t(-1))
+                m_first_layer_idx = 0;
+            for (size_t layer_idx = 0; layer_idx < m_plan.size(); ++layer_idx) {
+                WipeTower2::WipeTowerInfo& layer = m_plan[layer_idx];
+                if (! layer.tool_changes.empty())
+                    continue;
+                const bool first_layer = (layer_idx == 0);
+                const float width = m_wipe_tower_width - 3.f * m_perimeter_width;
+                float lo = 0.f;
+                float hi = std::max(1.f, width * target_depth * layer.height * 4.f);
+                for (int it = 0; it < 24; ++it) {
+                    const float mid = 0.5f * (lo + hi);
+                    if (set_toolchange(m_current_tool, m_current_tool, layer.height, mid, first_layer).required_depth < target_depth)
+                        lo = mid;
+                    else
+                        hi = mid;
+                }
+                WipeTower2::WipeTowerInfo::ToolChange toolchange =
+                    set_toolchange(m_current_tool, m_current_tool, layer.height, hi, first_layer);
+                toolchange.fake = true;
+                layer.tool_changes.push_back(toolchange);
+            }
+        }
+    }
 
 	plan_tower();
 #if 1
@@ -2499,10 +2573,13 @@ void WipeTower2::generate(std::vector<std::vector<WipeTower::ToolChangeResult>> 
         if (max_depth > EPSILON) {
             m_wipe_tower_width = align_ceil(std::sqrt(max_depth * m_wipe_tower_width), m_perimeter_width);
             for (size_t idx = 0; idx < m_plan.size(); ++idx)
-                for (auto& toolchange : m_plan[idx].tool_changes)
+                for (auto& toolchange : m_plan[idx].tool_changes) {
+                    const bool fake = toolchange.fake;
                     toolchange = set_toolchange(toolchange.old_tool, toolchange.new_tool,
                                                 m_plan[idx].height, toolchange.wipe_volume,
                                                 idx == m_first_layer_idx);
+                    toolchange.fake = fake;
+                }
             plan_tower();
         }
 
@@ -2540,8 +2617,16 @@ void WipeTower2::generate(std::vector<std::vector<WipeTower::ToolChangeResult>> 
 
     m_old_temperature = -1; // reset last temperature written in the gcode
 
-	for (const WipeTower2::WipeTowerInfo& layer : m_plan)
+	BOOST_LOG_TRIVIAL(info) << "MKPDBG wipertower2 plan=" << m_plan.size()
+	                        << " depth=" << m_wipe_tower_depth << " height=" << m_wipe_tower_height;
+	for (size_t layer_idx = 0; layer_idx < m_plan.size(); ++layer_idx)
 	{
+        // MKP: on a forced full-height tower the layers without a tool change have nothing to
+        // purge into, so their planned depth is zero and the tower collapses into a single
+        // perimeter sliver. Print the full planned depth instead; the head changes inserted
+        // after slicing then have a real body to purge onto, and the tower ends level with the
+        // model.
+        const WipeTower2::WipeTowerInfo& layer = m_plan[layer_idx];
         std::vector<WipeTower::ToolChangeResult> layer_result;
         set_layer(layer.z, layer.height, 0, false/*layer.z == m_plan.front().z*/, layer.z == m_plan.back().z);
         m_internal_rotation += 180.f;
@@ -2549,7 +2634,13 @@ void WipeTower2::generate(std::vector<std::vector<WipeTower::ToolChangeResult>> 
         if (m_layer_info->depth < m_wipe_tower_depth - m_perimeter_width)
 			m_y_shift = (m_wipe_tower_depth-m_layer_info->depth-m_perimeter_width)/2.f;
 
-        int idx = first_toolchange_to_nonsoluble_nonsupport(layer.tool_changes);
+        // MKP: a layer whose tool changes are all sizing-only prints no purge at all - just the
+        // hollow wall/brim, finished before any tool change would have run.
+        const bool only_fake_tool_changes = ! layer.tool_changes.empty() &&
+            std::all_of(layer.tool_changes.begin(), layer.tool_changes.end(),
+                        [](const WipeTower2::WipeTowerInfo::ToolChange &tch) { return tch.fake; });
+
+        int idx = only_fake_tool_changes ? -1 : first_toolchange_to_nonsoluble_nonsupport(layer.tool_changes);
         WipeTower::ToolChangeResult finish_layer_tcr;
 
         if (idx == -1) {
@@ -2560,6 +2651,8 @@ void WipeTower2::generate(std::vector<std::vector<WipeTower::ToolChangeResult>> 
         }
 
         for (int i=0; i<int(layer.tool_changes.size()); ++i) {
+            if (layer.tool_changes[i].fake)
+                continue;
             layer_result.emplace_back(tool_change(layer.tool_changes[i].new_tool));
             if (i == idx) // finish_layer will be called after this toolchange
                 finish_layer_tcr = finish_layer();

@@ -1013,6 +1013,10 @@ void Tab::decorate()
             else
                 color = &m_modified_label_clr;
         }
+        // MKPSpectrum: mkp_ 自定义选项在预设里天生就与系统值不同，按原生规则会涂成近白色，
+        // 同一面板里就会出现“亮白 + 灰”两种字色。这里统一压成系统色，只有未保存的改动才变橙。
+        if (color == &m_default_text_clr && opt.first.rfind("mkp_", 0) == 0)
+            color = &m_sys_label_clr;
         if ((opt.second & osInitValue) != 0)
         {
             is_modified_value = false;
@@ -3236,6 +3240,8 @@ void TabPrint::build()
         optgroup->append_single_option_line("slow_down_layers", "speed_settings_initial_layer_speed#number-of-slow-layers");
         optgroup = page->new_optgroup(L("Other layers speed"), L"param_speed", 15);
         optgroup->append_single_option_line("outer_wall_speed", "speed_settings_other_layers_speed#outer-wall", 0);
+        optgroup->append_single_option_line("mkp_outer_wall_linear_speed");
+        optgroup->append_single_option_line("mkp_outer_wall_speed_min");
         optgroup->append_single_option_line("inner_wall_speed", "speed_settings_other_layers_speed#inner-wall", 0);
         optgroup->append_single_option_line("small_perimeter_speed", "speed_settings_other_layers_speed#small-perimeters", 0);
         optgroup->append_single_option_line("small_perimeter_threshold", "speed_settings_other_layers_speed#small-perimeters-threshold", 0);
@@ -3371,6 +3377,8 @@ void TabPrint::build()
     page = add_options_page(L("Multimaterial"), "custom-gcode_multi_material"); // ORCA: icon only visible on placeholders
         optgroup = page->new_optgroup(L("Prime tower"), L"param_tower");
         optgroup->append_single_option_line("enable_prime_tower", "multimaterial_settings_prime_tower");
+        // MKP: the tower is kept on single-filament plates for the inkjet workflow.
+        optgroup->append_single_option_line("mkp_full_height_prime_tower", "multimaterial_settings_prime_tower");
         optgroup->append_single_option_line("prime_tower_skip_points", "multimaterial_settings_prime_tower#skip-points");
         optgroup->append_single_option_line("enable_tower_interface_features", "multimaterial_settings_prime_tower#enable-tower-interface-features");
         optgroup->append_single_option_line("enable_tower_interface_cooldown_during_tower", "multimaterial_settings_prime_tower#cool-down-from-interface-boost-during-prime-tower");
@@ -3427,6 +3435,38 @@ void TabPrint::build()
         optgroup->append_single_option_line("interlocking_depth", "multimaterial_settings_advanced#interlocking-depth");
         optgroup->append_single_option_line("interlocking_boundary_avoidance", "multimaterial_settings_advanced#interlocking-boundary-avoidance");
 
+    page = add_options_page(from_u8("喷墨"), "custom-gcode_other"); // MKPSpectrum: inkjet process page
+        optgroup = page->new_optgroup(from_u8("表面处理"), L"param_special");
+        optgroup->append_single_option_line("mkp_surface_enabled");
+        optgroup->append_single_option_line("mkp_surface_speed");
+        optgroup->append_single_option_line("mkp_surface_wall_speed");
+        optgroup->append_single_option_line("mkp_surface_linear_speed");
+        optgroup->append_single_option_line("mkp_surface_speed_min");
+        optgroup->append_single_option_line("mkp_surface_speed_max");
+        optgroup->append_single_option_line("mkp_surface_inner_walls");
+        optgroup->append_single_option_line("mkp_surface_pattern");
+        optgroup->append_single_option_line("mkp_surface_line_spacing");
+
+        optgroup = page->new_optgroup(from_u8("喷墨"), L"param_special");
+        optgroup->append_single_option_line("mkp_inkjet_density");
+        optgroup->append_single_option_line("mkp_inkjet_speed");
+        optgroup->append_single_option_line("mkp_inkjet_retract_length");
+        optgroup->append_single_option_line("mkp_inkjet_recovery_length");
+        optgroup->append_single_option_line("mkp_inkjet_flush_mode");
+        optgroup->append_single_option_line("mkp_inkjet_flush_interval");
+        optgroup->append_single_option_line("mkp_inkjet_repeat");
+        optgroup->append_single_option_line("mkp_inkjet_dry_time");
+        optgroup->append_single_option_line("mkp_inkjet_wall_band");
+
+        optgroup = page->new_optgroup(from_u8("色调调节"), L"param_special");
+        optgroup->append_single_option_line("mkp_inkjet_c");
+        optgroup->append_single_option_line("mkp_inkjet_m");
+        optgroup->append_single_option_line("mkp_inkjet_y");
+        optgroup->append_single_option_line("mkp_inkjet_saturation");
+        optgroup->append_single_option_line("mkp_inkjet_brightness");
+        optgroup->append_single_option_line("mkp_inkjet_contrast");
+        optgroup->append_single_option_line("mkp_inkjet_shear");
+
     page = add_options_page(L("Others"), "custom-gcode_other"); // ORCA: icon only visible on placeholders
         optgroup = page->new_optgroup(L("Skirt"), L"param_skirt");
         optgroup->append_single_option_line("skirt_loops", "others_settings_skirt#loops");
@@ -3478,6 +3518,7 @@ void TabPrint::build()
         optgroup->append_single_option_line("fuzzy_skin_ripple_offset", "others_settings_fuzzy_skin#ripple-offset");
         optgroup->append_single_option_line("fuzzy_skin_layers_between_ripple_offset", "others_settings_fuzzy_skin#layers-between-ripple-offset");
         optgroup->append_single_option_line("fuzzy_skin_first_layer", "others_settings_fuzzy_skin#apply-fuzzy-skin-to-first-layer");
+
 
         optgroup = page->new_optgroup(L("G-code output"), L"param_gcode");
         optgroup->append_single_option_line("reduce_infill_retraction", "others_settings_g_code_output#reduce-infill-retraction");
@@ -3572,6 +3613,20 @@ void TabPrint::update_description_lines()
 void TabPrint::toggle_options()
 {
     if (!m_active_page) return;
+    if (m_config->has("mkp_outer_wall_linear_speed")) {
+        toggle_line("mkp_outer_wall_speed_min", m_config->opt_bool("mkp_outer_wall_linear_speed"));
+        if (m_active_page->get_line("mkp_outer_wall_speed_min"))
+            m_active_page->update_visibility(m_mode, true);
+    }
+    if (m_config->has("mkp_surface_linear_speed")) {
+        const bool linear = m_config->opt_bool("mkp_surface_linear_speed");
+        toggle_option("mkp_surface_speed", !linear, -1, from_u8("线性处理速度已启用"));
+        toggle_option("mkp_surface_wall_speed", !linear, -1, from_u8("线性处理速度已启用"));
+        toggle_line("mkp_surface_speed_min", linear);
+        toggle_line("mkp_surface_speed_max", linear);
+        if (m_active_page->get_line("mkp_surface_speed_min"))
+            m_active_page->update_visibility(m_mode, true);
+    }
     // BBS: whether the preset is Bambu Lab printer
     if (m_preset_bundle) {
         bool is_BBL_printer = wxGetApp().preset_bundle->is_bbl_vendor();
@@ -3671,6 +3726,27 @@ void TabPrint::update()
         return; // ys_FIXME
 
     m_update_cnt++;
+
+    // Older projects may lack newly added process options needed by this tab's fields.
+    // Seed only process keys: on_config_changed forwards this partial config to the plater,
+    // so adding printer defaults here would overwrite the selected printer's bed geometry.
+    {
+        const FullPrintConfig& build_defaults = FullPrintConfig::defaults();
+        bool                    seeded        = false;
+        for (const t_config_option_key& default_key : Preset::print_options())
+            if (!m_config->has(default_key)) {
+                if (const ConfigOption* default_value = build_defaults.option(default_key)) {
+                    m_config->set_key_value(default_key, default_value->clone());
+                    seeded = true;
+                }
+            }
+        // The seeding is a crash guard, not an edit: it must not turn the project into "unsaved
+        // changes", or every close of a project saved by an older build asks whether to keep them.
+        // It only ever fires on the first refresh after such a project is loaded, and that is
+        // exactly when the saved-state baseline should be re-taken.
+        if (seeded)
+            wxGetApp().plater()->reset_project_dirty_initial_presets();
+    }
 
     // ysFIXME: It's temporary workaround and should be clewer reworked:
     // Note: This workaround works till "enable_support" and "overhangs" is exclusive sets of mutually no-exclusive parameters.
@@ -5512,8 +5588,33 @@ void TabPrinter::build_fff()
         optgroup->append_single_option_line("z_offset", "printer_basic_information_printable_space#z-offset");
         optgroup->append_single_option_line("preferred_orientation", "printer_basic_information_printable_space#preferred-orientation");
 
+        optgroup = page->new_optgroup(from_u8("喷墨偏移"), L"param_printable_space");
+        optgroup->append_single_option_line("mkp_inkjet_offset_x");
+        optgroup->append_single_option_line("mkp_inkjet_offset_y");
+        optgroup->append_single_option_line("mkp_inkjet_offset_z");
+        optgroup = page->new_optgroup(from_u8("笔刷偏移"), L"param_printable_space");
+        optgroup->append_single_option_line("mkp_brush_offset_x");
+        optgroup->append_single_option_line("mkp_brush_offset_y");
+        optgroup->append_single_option_line("mkp_brush_offset_z");
+
+        optgroup = page->new_optgroup(from_u8("绘图笔偏移"), L"param_printable_space");
+        optgroup->append_single_option_line("mkp_pen_offset_x");
+        optgroup->append_single_option_line("mkp_pen_offset_y");
+        optgroup->append_single_option_line("mkp_pen_offset_z");
+
+        optgroup = page->new_optgroup(from_u8("拖刀偏移"), L"param_printable_space");
+        optgroup->append_single_option_line("mkp_knife_offset_x");
+        optgroup->append_single_option_line("mkp_knife_offset_y");
+        optgroup->append_single_option_line("mkp_knife_offset_z");
+
+        optgroup = page->new_optgroup(from_u8("激光偏移"), L"param_printable_space");
+        optgroup->append_single_option_line("mkp_laser_offset_x");
+        optgroup->append_single_option_line("mkp_laser_offset_y");
+        optgroup->append_single_option_line("mkp_laser_offset_z");
+
         optgroup = page->new_optgroup(L("Advanced"), L"param_advanced");
 
+        optgroup->append_single_option_line("mkp_inkjet_device");
         optgroup->append_single_option_line("printer_structure", "printer_basic_information_advanced#printer-structure");
         optgroup->append_single_option_line("gcode_flavor", "printer_basic_information_advanced#g-code-flavor");
         optgroup->append_single_option_line("gcode_skip_config_block", "printer_basic_information_advanced#skip-g-code-config-block");
@@ -5788,6 +5889,50 @@ void TabPrinter::build_fff()
         option.opt.is_code = true;
         option.opt.height = gcode_field_height;//150;
         optgroup->append_single_option_line(option, "printer_machine_gcode#template-custom-g-code");
+
+        optgroup = page->new_optgroup(from_u8("取得笔刷 G-code"), L"param_gcode", 0);
+        optgroup->m_on_change = [this, &optgroup_title = optgroup->title](const t_config_option_key& opt_key, const boost::any& value) {
+            validate_custom_gcode_cb(this, optgroup_title, opt_key, value);
+        };
+        optgroup->edit_custom_gcode = edit_custom_gcode_fn;
+        option = optgroup->get_option("mkp_grab_brush_gcode");
+        option.opt.full_width = true;
+        option.opt.is_code = true;
+        option.opt.height = gcode_field_height;
+        optgroup->append_single_option_line(option);
+
+        optgroup = page->new_optgroup(from_u8("放回笔刷 G-code"), L"param_gcode", 0);
+        optgroup->m_on_change = [this, &optgroup_title = optgroup->title](const t_config_option_key& opt_key, const boost::any& value) {
+            validate_custom_gcode_cb(this, optgroup_title, opt_key, value);
+        };
+        optgroup->edit_custom_gcode = edit_custom_gcode_fn;
+        option = optgroup->get_option("mkp_release_brush_gcode");
+        option.opt.full_width = true;
+        option.opt.is_code = true;
+        option.opt.height = gcode_field_height;
+        optgroup->append_single_option_line(option);
+
+        optgroup = page->new_optgroup(from_u8("取得喷墨头 G-code"), L"param_gcode", 0);
+        optgroup->m_on_change = [this, &optgroup_title = optgroup->title](const t_config_option_key& opt_key, const boost::any& value) {
+            validate_custom_gcode_cb(this, optgroup_title, opt_key, value);
+        };
+        optgroup->edit_custom_gcode = edit_custom_gcode_fn;
+        option = optgroup->get_option("mkp_grab_inkjet_gcode");
+        option.opt.full_width = true;
+        option.opt.is_code = true;
+        option.opt.height = gcode_field_height;
+        optgroup->append_single_option_line(option);
+
+        optgroup = page->new_optgroup(from_u8("放回喷墨头 G-code"), L"param_gcode", 0);
+        optgroup->m_on_change = [this, &optgroup_title = optgroup->title](const t_config_option_key& opt_key, const boost::any& value) {
+            validate_custom_gcode_cb(this, optgroup_title, opt_key, value);
+        };
+        optgroup->edit_custom_gcode = edit_custom_gcode_fn;
+        option = optgroup->get_option("mkp_release_inkjet_gcode");
+        option.opt.full_width = true;
+        option.opt.is_code = true;
+        option.opt.height = gcode_field_height;
+        optgroup->append_single_option_line(option);
 
     page = add_options_page(L("Notes"), "custom-gcode_note"); // ORCA: icon only visible on placeholders
         optgroup = page->new_optgroup(L("Notes"), "note", 0);

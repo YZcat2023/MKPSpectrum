@@ -1541,7 +1541,7 @@ void UnsavedChangesDialog::update_tree(Preset::Type type, DynamicConfig * config
             // Orca: Every transferred setting must remain visible even when it is absent from the search index.
             const ConfigOptionDef* def = print_config_def.get(opt_key);
             const std::string label = def ? (def->full_label.empty() ? def->label : def->full_label) : std::string();
-            option.label_local = (label.empty() ? from_u8(opt_key) : _L(label)).ToStdWstring();
+            option.label_local = (label.empty() ? from_u8(opt_key) : from_u8(label)).ToStdWstring();
             option.category_local = (def && !def->category.empty() ?
                 Tab::translate_category(from_u8(def->category), type) : _L("Others")).ToStdWstring();
         }

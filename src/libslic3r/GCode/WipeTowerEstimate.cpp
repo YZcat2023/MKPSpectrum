@@ -53,6 +53,12 @@ bool prime_tower_is_printed(const ConfigBase &config, int used_filaments, int nu
     const bool enable_wrapping = wrapping != nullptr && wrapping->value;
     if (smooth_timelapse || enable_wrapping)
         return true;
+    // MKP: the forced full-height tower prints on a single filament too. Print::has_wipe_tower()
+    // already answers yes for it; this predicate has to agree, otherwise the GUI sizes the tower
+    // as zero and never clamps a position that the slicer then rejects as off the bed.
+    const auto *mkp_full = config.option<ConfigOptionBool>("mkp_full_height_prime_tower");
+    if (mkp_full != nullptr && mkp_full->value)
+        return true;
 
     const ConfigOption *sequence = option_of(config, "print_sequence");
     const bool by_object = sequence != nullptr && sequence->getInt() == int(PrintSequence::ByObject);
@@ -149,7 +155,7 @@ WipeTowerFootprint estimate_wipe_tower_footprint(const ConfigBase &config, WipeT
     const bool   wrapping         = opt_bool("enable_wrapping_detection");
     // Reasons a tower is printed with no tool change to purge for: the ones that stop
     // normalize_fdm_2 clearing enable_prime_tower. Its mixed-filament case is not modelled.
-    const bool   need_wipe_tower  = smooth_timelapse || wrapping;
+    const bool   need_wipe_tower  = smooth_timelapse || wrapping || opt_bool("mkp_full_height_prime_tower");
 
     // Fewer than two filaments cannot make a tool change, so only wrapping detection or smooth
     // timelapse print a tower then. The flush volume is no proof of one: it is read from the

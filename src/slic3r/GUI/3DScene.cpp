@@ -37,6 +37,8 @@
 #include "libslic3r/Point.hpp"
 #include "slic3r/GUI/ImGuiWrapper.hpp"
 #include "libslic3r/Model.hpp"
+#include "libslic3r/TexturePainting.hpp"
+#include "libslic3r/TextureDisplacement.hpp"
 #include "libslic3r/Technologies.hpp"
 #include <optional>
 #include "slic3r/GUI/OpenGLManager.hpp"
@@ -812,6 +814,34 @@ void GLVolume::simple_render(GLShaderProgram* shader, ModelObjectPtrs& model_obj
         glFrontFace(GL_CCW);
 }
 
+// Draws the volume's own texture. The caller has "model_texture" bound and its view / projection /
+// normal matrix and tint set; this only walks the per-image groups.
+void GLVolume::render_texture_display(GLShaderProgram *shader, const ColorRGBA &tint) const
+{
+    if (shader == nullptr)
+        return;
+
+    glsafe(::glActiveTexture(GL_TEXTURE0));
+    shader->set_uniform("uniform_texture", 0);
+    // GLModel::render() writes "uniform_color" from the display mesh's own colour on every draw,
+    // and that mesh carries the default (black) one. The tint therefore lives in its own uniform,
+    // which nothing else writes, so the picture is not multiplied by black.
+    shader->set_uniform("uniform_tint", tint);
+    for (const std::unique_ptr<TextureDisplay> &display : texture_display) {
+        if (!display || !display->model.is_initialized())
+            continue;
+        const unsigned int texture_id = display->texture.get_id();
+        if (texture_id == 0)
+            continue;
+        glsafe(::glBindTexture(GL_TEXTURE_2D, texture_id));
+        if (tverts_range == std::make_pair<size_t, size_t>(0, -1))
+            display->model.render(shader);
+        else
+            display->model.render(this->tverts_range, shader);
+        glsafe(::glBindTexture(GL_TEXTURE_2D, 0));
+    }
+}
+
 bool GLVolume::is_sla_support() const { return this->composite_id.volume_id == -int(slaposSupportTree); }
 bool GLVolume::is_sla_pad() const { return this->composite_id.volume_id == -int(slaposPad); }
 
@@ -892,6 +922,113 @@ std::vector<int> GLVolumeCollection::load_object(
 }
 
 
+// Builds the textured draw data for a volume that arrived with its own picture
+// (ModelVolume::display_texture). Faces are grouped by the image they sample so each group draws
+// with one texture bound; a face whose material carried no image gets a one-pixel texture of the
+// material's base colour, so the whole volume shows instead of only its mapped parts.
+static void build_texture_display(GLVolume &volume, const ModelVolume &model_volume)
+{
+    const TextureDisplayData    &disp = *model_volume.display_texture;
+    const indexed_triangle_set  &its  = model_volume.mesh().its;
+    // The layout is indexed by triangle, so it only means anything against the mesh it was
+    // measured on - the OBJ the volume was just built from.
+    if (its.indices.empty() || disp.face_uv.size() != its.indices.size()) {
+        BOOST_LOG_TRIVIAL(warning) << "texture display: " << disp.face_uv.size() << " face uvs against "
+                                   << its.indices.size() << " triangles, drawing filament colours instead";
+        return;
+    }
+
+    std::vector<Vec3f> vertex_normals = texture_displacement_vertex_normals(its);
+    if (vertex_normals.size() != its.vertices.size())
+        vertex_normals.clear(); // fall back to per-face normals below
+
+    std::vector<std::vector<int>>            by_image(disp.images.size());
+    // Faces with no image map, keyed by their 8-bit fallback albedo so equal colours share a group.
+    std::map<unsigned int, std::vector<int>> by_color;
+    for (size_t fi = 0; fi < its.indices.size(); ++fi) {
+        const int img = disp.face_image[fi];
+        if (img >= 0 && size_t(img) < disp.images.size()) {
+            by_image[size_t(img)].push_back(int(fi));
+        } else {
+            const std::array<float, 3> c  = fi < disp.face_rgb.size() ? disp.face_rgb[fi]
+                                                                     : std::array<float, 3>{0.8f, 0.8f, 0.8f};
+            const unsigned int key = (unsigned int(std::clamp(c[0], 0.f, 1.f) * 255.f + 0.5f) << 16) |
+                                     (unsigned int(std::clamp(c[1], 0.f, 1.f) * 255.f + 0.5f) << 8)  |
+                                      unsigned int(std::clamp(c[2], 0.f, 1.f) * 255.f + 0.5f);
+            by_color[key].push_back(int(fi));
+        }
+    }
+
+    auto emit_group = [&](const std::vector<int> &faces, const unsigned char *rgb, int w, int h) {
+        if (faces.empty() || rgb == nullptr || w <= 0 || h <= 0)
+            return;
+        auto display = std::make_unique<GLVolume::TextureDisplay>();
+        {
+            std::vector<unsigned char> rgba(size_t(w) * size_t(h) * 4);
+            for (size_t p = 0, q = 0; q < rgba.size(); p += 3, q += 4) {
+                rgba[q]     = rgb[p];
+                rgba[q + 1] = rgb[p + 1];
+                rgba[q + 2] = rgb[p + 2];
+                rgba[q + 3] = 255;
+            }
+            // No mipmap chain for a 1x1 fallback: MIN_FILTER would then ask for a level that does
+            // not exist and the texture would sample as black.
+            const bool use_mipmaps = w > 1 || h > 1;
+            if (!display->texture.load_from_raw_data(std::move(rgba), (unsigned int) w, (unsigned int) h, false, use_mipmaps))
+                return;
+            // Clamp rather than repeat: an island's uv may sit a hair outside [0,1] after rounding,
+            // and repeating would sample the opposite edge of the image there.
+            glsafe(::glBindTexture(GL_TEXTURE_2D, display->texture.get_id()));
+            glsafe(::glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE));
+            glsafe(::glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE));
+            glsafe(::glBindTexture(GL_TEXTURE_2D, 0));
+        }
+
+        GUI::GLModel::Geometry data;
+        data.format = { GUI::GLModel::Geometry::EPrimitiveType::Triangles, GUI::GLModel::Geometry::EVertexLayout::P3N3T2 };
+        // White: GLModel::render() pushes this into "uniform_color" on every draw, and the
+        // texture program ignores that name, but a black value here would confuse any other
+        // program that ever draws this mesh.
+        data.color = ColorRGBA(1.f, 1.f, 1.f, 1.f);
+        data.reserve_vertices(faces.size() * 3);
+        data.reserve_indices(faces.size() * 3);
+        for (int fi : faces) {
+            const Vec3i32 &face = its.indices[fi];
+            Vec3f          face_normal = Vec3f::UnitZ();
+            if (vertex_normals.empty()) {
+                const Vec3f e1 = its.vertices[face[1]] - its.vertices[face[0]];
+                const Vec3f e2 = its.vertices[face[2]] - its.vertices[face[0]];
+                const float len = e1.cross(e2).norm();
+                if (len > 0.f)
+                    face_normal = e1.cross(e2) / len;
+            }
+            const unsigned int base = (unsigned int) data.vertices_count();
+            for (int k = 0; k < 3; ++k) {
+                const Vec3f normal = vertex_normals.empty() ? face_normal : vertex_normals[face[k]];
+                data.add_vertex(its.vertices[face[k]], normal,
+                                Vec2f{ disp.face_uv[fi][k][0], disp.face_uv[fi][k][1] });
+            }
+            data.add_triangle(base, base + 1, base + 2);
+        }
+        display->model.init_from(std::move(data));
+        if (display->model.is_initialized())
+            volume.texture_display.push_back(std::move(display));
+    };
+
+    for (size_t img = 0; img < by_image.size(); ++img) {
+        const TextureDisplayData::Image &image = disp.images[img];
+        if (image.rgb.size() < size_t(image.width) * size_t(image.height) * 3)
+            continue; // nothing decoded for this material
+        emit_group(by_image[img], image.rgb.data(), image.width, image.height);
+    }
+    for (const auto &group : by_color) {
+        const unsigned char rgb[3] = { (unsigned char) ((group.first >> 16) & 0xFF),
+                                       (unsigned char) ((group.first >> 8) & 0xFF),
+                                       (unsigned char) (group.first & 0xFF) };
+        emit_group(group.second, rgb, 1, 1);
+    }
+}
+
 int GLVolumeCollection::load_object_volume(
     const ModelObject   *model_object,
     int                  obj_idx,
@@ -916,6 +1053,10 @@ int GLVolumeCollection::load_object_volume(
     v.name = model_volume->name;
 
     v.model.init_from(*mesh);
+    // A volume that came in with its own texture is drawn as the file looks; the geometric model
+    // stays as it is, so picking, the convex hull and the outline pass are unaffected.
+    if (model_volume->display_texture)
+        build_texture_display(v, *model_volume);
     if (need_raycaster) { v.mesh_raycaster = std::make_unique<GUI::MeshRaycaster>(mesh); }
     v.composite_id = GLVolume::CompositeID(obj_idx, volume_idx, instance_idx);
 
@@ -1249,6 +1390,11 @@ void GLVolumeCollection::render(GLVolumeCollection::ERenderType       type,
     // default sampler unit 0, which can conflict with other sampler types.
     shader->set_uniform("depth_tex", OUTLINE_DEPTH_TEX_UNIT);
 
+    // Preview shell height ramp: inert (z_low > z_high) for every collection but the one the
+    // G-code viewer's shell pass is drawing, see set_shell_alpha_ramp().
+    shader->set_uniform("shell_alpha_z", m_shell_alpha_z);
+    shader->set_uniform("shell_alpha", m_shell_alpha);
+
     // Compute up direction accounting for build plate tilt. This is frame-invariant
     // (config cannot change mid-render), so compute it once before the volume loop.
     const Vec3f up_direction = GUI::build_plate_tilt_up_direction().cast<float>();
@@ -1349,6 +1495,115 @@ void GLVolumeCollection::render(GLVolumeCollection::ERenderType       type,
         shader->set_uniform("projection_matrix", projection_matrix);
         const Matrix3d view_normal_matrix = view_matrix.matrix().block(0, 0, 3, 3) * model_matrix.matrix().block(0, 0, 3, 3).inverse().transpose();
         shader->set_uniform("view_normal_matrix", view_normal_matrix);
+        // A volume carrying its own texture is drawn by its own program: the same lighting model and
+        // the same matrices, but the albedo is the file's image rather than the filament colour. Any
+        // state that program does not use (clipping, slope, printable heights) is simply not set.
+        if (volume.first->has_texture_display() && type == ERenderType::Opaque && !volume.first->picking) {
+            if (GLShaderProgram *texture_shader = GUI::wxGetApp().get_shader("model_texture"); texture_shader != nullptr) {
+                // A selected volume gets a glowing rim around the picture. The silhouette outline of
+                // the ordinary shader (see render_with_outline) cannot be reused here: its band is
+                // drawn inside the inflated contour, and the picture - drawn afterwards so that it
+                // wins over the paint - would simply paint over it, which left the selection hardly
+                // visible on a textured part. Instead the stencil buffer keeps the silhouette of the
+                // picture itself, and the picture is then drawn again a couple of pixels apart in
+                // additive light, which reads as a halo and never covers the image.
+                const bool draw_glow = volume.first->selected && GUI::wxGetApp().show_outline();
+                if (draw_glow) {
+                    glsafe(::glEnable(GL_STENCIL_TEST));
+                    glsafe(::glStencilMask(0xFF));
+                    glsafe(::glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE));
+                    glsafe(::glStencilFunc(GL_ALWAYS, 0xFF, 0xFF));
+                    glsafe(::glClearStencil(0));
+                    glsafe(::glClear(GL_STENCIL_BUFFER_BIT));
+                }
+
+                // The ordinary pass paints the surface (and, while the stencil test is on, marks
+                // where the part is). The picture is then drawn over that paint.
+                volume.first->render();
+
+                // The second, identical draw must not rewrite the stencil the glow depends on.
+                if (draw_glow)
+                    glsafe(::glStencilMask(0x00));
+
+                // The texture pass re-draws the same triangles over the paint above, so it
+                // compares equal against the depth they left behind - not less.
+                glsafe(::glDepthFunc(GL_LEQUAL));
+                shader->stop_using();
+                texture_shader->start_using();
+                texture_shader->set_uniform("is_outline", false);
+                texture_shader->set_uniform("volume_world_matrix", volume.first->world_matrix());
+                texture_shader->set_uniform("shell_alpha_z", m_shell_alpha_z);
+                texture_shader->set_uniform("shell_alpha", m_shell_alpha);
+                texture_shader->set_uniform("view_model_matrix", view_matrix * model_matrix);
+                texture_shader->set_uniform("projection_matrix", projection_matrix);
+                texture_shader->set_uniform("view_normal_matrix", view_normal_matrix);
+                volume.first->render_texture_display(texture_shader,
+                    ColorRGBA(1.f, 1.f, 1.f, volume.first->render_color.a()));
+
+                if (draw_glow) {
+                    // Three copies at growing offsets, each only where the stencil says "outside the
+                    // part", added over the scene: the rim fades away instead of ending in a line.
+                    // Depth writes are off so the halo does not affect anything drawn later, and the
+                    // depth test stays on so a part behind another one keeps its halo hidden.
+                    const bool blend_was_on = ::glIsEnabled(GL_BLEND) == GL_TRUE;
+                    glsafe(::glEnable(GL_BLEND));
+                    glsafe(::glBlendFunc(GL_SRC_ALPHA, GL_ONE));
+                    glsafe(::glDepthMask(GL_FALSE));
+                    glsafe(::glStencilFunc(GL_NOTEQUAL, 0xFF, 0xFF));
+                    texture_shader->set_uniform("is_outline", true);
+                    texture_shader->set_uniform("screen_size", Vec2f{float(cnv_size.get_width()), float(cnv_size.get_height())});
+                    // Warm white, so it reads as light on the dark background rather than as a
+                    // second outline of a colour the picture may already contain.
+                    const ColorRGBA glow_color{1.f, 0.93f, 0.78f, 1.f};
+                    static const float glow_rings[][2] = {{1.5f, 0.90f}, {3.0f, 0.60f}, {5.0f, 0.35f}, {8.0f, 0.15f}};
+                    for (const float *ring : glow_rings) {
+                        texture_shader->set_uniform("outline_px", ring[0]);
+                        volume.first->render_texture_display(texture_shader,
+                            ColorRGBA(glow_color.r(), glow_color.g(), glow_color.b(), ring[1]));
+                    }
+                    texture_shader->set_uniform("is_outline", false);
+                    glsafe(::glDepthMask(GL_TRUE));
+                    if (!blend_was_on)
+                        glsafe(::glDisable(GL_BLEND));
+                    glsafe(::glStencilMask(0xFF));
+                    glsafe(::glDisable(GL_STENCIL_TEST));
+                }
+
+                texture_shader->stop_using();
+                shader->start_using();
+                glsafe(::glDepthFunc(GL_LESS));
+                glsafe(::glBindBuffer(GL_ARRAY_BUFFER, 0));
+                glsafe(::glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0));
+                continue;
+            }
+        }
+        // The Preview page draws the model itself as a translucent shell (GCodeViewer::render_shells()).
+        // That pass is Transparent, so a volume carrying its own picture has to be drawn here too:
+        // the same program and matrices as the opaque pass, with the shell's alpha carried in the
+        // tint. Without this the shell keeps the filament colour and the imported texture only shows
+        // on the Prepare page.
+        if (volume.first->has_texture_display() && type == ERenderType::Transparent && !volume.first->picking) {
+            if (GLShaderProgram *texture_shader = GUI::wxGetApp().get_shader("model_texture"); texture_shader != nullptr) {
+                const float alpha = volume.first->render_color.a();
+                if (alpha > 0.001f) {
+                    shader->stop_using();
+                    texture_shader->start_using();
+                    texture_shader->set_uniform("is_outline", false);
+                    texture_shader->set_uniform("volume_world_matrix", volume.first->world_matrix());
+                    texture_shader->set_uniform("shell_alpha_z", m_shell_alpha_z);
+                    texture_shader->set_uniform("shell_alpha", m_shell_alpha);
+                    texture_shader->set_uniform("view_model_matrix", view_matrix * model_matrix);
+                    texture_shader->set_uniform("projection_matrix", projection_matrix);
+                    texture_shader->set_uniform("view_normal_matrix", view_normal_matrix);
+                    volume.first->render_texture_display(texture_shader, ColorRGBA(1.f, 1.f, 1.f, alpha));
+                    texture_shader->stop_using();
+                    shader->start_using();
+                    glsafe(::glBindBuffer(GL_ARRAY_BUFFER, 0));
+                    glsafe(::glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0));
+                    continue;
+                }
+            }
+        }
         if (shade_translucent_filaments) {
             const bool translucent_filament = volume.first->visible && !volume.first->is_modifier && volume.first->color.is_transparent();
             shader->set_uniform("translucent_filament", translucent_filament);

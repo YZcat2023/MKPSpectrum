@@ -60,6 +60,7 @@ namespace cereal {
 namespace Slic3r {
 
 struct TexturedMesh;
+struct TextureDisplayData;
 enum class ConversionType;
 
 class BuildVolume;
@@ -998,6 +999,12 @@ public:
     // where leaving it would map the texture by another mesh's triangle numbering.
     void reset_texture_uv() { texture_uv.clear(); }
 
+    // The texture the file shipped with, laid out for the 3D editor (see TextureDisplayData): the
+    // volume is then drawn the way the file looks, instead of with the printable colours the import
+    // may have derived from the same picture. Display only - nothing here reaches the slicer, and
+    // it is not written into a project - so it lives as long as the session that imported it, and
+    // it is shared between the volumes of one imported object rather than copied per volume.
+    std::shared_ptr<const TextureDisplayData> display_texture;
     // Save painting data before reset_extra_facets() discards it.
     // Used for replacing mesh without losing painting data.
     // Only for model parts (not modifiers/connectors).
@@ -1263,7 +1270,7 @@ private:
         texture_displacement_facets_6(other.texture_displacement_facets_6), texture_displacement_facets_7(other.texture_displacement_facets_7),
         texture_displacement_layers(other.texture_displacement_layers),
         texture_displacement_options(other.texture_displacement_options),
-        texture_uv(other.texture_uv),
+        texture_uv(other.texture_uv), display_texture(other.display_texture),
         cut_info(other.cut_info), text_configuration(other.text_configuration), emboss_shape(other.emboss_shape)
     {
 		assert(this->id().valid());
@@ -1782,7 +1789,8 @@ public:
         std::vector<Preset*>* project_presets = nullptr, bool* is_xxx = nullptr, Semver* file_version = nullptr, Import3mfProgressFn proFn = nullptr,
                                 ImportstlProgressFn        stlFn                = nullptr,
                                 BBLProject *               project              = nullptr,
-                                int                        plate_id             = 0
+                                int                        plate_id             = 0,
+                                const std::function<size_t(size_t)>& choose_triangle_count = {}
                                 );
     // BBS
     static bool    obj_import_vertex_color_deal(const std::vector<unsigned char> &vertex_filament_ids, const unsigned char &first_extruder_id, Model *model);

@@ -29,6 +29,8 @@
 #include "MTUtils.hpp"
 #include "TriangleMeshSlicer.hpp"
 #include "TriangleSelector.hpp"
+#include <opencv2/core/mat.hpp>
+#include <opencv2/imgcodecs.hpp>
 #include "MaterialType.hpp"
 #include "Tesselate.hpp"
 #include "MeshRepair.hpp"
@@ -86,6 +88,7 @@
 // BBS: for segment
 #include "MeshBoolean.hpp"
 #include "Format/3mf.hpp"
+#include "PNGReadWrite.hpp"
 
 // Transtltion
 #include "I18N.hpp"
@@ -308,11 +311,129 @@ static void add_textured_mesh_to_model(Model& model, const TexturedMesh& tex_mes
     for (size_t i = 0; i < tex_mesh.indices.size(); ++i)
         its.indices[i] = Vec3i32(tex_mesh.indices[i][0], tex_mesh.indices[i][1], tex_mesh.indices[i][2]);
 
+    // The file's own uv layout, corner for corner, read *before* the clean-up below: that clean-up
+    // rewrites vertex indices and can drop faces, after which a face index no longer names the same
+    // triangle. TextureProjectionMethod::ModelUV maps a texture-displacement layer through these, so
+    // the ink lands where the picture was authored to be instead of on a fresh projection that tiles
+    // it. glTF/assimp v already runs down the image from row 0, which is what DecodedHeightTexture
+    // samples, so the uvs go in as they are - no flip, unlike the OBJ loader.
+    const size_t       n_faces = its.indices.size();
+    const bool         per_face_uv = tex_mesh.has_face_uvs();
+    std::vector<Vec2f> face_uv;
+    if ((per_face_uv && ! tex_mesh.uv_coords.empty()) || ! tex_mesh.uvs.empty()) {
+        face_uv.resize(n_faces * 3);
+        for (size_t fi = 0; fi < n_faces; ++ fi)
+            for (size_t k = 0; k < 3; ++ k) {
+                Vec2f uv(0.f, 0.f);
+                const int idx = per_face_uv ? tex_mesh.uv_indices[fi][k] : int(its.indices[fi][int(k)]);
+                if (per_face_uv) {
+                    if (idx >= 0 && size_t(idx) < tex_mesh.uv_coords.size())
+                        uv = Vec2f(tex_mesh.uv_coords[size_t(idx)][0], tex_mesh.uv_coords[size_t(idx)][1]);
+                } else if (idx >= 0 && size_t(idx) < tex_mesh.uvs.size())
+                    uv = Vec2f(tex_mesh.uvs[size_t(idx)][0], tex_mesh.uvs[size_t(idx)][1]);
+                face_uv[fi * 3 + k] = uv;
+            }
+    }
+
     its_merge_vertices(its);
     its_remove_degenerate_faces(its);
     its_compactify_vertices(its);
 
     model.add_object(object_name.c_str(), input_file.c_str(), TriangleMesh(std::move(its)));
+
+    if (! face_uv.empty() && ! model.objects.empty() && ! model.objects.back()->volumes.empty()) {
+        ModelVolume &volume = *model.objects.back()->volumes[0];
+        // Only when the clean-up kept every face, so the per-triangle layout still lines up.
+        if (volume.mesh().its.indices.size() == n_faces)
+            volume.texture_uv = std::move(face_uv);
+        else
+            BOOST_LOG_TRIVIAL(warning) << "textured import: " << n_faces << " faces became "
+                                       << volume.mesh().its.indices.size()
+                                       << ", the model uv layout no longer lines up and is dropped";
+    }
+}
+
+// Gives a freshly imported, textured model its inkjet source: which map to spray, how to map it,
+// and which faces are painted. Import has to do this, not the GUI: the same model sliced from the
+// command line has to spray the same picture. A project that already saved painting keeps it.
+void attach_inkjet_texture_source(Model &model)
+{
+    if (! model.texture_mesh || model.texture_mesh->textures.empty())
+        return;
+    const TexturedMesh &textured = *model.texture_mesh;
+    size_t attached = 0;
+    for (ModelObject *object : model.objects)
+        for (ModelVolume *volume : object->volumes) {
+            if (! volume->is_model_part())
+                continue;
+            // Only where the volume still holds the very mesh the layout was measured on.
+            if (volume->mesh().its.indices.size() != textured.indices.size())
+                continue;
+            if (! volume->texture_displacement_layers.empty())
+                continue;
+            int texture_index = -1;
+            if (! textured.material_ids.empty() && textured.material_ids.front() >= 0 &&
+                size_t(textured.material_ids.front()) < textured.material_texture_map.size())
+                texture_index = textured.material_texture_map[size_t(textured.material_ids.front())];
+            if (texture_index < 0 || size_t(texture_index) >= textured.textures.size())
+                texture_index = 0;
+            const TextureImage &image = textured.textures[size_t(texture_index)];
+            if (image.data.empty())
+                continue;
+            auto ink_image = std::make_shared<std::vector<unsigned char>>();
+            if (png::is_decodable_8bit_png(png::ReadBuf{ image.data.data(), image.data.size() })) {
+                *ink_image = image.data;
+            } else {
+                // GLB can embed JPEG. Keep its original bytes for viewport rendering, and
+                // give the inkjet PNG reader a lossless copy of the decoded pixels.
+                std::vector<unsigned char> bgr;
+                int width = 0, height = 0;
+                try {
+                    if (decode_texture_to_pixels(image, bgr, width, height))
+                        cv::imencode(".png", cv::Mat(height, width, CV_8UC3, bgr.data()), *ink_image,
+                                     {cv::IMWRITE_PNG_COMPRESSION, 1});
+                } catch (const cv::Exception &e) {
+                    BOOST_LOG_TRIVIAL(warning) << "inkjet source: texture conversion failed: " << e.what();
+                    ink_image->clear();
+                }
+                if (ink_image->empty()) {
+                    BOOST_LOG_TRIVIAL(warning) << "inkjet source: cannot decode texture " << texture_index;
+                    continue;
+                }
+            }
+            // A model that came in through the textured import path may carry the picture's layout
+            // on the volume (display_texture) instead of texture_uv; both are the same per-triangle
+            // corners. Adopt it so the ink follows the picture instead of a projection that tiles it.
+            if (! volume->has_texture_uv() && volume->display_texture &&
+                volume->display_texture->face_uv.size() == volume->mesh().its.indices.size()) {
+                const auto &uvs = volume->display_texture->face_uv;
+                volume->texture_uv.resize(uvs.size() * 3);
+                for (size_t fi = 0; fi < uvs.size(); ++ fi)
+                    for (size_t k = 0; k < 3; ++ k)
+                        volume->texture_uv[fi * 3 + k] = Vec2f(uvs[fi][k][0], uvs[fi][k][1]);
+            }
+
+            TextureDisplacementLayer layer;
+            layer.slot = 0;
+            layer.name = "Model texture";
+            if (volume->has_texture_uv())
+                layer.projection_method = TextureProjectionMethod::ModelUV;
+            layer.image_data   = std::move(ink_image);
+            layer.tiling_scale = 12.5f;
+            layer.depth_mm     = 0.4f;
+            volume->texture_displacement_layers.emplace_back(std::move(layer));
+
+            TriangleSelector selector(volume->mesh());
+            for (int i = 0; i < int(volume->mesh().its.indices.size()); ++ i)
+                selector.set_facet(i, EnforcerBlockerType::ENFORCER);
+            volume->texture_displacement_facet(0).set(selector);
+            BOOST_LOG_TRIVIAL(info) << "inkjet source: volume '" << volume->name << "' projection="
+                                    << (volume->has_texture_uv() ? "ModelUV" : "Triplanar");
+            ++ attached;
+        }
+    if (attached > 0)
+        BOOST_LOG_TRIVIAL(info) << "inkjet source: texture displacement source attached to "
+                                << attached << " volume(s)";
 }
 
 Model Model::read_from_file(const std::string&                                  input_file,
@@ -326,7 +447,8 @@ Model Model::read_from_file(const std::string&                                  
                             Import3mfProgressFn                                 proFn,
                             ImportstlProgressFn                                 stlFn,
                             BBLProject *                                        project,
-                            int                                                 plate_id)
+                            int                                                 plate_id,
+                            const std::function<size_t(size_t)>& choose_triangle_count)
 {
     Model model;
 
@@ -445,7 +567,7 @@ Model Model::read_from_file(const std::string&                                  
         // import path: the geometry becomes a normal object and the texture is handed to the
         // texture-to-color dialog via Model::texture_mesh.
         auto tex_mesh = std::make_shared<TexturedMesh>();
-        result = load_assimp_textured_model(input_file, *tex_mesh, &message);
+        result = load_assimp_textured_model(input_file, *tex_mesh, &message, choose_triangle_count);
         if (result) {
             model.texture_mesh = tex_mesh;
             add_textured_mesh_to_model(model, *tex_mesh, input_file);
@@ -513,6 +635,9 @@ Model Model::read_from_file(const std::string&                                  
         CustomGCode::check_mode_for_custom_gcode_per_print_z(plate_gcodes.second);
 
     sort_remove_duplicates(config_substitutions->substitutions);
+    // A model that arrived with its own picture also arrives ready to spray it, whether it was opened
+    // in the GUI or sliced headless.
+    attach_inkjet_texture_source(model);
     return model;
 }
 

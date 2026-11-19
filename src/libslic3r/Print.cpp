@@ -271,6 +271,18 @@ bool Print::invalidate_state_by_config_options(const ConfigOptionResolver & /* n
     // Cache the plenty of parameters, which influence the G-code generator only,
     // or they are only notes not influencing the generated G-code.
     static std::unordered_set<std::string> steps_gcode = {
+        "mkp_outer_wall_linear_speed",
+        "mkp_outer_wall_speed_min",
+        "mkp_surface_speed",
+        "mkp_surface_wall_speed",
+        "mkp_surface_linear_speed",
+        "mkp_surface_speed_min",
+        "mkp_surface_speed_max",
+        "mkp_surface_inner_walls",
+        "mkp_inkjet_retract_length",
+        "mkp_inkjet_recovery_length",
+        "mkp_inkjet_flush_mode",
+        "mkp_inkjet_flush_interval",
         // Belt printer G-code axis remap (only affects G-code output, not slicing).
         "gcode_remap_x",
         "gcode_remap_y",
@@ -5202,6 +5214,11 @@ bool Print::has_wipe_tower() const
         if (enable_timelapse_print())
             return true;
 
+        // MKP: keep the tower on a single-filament print when the profile asks for a full-height
+        // one; the head changes are inserted after slicing, so the slicer sees no tool change to
+        // hang the tower on.
+        if (m_config.mkp_full_height_prime_tower.value)
+            return !m_config.spiral_mode.value;
         return !m_config.spiral_mode.value && m_config.filament_diameter.values.size() > 1;
     }
     return false;
@@ -5375,7 +5392,7 @@ void Print::_make_wipe_tower()
 
             if (!layer_tools.has_wipe_tower) continue;
             bool first_layer = &layer_tools == &m_wipe_tower_data.tool_ordering.front();
-            wipe_tower.plan_toolchange((float)layer_tools.print_z, (float)layer_tools.wipe_tower_layer_height, current_filament_id, current_filament_id);
+            wipe_tower.plan_toolchange((float)layer_tools.print_z, (float)layer_tools.wipe_tower_layer_height, current_filament_id, current_filament_id, 0.f);
 
             used_filament_ids.insert(layer_tools.extruders.begin(), layer_tools.extruders.end());
 
@@ -5438,7 +5455,12 @@ void Print::_make_wipe_tower()
                 continue;
             }
 
-            if (&layer_tools == &m_wipe_tower_data.tool_ordering.back() || (&layer_tools + 1)->wipe_tower_partitions == 0)
+            if (&layer_tools == &m_wipe_tower_data.tool_ordering.back())
+                break;
+            // MKP: a single-filament print has no tool change to hang the tower on, so wipe_tower_partitions
+            // stays 0 on every layer. Stopping at the first such layer would plan the tower for that layer
+            // only, leaving the rest of the model without one (tower printed as a short stub).
+            if (! m_config.mkp_full_height_prime_tower.value && (&layer_tools + 1)->wipe_tower_partitions == 0)
                 break;
         }
         }
@@ -5463,7 +5485,7 @@ void Print::_make_wipe_tower()
         // Unload the current filament over the purge tower.
         coordf_t layer_height = m_objects.front()->config().layer_height.value;
         bool generate_final_purge = true;
-        if (m_wipe_tower_data.tool_ordering.back().wipe_tower_partitions > 0) {
+        if (m_wipe_tower_data.tool_ordering.back().wipe_tower_partitions > 0 || m_config.mkp_full_height_prime_tower.value) {
             // The wipe tower goes up to the last layer of the print.
             if (wipe_tower.layer_finished()) {
                 // The wipe tower is printed to the top of the print and it has no space left for the final extruder purge.
@@ -5560,7 +5582,12 @@ void Print::_make_wipe_tower()
                     }
                 }
                 layer_tools.wiping_extrusions().ensure_perimeters_infills_order(*this);
-                if (&layer_tools == &m_wipe_tower_data.tool_ordering.back() || (&layer_tools + 1)->wipe_tower_partitions == 0)
+                if (&layer_tools == &m_wipe_tower_data.tool_ordering.back())
+                    break;
+                // MKP: a single-filament print has no tool change to hang the tower on, so wipe_tower_partitions
+                // stays 0 on every layer. Stopping at the first such layer would plan the tower for that layer
+                // only, leaving the rest of the model without one (tower printed as a short stub).
+                if (! m_config.mkp_full_height_prime_tower.value && (&layer_tools + 1)->wipe_tower_partitions == 0)
                     break;
             }
         }
@@ -5579,7 +5606,7 @@ void Print::_make_wipe_tower()
         // Unload the current filament over the purge tower.
         coordf_t layer_height = m_objects.front()->config().layer_height.value;
         bool generate_final_purge = true;
-        if (m_wipe_tower_data.tool_ordering.back().wipe_tower_partitions > 0) {
+        if (m_wipe_tower_data.tool_ordering.back().wipe_tower_partitions > 0 || m_config.mkp_full_height_prime_tower.value) {
             // The wipe tower goes up to the last layer of the print.
             if (wipe_tower.layer_finished()) {
                 // The wipe tower is printed to the top of the print and it has no space left for the final extruder purge.

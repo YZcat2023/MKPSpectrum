@@ -1987,6 +1987,7 @@ WipeTower::WipeTower(const PrintConfig& config, int plate_idx, Vec3d plate_origi
     m_z_pos(0.f),
     //m_bridging(float(config.wipe_tower_bridging)),
     m_bridging(10.f),
+    m_mkp_support_lines_first(config.mkp_full_height_prime_tower.value),
     m_sparse_layers_skipped(wipe_tower_sparse_layers_skipped(config)),
     m_sparse_layers_combined(wipe_tower_sparse_layers_combined(config)),
     m_gcode_flavor(config.gcode_flavor),
@@ -2969,7 +2970,7 @@ WipeTower::ToolChangeResult WipeTower::finish_layer(bool extrude_perimeter, bool
     bool toolchanges_on_layer = m_layer_info->toolchanges_depth() > WT_EPSILON;
 
     // inner perimeter of the sparse section, if there is space for it:
-    if (fill_box.ru.y() - fill_box.rd.y() > m_perimeter_width - WT_EPSILON)
+    if (!m_mkp_support_lines_first && fill_box.ru.y() - fill_box.rd.y() > m_perimeter_width - WT_EPSILON)
         writer.rectangle_fill_box(this, fill_box.ld, fill_box.rd.x() - fill_box.ld.x(), fill_box.ru.y() - fill_box.rd.y(), feedrate);
 
     // we are in one of the corners, travel to ld along the perimeter:
@@ -3022,7 +3023,8 @@ WipeTower::ToolChangeResult WipeTower::finish_layer(bool extrude_perimeter, bool
             // Extrude an inverse U at the left of the region and the sparse infill.
             writer.extrude(fill_box.lu + Vec2f(m_perimeter_width * 2, 0.f), feedrate);
 
-            const int n = 1+int((right-left)/m_bridging);
+            // The first stroke at 'left' plus these four strokes makes five support lines.
+            const int n = m_mkp_support_lines_first ? 4 : 1+int((right-left)/m_bridging);
             const float dx = (right-left)/n;
             for (int i=1;i<=n;++i) {
                 float x=left+dx*i;
@@ -3037,6 +3039,9 @@ WipeTower::ToolChangeResult WipeTower::finish_layer(bool extrude_perimeter, bool
         writer.append("; CP EMPTY GRID END\n"
                       ";------------------\n\n\n\n\n\n\n");
     }
+
+    if (m_mkp_support_lines_first && fill_box.ru.y() - fill_box.rd.y() > m_perimeter_width - WT_EPSILON)
+        writer.rectangle_fill_box(this, fill_box.ld, fill_box.rd.x() - fill_box.ld.x(), fill_box.ru.y() - fill_box.rd.y(), feedrate);
 
     // outer perimeter (always):
     // BBS
@@ -3868,7 +3873,7 @@ WipeTower::ToolChangeResult WipeTower::finish_layer_new(bool extrude_perimeter, 
         if (i > 0)
             writer.travel(m_left_to_right ? fill_box.ru : fill_box.lu);
 
-        if (extrude_fill_wall && (fill_box.ru.y() - fill_box.rd.y() > WT_EPSILON))
+        if (!m_mkp_support_lines_first && extrude_fill_wall && (fill_box.ru.y() - fill_box.rd.y() > WT_EPSILON))
             writer.rectangle_fill_box(this, fill_box, finish_rect_wipe_path, feedrate);
         // Extrude infill to support the material to be printed above.
         const float         dy    = (fill_box.lu.y() - fill_box.ld.y() - m_perimeter_width);
@@ -3901,7 +3906,7 @@ WipeTower::ToolChangeResult WipeTower::finish_layer_new(bool extrude_perimeter, 
                 // Extrude an inverse U at the left of the region and the sparse infill.
                 writer.extrude(fill_box.lu + Vec2f(m_perimeter_width * 2, 0.f), feedrate);
 
-                const int   n  = 1 + int((right - left) / m_bridging);
+                const int   n  = m_mkp_support_lines_first ? 4 : 1 + int((right - left) / m_bridging);
                 const float dx = (right - left) / n;
                 for (int i = 1; i <= n; ++i) {
                     float x = left + dx * i;
@@ -3918,6 +3923,8 @@ WipeTower::ToolChangeResult WipeTower::finish_layer_new(bool extrude_perimeter, 
             writer.append("; CP EMPTY GRID END\n"
                           ";------------------\n\n\n\n\n\n\n");
         }
+        if (m_mkp_support_lines_first && extrude_fill_wall && (fill_box.ru.y() - fill_box.rd.y() > WT_EPSILON))
+            writer.rectangle_fill_box(this, fill_box, finish_rect_wipe_path, feedrate);
     }
 
     // outer perimeter (always):
@@ -4031,7 +4038,7 @@ WipeTower::ToolChangeResult WipeTower::finish_block(const WipeTowerBlock &block,
 
     std::vector<Vec2f> finish_rect_wipe_path;
     // inner perimeter of the sparse section, if there is space for it:
-    if (fill_box.ru.y() - fill_box.rd.y() > WT_EPSILON) {
+    if (!m_mkp_support_lines_first && fill_box.ru.y() - fill_box.rd.y() > WT_EPSILON) {
         writer.rectangle_fill_box(this, fill_box, finish_rect_wipe_path, feedrate);
     }
 
@@ -4073,7 +4080,7 @@ WipeTower::ToolChangeResult WipeTower::finish_block(const WipeTowerBlock &block,
             // Extrude an inverse U at the left of the region and the sparse infill.
             writer.extrude(fill_box.lu + Vec2f(m_perimeter_width * 2, 0.f), feedrate);
 
-            const int   n  = 1 + int((right - left) / m_bridging);
+            const int   n  = m_mkp_support_lines_first ? 4 : 1 + int((right - left) / m_bridging);
             const float dx = (right - left) / n;
             for (int i = 1; i <= n; ++i) {
                 float x = left + dx * i;
@@ -4089,6 +4096,8 @@ WipeTower::ToolChangeResult WipeTower::finish_block(const WipeTowerBlock &block,
         writer.append("; CP EMPTY GRID END\n"
                       ";------------------\n\n\n\n\n\n\n");
     }
+    if (m_mkp_support_lines_first && fill_box.ru.y() - fill_box.rd.y() > WT_EPSILON)
+        writer.rectangle_fill_box(this, fill_box, finish_rect_wipe_path, feedrate);
 
     // outer perimeter (always):
     // BBS

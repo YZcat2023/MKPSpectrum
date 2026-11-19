@@ -4564,7 +4564,9 @@ int CLI::run(int argc, char **argv)
 
         std::vector<int> extruders = plate->get_extruders_under_cli(true, print_config);
         unsigned int filaments_cnt = extruders.size();
-        if ((filaments_cnt <= 1) && !is_smooth_timelapse){
+        const auto *mkp_full_tower_opt = print_config.option<ConfigOptionBool>("mkp_full_height_prime_tower");
+        const bool  mkp_full_tower     = mkp_full_tower_opt != nullptr && mkp_full_tower_opt->value;
+        if ((filaments_cnt <= 1) && !is_smooth_timelapse && !mkp_full_tower){
             plate_obj_size_info.has_wipe_tower = false;
             BOOST_LOG_TRIVIAL(info) << boost::format("filaments_cnt=%1%, set to no wipe tower")%filaments_cnt;
             return;
@@ -5881,7 +5883,9 @@ int CLI::run(int argc, char **argv)
                             BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format("arrange: slice filaments info invalid or need_skip, get from partplate: filament_count %1%")%filaments_cnt;
                         }
 
-                        if ((filaments_cnt <= 1) && !is_smooth_timelapse && (!enable_wrapping_detect || current_wrapping_exclude_area.empty()))
+                        const auto *mkp_full_tower_opt = m_print_config.option<ConfigOptionBool>("mkp_full_height_prime_tower");
+                        const bool  mkp_full_tower     = mkp_full_tower_opt != nullptr && mkp_full_tower_opt->value;
+                        if ((filaments_cnt <= 1) && !is_smooth_timelapse && !mkp_full_tower && (!enable_wrapping_detect || current_wrapping_exclude_area.empty()))
                         {
                             BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << boost::format("arrange: not a multi-color object anymore, drop the wipe tower before arrange.");
                         }

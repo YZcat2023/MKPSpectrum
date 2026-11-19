@@ -32,8 +32,10 @@
 #include "I18N.hpp"
 #include "IMEXHelpers.hpp"
 #include "GCode.hpp"
+#include "MkpInkjetProgress.hpp"
 #include <cstdio>
 #include "Exception.hpp"
+#include "Zipper.hpp"
 #include "LifecycleEvents.hpp"
 #include "ExtrusionEntity.hpp"
 #include "EdgeGrid.hpp"
@@ -154,6 +156,8 @@ namespace fs = boost::filesystem;
 namespace Slic3r {
 
 namespace {
+// The head's fixed USB address is shared by setup, upload and mode restoration.
+constexpr const char *MKP_MBRUSH_ADDRESS = "192.168.88.1";
 
 // Follow XY commands in a generated G-code block. This deliberately handles
 // only standard motion/modal commands: an opaque macro that moves the head is
@@ -1643,6 +1647,7 @@ static std::vector<Vec2d> get_path_of_change_filament(const Print& print)
         // A phony move to the end position at the wipe tower.
         gcodegen.writer().travel_to_xy((end_pos + plate_origin_2d).cast<double>());
         gcodegen.set_last_pos(wipe_tower_point_to_object_point(gcodegen, end_pos + plate_origin_2d));
+        m_last_tower_position = Vec3d(end_pos.x() + plate_origin_2d.x(), end_pos.y() + plate_origin_2d.y(), z);
         if (!is_approx(z, current_z)) {
             gcode += gcodegen.writer().retract();
             gcode += gcodegen.writer().travel_to_z(current_z, "Travel back up to the topmost object layer.");
@@ -1697,7 +1702,16 @@ static std::vector<Vec2d> get_path_of_change_filament(const Print& print)
 
         std::string tcr_rotated_gcode = post_process_wipe_tower_moves(tcr, wipe_tower_offset, wipe_tower_rotation);
 
-        gcode += gcodegen.writer().unlift(); // Make sure there is no z-hop (in most cases, there isn't).
+        const bool needs_toolchange = gcodegen.writer().need_toolchange(new_extruder_id);
+        const bool refill_at_grid = gcodegen.m_mkp_tower_recovery_pending && tcr.mkp_grid_refill && !needs_toolchange;
+        if (gcodegen.m_mkp_tower_recovery_pending && !refill_at_grid) {
+            const double layer_z = gcodegen.writer().get_position().z();
+            gcode += recover_after_inkjet(gcodegen);
+            gcodegen.writer().get_position().z() = layer_z;
+            gcodegen.m_mkp_tower_recovery_pending = false;
+        }
+        if (!refill_at_grid)
+            gcode += gcodegen.writer().unlift();
 
         double current_z = gcodegen.writer().get_position().z();
 
@@ -1705,7 +1719,6 @@ static std::vector<Vec2d> get_path_of_change_filament(const Print& print)
         if (z == -1.) // in case no specific z was provided, print at current_z pos
             z = current_z;
 
-        const bool needs_toolchange = gcodegen.writer().need_toolchange(new_extruder_id);
         const bool will_go_down     = !is_approx(z, current_z);
         const bool is_ramming       = (gcodegen.config().single_extruder_multi_material) ||
                                 (!gcodegen.config().single_extruder_multi_material &&
@@ -1722,7 +1735,32 @@ static std::vector<Vec2d> get_path_of_change_filament(const Print& print)
 
         const Point start_wipe_pos     = wipe_tower_point_to_object_point(gcodegen, start_pos + plate_origin_2d);
         const bool travel_to_tower_now = should_travel_to_tower || gcodegen.m_need_change_layer_lift_z;
-        if (travel_to_tower_now) {
+        if (refill_at_grid) {
+            auto &writer = gcodegen.writer();
+            const Vec2d entry = gcodegen.point_to_gcode(start_wipe_pos);
+            const Vec2f first = transform_wt2_pt(tcr.mkp_grid_refill->first) + plate_origin_2d;
+            const Vec2f second = transform_wt2_pt(tcr.mkp_grid_refill->second) + plate_origin_2d;
+            // Compare physical positions after tower rotation, including across layers without ink.
+            const auto &previous = gcodegen.m_mkp_last_grid_refill;
+            const Vec2f refill_world = previous && (second - *previous).squaredNorm() > (first - *previous).squaredNorm()
+                ? second : first;
+            gcodegen.m_mkp_last_grid_refill = refill_world;
+            const Vec2d refill = gcodegen.point_to_gcode(wipe_tower_point_to_object_point(gcodegen, refill_world));
+            const double clearance = std::max(gcodegen.m_mkp_recovery_travel_z,
+                std::max(current_z, z) + std::max(0.5, double(gcodegen.config().z_hop.get_at(0))));
+            gcode += ";MKP_TOWER_RECOVERY_START\n";
+            gcode += writer.travel_to_z(clearance, "", true);
+            gcode += writer.travel_to_xy(refill);
+            gcode += writer.travel_to_z(z, "", true);
+            gcode += writer.unretract(0.f, gcodegen.config().mkp_inkjet_recovery_length.value);
+            gcode += ";MKP_TOWER_RECOVERY_END\n";
+            gcode += writer.travel_to_z(z + 0.5, "", true);
+            gcode += writer.travel_to_xy(entry);
+            gcode += writer.travel_to_z(z, "", true);
+            gcodegen.set_last_pos(start_wipe_pos);
+            gcodegen.m_need_change_layer_lift_z = false;
+            gcodegen.m_mkp_tower_recovery_pending = false;
+        } else if (travel_to_tower_now) {
             // FIXME: It would be better if the wipe tower set the force_travel flag for all toolchanges,
             // then we could simplify the condition and make it more readable.
 
@@ -1750,7 +1788,7 @@ static std::vector<Vec2d> get_path_of_change_filament(const Print& print)
             // toolchange gcode (and the head position it ends at) is known.
         }
 
-        if (will_go_down) {
+        if (will_go_down && !refill_at_grid) {
             gcode += gcodegen.writer().retract();
             gcode += gcodegen.writer().travel_to_z(z, "Travel down to the last wipe tower layer.");
             gcode += gcodegen.writer().unretract();
@@ -1960,6 +1998,7 @@ static std::vector<Vec2d> get_path_of_change_filament(const Print& print)
         // A phony move to the end position at the wipe tower.
         gcodegen.writer().travel_to_xy((end_pos + plate_origin_2d).cast<double>());
         gcodegen.set_last_pos(wipe_tower_point_to_object_point(gcodegen, end_pos + plate_origin_2d));
+        m_last_tower_position = Vec3d(end_pos.x() + plate_origin_2d.x(), end_pos.y() + plate_origin_2d.y(), z);
         if (!is_approx(z, current_z)) {
             gcode += gcodegen.writer().retract();
             gcode += gcodegen.writer().travel_to_z(current_z, "Travel back up to the topmost object layer.");
@@ -2136,6 +2175,28 @@ static std::vector<Vec2d> get_path_of_change_filament(const Print& print)
             }
         }
 
+        return gcode;
+    }
+
+    std::string WipeTowerIntegration::recover_after_inkjet(GCode &gcodegen) const
+    {
+        if (!m_last_tower_position)
+            return {};
+        GCodeWriter &writer = gcodegen.writer();
+        const Vec3d &tower = *m_last_tower_position;
+        std::string gcode = ";MKP_TOWER_RECOVERY_START\n";
+        // Cross the bed at clearance height; descend only once above the actual printed tower.
+        const double from_z = gcodegen.m_mkp_tower_recovery_pending ?
+            gcodegen.m_mkp_recovery_travel_z : writer.get_position().z();
+        const double clearance = std::max(from_z, tower.z() + gcodegen.config().z_hop.get_at(0));
+        gcode += writer.travel_to_z(clearance, "", true);
+        gcode += writer.travel_to_xy(tower.head<2>());
+        gcodegen.set_last_pos(gcodegen.gcode_to_point(tower.head<2>()));
+        gcode += writer.travel_to_z(tower.z());
+        // The inkjet recovery is independent of the withdrawal amount. Clear the native debt
+        // with this actual E movement, at the tower, so it cannot be replayed on the model.
+        gcode += writer.unretract(0.f, gcodegen.config().mkp_inkjet_recovery_length.value);
+        gcode += ";MKP_TOWER_RECOVERY_END\n";
         return gcode;
     }
 
@@ -2898,6 +2959,23 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
 
     BOOST_LOG_TRIVIAL(info) << "Exporting G-code..." << log_memory_info();
 
+    // Where the per-layer ink previews go: the folder the flat-print side previews through, so the
+    // UI's preview server can hand these out too. Falls back to the export folder when there is no
+    // home directory to speak of.
+    auto mkp_preview_dir = [](const fs::path &fallback) -> fs::path {
+        const char *home = std::getenv("USERPROFILE");
+        if (home == nullptr || *home == '\0')
+            return fallback / "_mkp_preview";
+        return fs::path(home) / "Documents" / "MKPSpectrum" / "Temp" / "Texture" / "Preview";
+    };
+
+    m_mkp_ink.clear();
+    m_mkp_ink_prefix.clear();
+    m_mkp_inkjet_started = false;
+    m_mkp_tower_recovery_pending = false;
+    m_mkp_last_grid_refill.reset();
+    m_mkp_inkjet_flush_filament = 0.;
+
     // Remove the old g-code if it exists.
     boost::nowide::remove(path);
 
@@ -2908,12 +2986,144 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
         BOOST_LOG_TRIVIAL(error) << "[WARNING]: the parent path " + folder.string() +" is not there, create it!" << std::endl;
     }
 
+
+    // MKP: texture slicing comes first, before a single line of G-code is written. What a layer gets
+    // sprayed with is decided by cutting the painted faces - and the colour on them - at that layer's
+    // height, never by the layer's own footprint: slicing the footprint sprays every layer the model
+    // occupies, which is the sheet of ink that showed up around the model. Every pass it finds becomes
+    // one .mbd strip inside _temp.zip, which is the archive the printer unpacks and MBRUSH_UPLOAD
+    // fetches its strips from.
+    // MKP: where the strips live. The print job only ever carries the G-code, and the folder this
+    // G-code is exported into is a per-slice temp folder that the next slice wipes - so the
+    // archive always goes to one fixed folder, and the Moonraker upload picks it up from there.
+    // Written here, while slicing, instead of by an external post-processing script.
+    auto mkp_inkjet_zip_path = []() -> fs::path {
+#ifdef _WIN32
+        const char *home = std::getenv("USERPROFILE");
+#else
+        const char *home = std::getenv("HOME");
+#endif
+        if (home == nullptr || *home == '\0')
+            return fs::path("_mkp_inkjet") / "_temp.zip";
+        return fs::path(home) / "Documents" / "MKPSpectrum" / "Temp" / "Inkjet" / "_temp.zip";
+    };
+
+    if (print->config().mkp_surface_enabled.value || print->config().mkp_outer_wall_linear_speed.value) {
+        const fs::path zip_path = mkp_inkjet_zip_path();
+        {
+            boost::system::error_code zip_dir_ec;
+            fs::create_directories(zip_path.parent_path(), zip_dir_ec);
+        }
+        // Review dump: one PNG per layer holding the whole layer's ink picture (before it is cut
+        // into head passes), in the same folder and under the same naming the flat-print side uses -
+        // that is the folder the preview page reads. Cleared at every export so what sits there is
+        // this slice, not the last one.
+        const fs::path preview_dir = mkp_preview_dir(folder);
+        boost::system::error_code preview_ec;
+        fs::create_directories(preview_dir, preview_ec);
+        // Only this slice's own layer pictures are cleared: the folder is the one the flat-print
+        // previews live in too, and both write layer_XXXX.png there.
+        for (fs::directory_iterator it(preview_dir, preview_ec), end; it != end; it.increment(preview_ec)) {
+            const std::string leaf = it->path().filename().string();
+            if (leaf.rfind("layer_", 0) == 0 && it->path().extension() == ".png")
+                fs::remove(it->path(), preview_ec);
+            // One folder per object, when the plate carries more than one textured model.
+            else if (leaf.rfind("obj", 0) == 0 && it->is_directory())
+                fs::remove_all(it->path(), preview_ec);
+        }
+        const auto     objects  = print->objects();
+        size_t texture_layer_count = 0;
+        for (const PrintObject *object : objects)
+            texture_layer_count += std::max<size_t>(1, object->layers().size());
+        size_t completed_texture_layers = 0;
+        print->set_status(80, "纹理切片");
+        try {
+            Zipper zip(zip_path.string(), Zipper::FAST_COMPRESSION);
+            for (size_t i = 0; i < objects.size(); ++ i) {
+                const PrintObject *object = objects[i];
+                char               prefix[32] = "";
+                // Layer numbers restart at every object, so more than one object needs its own folder
+                // or the second model would overwrite the first model's strips.
+                fs::path object_preview_dir = preview_dir;
+                if (objects.size() > 1) {
+                    ::sprintf(prefix, "obj%d/", int(i));
+                    // The review pictures are per object for the same reason the strips are: they are
+                    // named layer_XXXX.png after a layer number that restarts at every model, so a
+                    // shared folder let the second model erase the first model's pictures and only
+                    // one of the two ever appeared in the preview.
+                    object_preview_dir = preview_dir / prefix;
+                    object_preview_dir = object_preview_dir.parent_path() / object_preview_dir.filename();
+                    fs::create_directories(object_preview_dir, preview_ec);
+                }
+                m_mkp_ink_prefix[object] = prefix;
+                // Every knob the inkjet page offers is read here and nowhere else; before this they
+                // were saved, shown, and then thrown away, which is why changing them changed nothing.
+                const PrintConfig &cfg = print->config();
+                mkp::InkjetParams      ink_params;
+                ink_params.density      = cfg.mkp_inkjet_density.value;
+                ink_params.c            = cfg.mkp_inkjet_c.value;
+                ink_params.m            = cfg.mkp_inkjet_m.value;
+                ink_params.y            = cfg.mkp_inkjet_y.value;
+                ink_params.saturation   = cfg.mkp_inkjet_saturation.value;
+                ink_params.brightness   = cfg.mkp_inkjet_brightness.value;
+                ink_params.contrast     = cfg.mkp_inkjet_contrast.value;
+                ink_params.shear_mm     = cfg.mkp_inkjet_shear.value;
+                ink_params.wall_band_mm = cfg.mkp_inkjet_wall_band.value;
+                ink_params.surface_tone = (cfg.mkp_surface_enabled.value && cfg.mkp_surface_linear_speed.value) ||
+                                          cfg.mkp_outer_wall_linear_speed.value;
+                ink_params.encode_strips = cfg.mkp_surface_enabled.value;
+                BOOST_LOG_TRIVIAL(info) << "MKP ink params: density=" << ink_params.density
+                    << " c=" << ink_params.c << " m=" << ink_params.m << " y=" << ink_params.y
+                    << " sat=" << ink_params.saturation << " bri=" << ink_params.brightness
+                    << " con=" << ink_params.contrast << " shear=" << ink_params.shear_mm
+                    << " band=" << ink_params.wall_band_mm
+                    << " speed=" << cfg.mkp_inkjet_speed.value
+                    << " repeat=" << cfg.mkp_inkjet_repeat.value
+                    << " dry=" << cfg.mkp_inkjet_dry_time.value
+                    << " device=" << cfg.mkp_inkjet_device.value;
+                const size_t object_layers = std::max<size_t>(1, object->layers().size());
+                m_mkp_ink[object] = mkp::build_inkjet_layers(*object, zip, prefix, object_preview_dir.string(), ink_params,
+                    [&](double fraction, const std::string &stage) {
+                        print->throw_if_canceled();
+                        const int percent = 80 + int(9. * (completed_texture_layers + fraction * object_layers) /
+                                                     std::max<size_t>(1, texture_layer_count));
+                        print->set_status(percent, stage);
+                    });
+                completed_texture_layers += object_layers;
+            }
+            print->set_status(89, "纹理切片完成");
+            print->throw_if_canceled();
+            zip.finalize();
+          } catch (const CanceledException &) {
+              boost::system::error_code canceled_ec;
+              fs::remove(zip_path, canceled_ec);
+              throw;
+          } catch (const std::exception &e) {
+            BOOST_LOG_TRIVIAL(error) << "MKP: cannot write " << zip_path.string() << ": " << e.what();
+        }
+        // Nothing to spray: leave no archive behind, or the printer would unpack a stale one and
+        // print the previous model's strips.
+        bool any_ink = false;
+        for (const auto &item : m_mkp_ink)
+            if (! item.second.empty()) { any_ink = true; break; }
+        if (! any_ink || !print->config().mkp_surface_enabled.value)
+            fs::remove(zip_path);
+    } else {
+        // Nothing gets sprayed at all: no archive may be left lying around, or the upload would
+        // push the previous model's strips to the printer.
+        boost::system::error_code no_ink_ec;
+        fs::remove(mkp_inkjet_zip_path(), no_ink_ec);
+    }
+
+    print->set_status(print->config().mkp_surface_enabled.value ? 90 : 80, _u8L("Generating G-code"));
+
     std::string path_tmp(path);
     path_tmp += ".tmp";
 
     m_processor.initialize(path_tmp);
     m_processor.set_print(print);
-    GCodeOutputStream file(boost::nowide::fopen(path_tmp.c_str(), "wb"), m_processor);
+    GCodeOutputStream file(boost::nowide::fopen(path_tmp.c_str(), "wb"), m_processor,
+                          print->config().gcode_flavor.value, print->config().auxiliary_fan.value);
     if (! file.is_open()) {
         // TRN %1% is a file path.
         std::string err_msg = Slic3r::format(_(L("G-code export to %1% failed.\nCannot open the file for writing.")), path) + "\n";
@@ -4402,6 +4612,28 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
 
     // Write the custom start G-code
     file.writeln(machine_start_gcode);
+    // Native texture slicing already built the archive, but PRINT_START does not unpack it.
+    // Prepare the MBD paths once per job, even when the user's machine-start preset has no macro.
+    if (print.config().mkp_inkjet_device.value == mkpInkjetMBrush &&
+        std::any_of(m_mkp_ink.begin(), m_mkp_ink.end(),
+                    [](const auto &item) { return !item.second.empty(); })) {
+        std::istringstream startup(machine_start_gcode);
+        std::string line;
+        bool already_unpacks = false;
+        while (std::getline(startup, line)) {
+            line.erase(line.find(';') == std::string::npos ? line.size() : line.find(';'));
+            const auto first = line.find_first_not_of(" \t\r");
+            if (first != std::string::npos) {
+                const auto end = line.find_first_of(" \t\r", first);
+                std::string command = line.substr(first, end - first);
+                boost::to_upper(command);
+                if (command == "UNZIP_TEMP")
+                    already_unpacks = true;
+            }
+        }
+        if (!already_unpacks)
+            file.writeln("UNZIP_TEMP");
+    }
     // Mark the end of the machine start g-code so the GCodeProcessor usage-block builder knows where user
     // g-code ends and can start attributing filament/extruder usage. Gated on enable_pre_heating: only the
     // injector fleet (H2D/X2D/H2D-Pro/H2C) emits it; the byte-frozen fleet (X1/P1/A1/H2S, flag false) never
@@ -4811,6 +5043,10 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
             if (m_second_layer_things_done && print.config().enable_power_loss_recovery.value == PowerLossRecoveryMode::Enable) {
                 file.write(m_writer.enable_power_loss_recovery(PowerLossRecoveryMode::Disable));
             }
+            if (m_wipe_tower && m_mkp_tower_recovery_pending) {
+                file.write(m_wipe_tower->recover_after_inkjet(*this));
+                m_mkp_tower_recovery_pending = false;
+            }
             if (m_wipe_tower)
                 // Purge the extruder, pull out the active filament.
                 file.write(m_wipe_tower->finalize(*this));
@@ -4846,6 +5082,11 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
     // byte-frozen fleet unaffected.
     if (m_config.enable_pre_heating.value)
         file.write_format(";%s\n", GCodeProcessor::Machine_End_GCode_Start_Tag.c_str());
+
+    // Keep the head in constant-speed mode between ink layers without flushing
+    // it again just to restore that mode. Return to encoder mode once at job end.
+    if (m_mkp_inkjet_started)
+        file.writeln(std::string("M400\nMBRUSH_ENCODER IP=") + MKP_MBRUSH_ADDRESS);
 
     // Process filament-specific gcode in extruder order.
     {
@@ -5174,7 +5415,11 @@ void GCode::process_layers(
                 return LayerResult::make_nop_layer_result();
             const std::pair<coordf_t, std::vector<LayerToPrint>>& layer = layers_to_print[precomputed.index];
             const LayerTools& layer_tools = tool_ordering.tools_for_layer(layer.first);
-            print.set_status(80, Slic3r::format(_(L("Generating G-code: layer %1%")), std::to_string(precomputed.index + 1)));
+            const int progress_start = (print.config().mkp_surface_enabled.value ||
+                                        print.config().mkp_outer_wall_linear_speed.value) ? 90 : 80;
+            const int progress_percent = progress_start + int((94 - progress_start) *
+                std::clamp(double(m_layer_index) / std::max(1u, m_layer_count), 0., 1.));
+            print.set_status(progress_percent, Slic3r::format(_(L("Generating G-code: layer %1%")), std::to_string(precomputed.index + 1)));
             if (m_wipe_tower && layer_tools.has_wipe_tower)
                 m_wipe_tower->next_layer();
             //BBS
@@ -5273,7 +5518,11 @@ void GCode::process_layers(
             if (precomputed.index == size_t(-1))
                 return LayerResult::make_nop_layer_result();
             LayerToPrint &layer = layers_to_print[precomputed.index];
-            print.set_status(80, Slic3r::format(_(L("Generating G-code: layer %1%")), std::to_string(precomputed.index + 1)));
+            const int progress_start = (print.config().mkp_surface_enabled.value ||
+                                        print.config().mkp_outer_wall_linear_speed.value) ? 90 : 80;
+            const int progress_percent = progress_start + int((94 - progress_start) *
+                std::clamp(double(m_layer_index) / std::max(1u, m_layer_count), 0., 1.));
+            print.set_status(progress_percent, Slic3r::format(_(L("Generating G-code: layer %1%")), std::to_string(precomputed.index + 1)));
             //BBS
             check_placeholder_parser_failed();
             print.throw_if_canceled();
@@ -6583,6 +6832,510 @@ DynamicConfig GCode::timelapse_gcode_config(const Print &print, coordf_t print_z
 // For multi-material prints, this routine minimizes extruder switches by gathering extruder specific extrusion paths
 // and performing the extruder specific extrusions together.
 
+// ======================= MKP surface treatment (native) =======================
+// The inkjet / brush passes used to be spliced in by a Python post-processor after slicing. They
+// could not stay there: the toolpath of a layer depends on that layer's cross-section, so inserting
+// it into finished G-code meant guessing where the layer's material was. Emitting it here instead
+// uses the sliced geometry directly.
+//
+// Two docked tools ride along, each with its own grab / release macro from the printer preset:
+//   表面处理 (erMkpSurfacePath)  - the brush that roughens the plastic before ink goes down
+//   喷墨路径 (erMkpInkjetPath)   - the inkjet head, which follows the same raster; the colours come
+//                                  from the strip data, not from this toolpath
+namespace {
+
+// The preset macros were written for the Python post-processor, which substituted these three
+// tokens with concrete Z moves. Expand them here too, otherwise an un-updated preset would send the
+// token itself to the firmware.
+std::string mkp_expand_macro(const std::string &text, coordf_t layer_z, coordf_t lift_z)
+{
+    if (text.empty())
+        return text;
+    std::string out = text;
+    auto substitute = [&out](const char *token, coordf_t z) {
+        const std::string from(token);
+        char              buf[64];
+        ::sprintf(buf, "G1 Z%.3f F2000", z);
+        for (size_t pos = out.find(from); pos != std::string::npos; pos = out.find(from, pos + ::strlen(buf)))
+            out.replace(pos, from.size(), buf);
+    };
+    // lift_z is the docked head's own height above the nozzle - the brush's Z offset for the brush,
+    // the inkjet Z offset for the inkjet head. It used to be the literal 62 mm the post-processor
+    // wrote, which made the head height impossible to calibrate from the preset.
+    substitute("ZUPADJUST",      layer_z + lift_z);
+    substitute("ZDOWNADJUST",    layer_z);
+    // The dock descent must never be a hand-written number: the 24 mm the macros used to carry put
+    // a 38.7 mm brush 14.7 mm *below* the plate on its way out of the dock. The tool's working
+    // height - the height at which its tip reaches the surface - is the only depth that is always
+    // calibrated, so the dock uses exactly that, and travel still adds the clearance on top.
+    substitute("ZBRUSHDOCK",     layer_z + lift_z);
+    substitute("ZRESTOREADJUST", layer_z + 3.);
+    return out;
+}
+
+// A docked tool hangs below the nozzle: its Z offset is where it *works*, not where it may move.
+// Any horizontal move with the tool attached therefore runs this much above the working height.
+constexpr double MKP_TOOL_TRAVEL_CLEARANCE_MM = 3.0;
+
+// Move the nozzle to an absolute Z and keep the writer in step with it.
+void mkp_z(std::string &gcode, GCodeWriter &writer, coordf_t z, const char *feed = "F3000")
+{
+    gcode += writer.unlift();
+    char buf[48];
+    ::sprintf(buf, "G1 Z%.3f %s\n", z, feed);
+    gcode += buf;
+    writer.set_position(Vec3d(writer.get_position().x(), writer.get_position().y(), z));
+}
+
+// Force the physical Z, and make the writer agree. The macros move Z themselves (the docked head
+// rides at its own Z offset, then comes back at +3), so without this the writer would still believe
+// the nozzle sits at the layer height and skip the Z move on the next layer, printing in the air.
+void mkp_force_z(std::string &gcode, GCodeWriter &writer, coordf_t z)
+{
+    mkp_z(gcode, writer, z, "F600");
+}
+
+// Dock macros only move the tools. Native layer-end handling owns the E axis and fans.
+void mkp_emit_macro(std::string &gcode, GCodeWriter &writer, const std::string &text)
+{
+    if (text.empty())
+        return;
+    bool absolute_xyz = true;
+    double macro_feed = 0.;
+    Vec3d position = writer.get_position();
+    GCodeReader reader;
+    reader.parse_buffer(text, [&](GCodeReader &, const GCodeReader::GCodeLine &line) {
+        if (line.cmd_is("M82") || line.cmd_is("M83")) {
+            return; // Native E moves below retain the writer's configured addressing mode.
+        }
+        // Native layer-end handling owns both the E-axis cycle and fan suspension.
+        // Ignore these legacy macro commands even in older, un-migrated projects.
+        if (line.cmd_is("M106") || line.cmd_is("M107") || line.cmd_is("SET_FAN_SPEED"))
+            return;
+        const bool move = line.cmd_is("G0") || line.cmd_is("G1");
+        if (move && line.has_f())
+            macro_feed = line.precise_value(F);
+        if (move && line.has_e() && !line.has_x() && !line.has_y() && !line.has_z()) {
+            return;
+        }
+        if (line.cmd_is("G90"))
+            absolute_xyz = true;
+        else if (line.cmd_is("G91"))
+            absolute_xyz = false;
+        if (move) {
+            for (int axis = 0; axis < 3; ++axis)
+                if (line.has(static_cast<Axis>(axis)))
+                    position[axis] = absolute_xyz ? line.precise_value(static_cast<Axis>(axis)) :
+                        position[axis] + line.precise_value(static_cast<Axis>(axis));
+        }
+        // The legacy dock macros use F20000 for transit and lower feeds for docking.
+        // Let those transit moves follow the native travel preset, including lines inheriting F.
+        if (move && (line.has_x() || line.has_y()) && !line.has_z() && !line.has_e()
+            && std::abs(macro_feed - 20000.) < EPSILON) {
+            GCodeReader::GCodeLine travel = line;
+            const size_t extruder = writer.filament() ? writer.filament()->extruder_id() : 0;
+            travel.set(F, float(writer.config.travel_speed.get_at(extruder) * 60.), 3);
+            gcode += travel.raw() + "\n";
+        } else {
+            gcode += line.raw() + "\n";
+        }
+    });
+    writer.set_position(position);
+}
+
+// True when the line is a G1 move carrying Z and nothing else - a plain height change.
+bool mkp_is_pure_z(const std::string &line)
+{
+    const size_t first = line.find_first_not_of(" \t");
+    if (first == std::string::npos || line.compare(first, 3, "G1 ") != 0)
+        return false;
+    return line.find('Z', first) != std::string::npos &&
+           line.find('X', first) == std::string::npos &&
+           line.find('Y', first) == std::string::npos &&
+           line.find('E', first) == std::string::npos;
+}
+
+// True when the line is a G1 move carrying E and nothing else - a pure filament move.
+bool mkp_is_pure_e(const std::string &line)
+{
+    const size_t first = line.find_first_not_of(" \t");
+    if (first == std::string::npos || line.compare(first, 3, "G1 ") != 0)
+        return false;
+    return line.find('E', first) != std::string::npos &&
+           line.find('X', first) == std::string::npos &&
+           line.find('Y', first) == std::string::npos &&
+           line.find('Z', first) == std::string::npos;
+}
+
+// The grab macro descends into the dock and only then grips the tool, so its own dock Z is fine for
+// the bare nozzle. Getting back out is not: the tool hangs below the nozzle from that moment on, and
+// the exit move would rake it across the plate (the brush came out 14 mm below the bed that way).
+// Lift to the travel height right after the docking move, so only the dock approach itself is low.
+void mkp_lift_after_dock(std::string &text, coordf_t z_safe)
+{
+    size_t begin = 0, insert_at = std::string::npos;
+    while (begin <= text.size()) {
+        size_t end = text.find('\n', begin);
+        if (end == std::string::npos)
+            end = text.size();
+        if (mkp_is_pure_z(text.substr(begin, end - begin)))
+            insert_at = end;
+        if (end >= text.size())
+            break;
+        begin = end + 1;
+    }
+    if (insert_at == std::string::npos)
+        return;
+    char lift[48];
+    ::sprintf(lift, "\nG1 Z%.3f F3000", z_safe);
+    text.insert(insert_at, lift);
+}
+
+// A serpentine raster of `area` (scaled coordinates). Every scan line is offset by half a spacing so
+// it can never land exactly on a contour edge, where the intersection would drop it.
+Polylines mkp_raster_polylines(const ExPolygons &area, coordf_t spacing, bool along_x)
+{
+    Polylines out;
+    if (area.empty() || spacing <= 0.)
+        return out;
+    const BoundingBox bbox = get_extents(area);
+    const coordf_t    lo   = along_x ? double(bbox.min.y()) : double(bbox.min.x());
+    const coordf_t    hi   = along_x ? double(bbox.max.y()) : double(bbox.max.x());
+    const coord_t     a    = along_x ? bbox.min.x() : bbox.min.y();
+    const coord_t     b    = along_x ? bbox.max.x() : bbox.max.y();
+    bool              reversed = false;
+    for (coordf_t offset = lo + spacing * 0.5; offset < hi; offset += spacing) {
+        const coord_t c = coord_t(std::lround(offset));
+        Polyline      line;
+        line.points.emplace_back(along_x ? Point(a, c) : Point(c, a));
+        line.points.emplace_back(along_x ? Point(b, c) : Point(c, b));
+        if (reversed)
+            std::reverse(line.points.begin(), line.points.end());
+        for (Polyline &piece : intersection_pl(Polylines{ line }, area))
+            out.emplace_back(std::move(piece));
+        reversed = ! reversed;
+    }
+    return out;
+}
+
+// Use the printed wall paths, including hole boundaries and overhangs. An inset of the entire
+// section cannot distinguish internal perimeters from an exposed hole wall.
+Polylines mkp_wall_paths(const Layer &layer, bool include_inner)
+{
+    Polylines out;
+    const auto visit = [&](const ExtrusionEntity *entity, const auto &self) -> void {
+        if (const auto *collection = dynamic_cast<const ExtrusionEntityCollection *>(entity)) {
+            for (const ExtrusionEntity *child : collection->entities)
+                self(child, self);
+        } else if (const auto *loop = dynamic_cast<const ExtrusionLoop *>(entity)) {
+            for (const ExtrusionPath &path : loop->paths)
+                self(&path, self);
+        } else if (const auto *multi = dynamic_cast<const ExtrusionMultiPath *>(entity)) {
+            for (const ExtrusionPath &path : multi->paths)
+                self(&path, self);
+        } else if (const auto *path = dynamic_cast<const ExtrusionPath *>(entity)) {
+            if (path->role() != erExternalPerimeter && path->role() != erOverhangPerimeter &&
+                !(include_inner && path->role() == erPerimeter))
+                return;
+            Polyline line;
+            for (const Point3 &point : path->polyline.points)
+                line.points.emplace_back(point.to_point());
+            if (line.points.size() >= 2)
+                out.emplace_back(std::move(line));
+        }
+    };
+    for (const LayerRegion *region : layer.regions())
+        for (const ExtrusionEntity *entity : region->perimeters.entities)
+            visit(entity, visit);
+    return out;
+}
+
+// The top / bottom solid surfaces of a layer: the faces the ink will actually land on. Their
+// absence is what makes a layer 'wall only'.
+ExPolygons mkp_top_bottom_surfaces(const Layer &layer)
+{
+    ExPolygons out;
+    for (const LayerRegion *region : layer.regions())
+        for (const Surface &surface : region->fill_surfaces.surfaces)
+            if (surface.is_external() && ! surface.expolygon.empty())
+                out.emplace_back(surface.expolygon);
+    return out;
+}
+
+// Emit the strokes as non-extruding moves at the surface-treatment speed. dE is zero on purpose: the
+// inkjet head only has to follow the path, and the brush does not deposit filament.
+// work_z is where the tool reaches the surface, safe_z is where it may travel: hopping between two
+// contours at work_z would rake the tool over everything standing in between, so each hop is raised
+// to safe_z and only the contour itself runs at work_z.
+void mkp_emit_strokes(std::string &gcode, GCodeWriter &writer, const Vec2d &origin, const Polylines &lines,
+                      double speed_mm_s, coordf_t work_z, coordf_t safe_z,
+                      const std::string &role_pass, const std::string &role_reset,
+                      const mkp::SurfaceTone *tone, double speed_min, double speed_max)
+{
+    if (lines.empty())
+        return;
+    const double f = speed_mm_s > 0. ? speed_mm_s * 60. : 0.;
+    for (const Polyline &polyline : lines) {
+        if (polyline.points.size() < 2)
+            continue;
+        // Getting to a contour is travel, never a pass: the hop in from wherever the head was, and
+        // every jump from one contour to the next. Emitting them under the surface role made the
+        // preview draw a long stroke through thin air between the outline and a hole; the moves have
+        // to be tagged as travel so only the actual contour is a surface treatment path.
+        mkp_z(gcode, writer, safe_z);
+        gcode += role_reset;
+        gcode += writer.travel_to_xy(unscale(polyline.points.front()) + origin);
+        mkp_z(gcode, writer, work_z, "F600");
+        gcode += role_pass;
+        if (!tone && f > 0.)
+            writer.set_speed(gcode, f);
+        long previous_feed = -1;
+        for (size_t i = 1; i < polyline.points.size(); ++i) {
+            const Vec2d end = unscale(polyline.points[i]);
+            if (tone) {
+                const Vec2d start = unscale(polyline.points[i - 1]);
+                const Vec2d delta = end - start;
+                // Sample in model coordinates, before applying the tool and instance offsets.
+                const int count = std::max(1, int(std::ceil(delta.norm() / mkp::SurfaceTone::cell_mm)));
+                for (int j = 0; j < count; ++j) {
+                    const double lightness = tone->lightness_at(start + delta * ((j + 0.5) / count));
+                    const long feed = std::lround(60. * (speed_min + (speed_max - speed_min) * lightness));
+                    if (feed != previous_feed) {
+                        if (j > 0)
+                            writer.extrude_to_xy(gcode, start + delta * (double(j) / count) + origin, 0., std::string(), true);
+                        writer.set_speed(gcode, feed);
+                        previous_feed = feed;
+                    }
+                }
+            }
+            writer.extrude_to_xy(gcode, end + origin, 0., std::string(), true);
+        }
+    }
+    mkp_z(gcode, writer, safe_z);
+}
+
+// The head's own geometry - the 14.29 mm bar, the 9.99 mm step, the 20 mm merge gap and the 7 mm
+// lead-in - lives with the texture slicing in MkpInkjet.cpp, because that is where a pass is decided.
+// The MBrush head sits at this address on the printer's USB virtual NIC - fixed by the head's own
+// firmware, which is why the post-processor hard-coded it too (MKPSpectrum.py MBRUSH_USB_ADDRESS).
+
+// The passes must read as hairlines in the preview, the way travels do: no filament is involved, so
+// there is no bead to draw. GCodeProcessor takes this tag as a forced width.
+constexpr double MKP_HAIRLINE_WIDTH_MM    = 0.05;
+
+std::string mkp_surface_block(GCodeWriter &writer, const FullPrintConfig &config, const Vec2d &origin, coordf_t origin_z,
+                              size_t layer_id, const std::string &ink_prefix, const ExPolygons &area,
+                              const ExPolygons &top_bottom, const Polylines &walls, const mkp::InkLayer *ink,
+                              bool &inkjet_started, double &flush_filament, size_t nozzle_index)
+{
+    std::string gcode;
+    if (area.empty() || ! config.mkp_surface_enabled.value)
+        return gcode;
+    const coordf_t spacing = scaled<coordf_t>(config.mkp_surface_line_spacing.value);
+    if (spacing <= 0.)
+        return gcode;
+
+    // The ink is what these passes exist for: a layer the picture does not reach has nothing to print
+    // on, and sweeping the brush over it only costs time. So a layer without ink gets neither pass -
+    // not the spray, and not the surface treatment either.
+    if (ink == nullptr || ink->empty())
+        return gcode;
+    const auto &bands = ink->bands;
+    const auto *tone = config.mkp_surface_linear_speed.value ? &ink->tone : nullptr;
+    const double min_speed = std::max(0.1, config.mkp_surface_speed_min.value);
+    const double max_speed = std::max(min_speed, config.mkp_surface_speed_max.value);
+
+    const double fill_speed = config.mkp_surface_speed.value;
+    const double wall_speed = config.mkp_surface_wall_speed.value > 0.
+        ? config.mkp_surface_wall_speed.value : fill_speed;
+    char         buf[160];
+    ::sprintf(buf, ";MKP_SURFACE_START layer=%zu z=%.3f spacing=%.3f\n", layer_id, origin_z,
+              unscale<double>(spacing));
+    gcode += buf;
+    ::sprintf(buf, ";WIDTH:%.3f\n", MKP_HAIRLINE_WIDTH_MM);
+    gcode += buf;
+
+    const std::string role_tag   = ";" + GCodeProcessor::reserved_tag(GCodeProcessor::ETags::Role);
+    // Getting to a block is travel: no ink leaves the bar, so it must not carry one of the two
+    // surface roles, or the preview would draw it as a pass.
+    const std::string role_reset = role_tag + "Custom\n";
+
+
+    // ---- 表面处理: the brush.
+    // Only a layer that exposes a top or a bottom face needs a swept surface: those are the faces
+    // the ink lands on. A layer with neither is wall-only (overhang included) and gets a single
+    // pass around each contour instead of a raster over the whole section, which used to emit
+    // dozens of useless passes per layer.
+    {
+        Polylines brush;
+        if (! top_bottom.empty()) {
+            brush = mkp_raster_polylines(top_bottom, spacing, true);
+            if (config.mkp_surface_pattern.value == mkpGrid) {
+                Polylines cross = mkp_raster_polylines(top_bottom, spacing, false);
+                brush.reserve(brush.size() + cross.size());
+                for (Polyline &polyline : cross)
+                    brush.emplace_back(std::move(polyline));
+            }
+        }
+        if (! brush.empty() || !walls.empty()) {
+            // The brush hangs beside the nozzle, so every move below is a *nozzle* position: the
+            // brush offset is added on top of the model coordinate, exactly as the post-processor
+            // did (x_mm + offset_x). Z is the same story - the brush rides at its own height above
+            // the nozzle, so the pass runs at layer_z + brush_offset_z and the grab / release macros
+            // lift to the same place.
+            const double brush_lift = config.mkp_brush_offset_z.value;
+            const Vec2d  brush_origin = origin + Vec2d(config.mkp_brush_offset_x.value,
+                                                      config.mkp_brush_offset_y.value);
+            // The Z offset is the height at which the bristles reach the surface - the working
+            // height. Everything else happens at working + clearance, because the brush hangs below
+            // the nozzle and would otherwise be dragged across the print (and into the plate).
+            const coordf_t brush_work = origin_z + brush_lift;
+            const coordf_t brush_safe = brush_work + MKP_TOOL_TRAVEL_CLEARANCE_MM;
+            // Nothing is attached on the way to the dock, so the ordinary clearance hop is enough;
+            // the macro's own dock Z takes the bare nozzle down to the brush, and mkp_lift_after_dock
+            // brings it back up to travel height before it leaves the dock.
+            std::string brush_grab = mkp_expand_macro(config.mkp_grab_brush_gcode.value, origin_z, brush_lift);
+            mkp_lift_after_dock(brush_grab, brush_safe);
+            gcode += writer.travel_to_z(origin_z + std::max<coordf_t>(config.z_hop.get_at(0), 2.), "clearance lift before dock travel");
+            mkp_emit_macro(gcode, writer, brush_grab);
+            mkp_force_z(gcode, writer, brush_safe);
+            mkp_emit_strokes(gcode, writer, brush_origin, walls,
+                             wall_speed, brush_work, brush_safe,
+                             role_tag + "Surface treatment\n", role_reset, tone, min_speed, max_speed);
+            mkp_emit_strokes(gcode, writer, brush_origin, brush,
+                             fill_speed, brush_work, brush_safe,
+                             role_tag + "Surface treatment\n", role_reset, tone, min_speed, max_speed);
+            gcode += role_reset;
+            // The way back to the dock is a travel as well: start it clear, the macro lowers the
+            // brush into the dock on its own.
+            mkp_force_z(gcode, writer, brush_safe);
+            mkp_emit_macro(gcode, writer, mkp_expand_macro(config.mkp_release_brush_gcode.value, origin_z, brush_lift));
+        }
+    }
+
+    // ---- 喷墨路径: one inert pass per block. The bar only sprays while it is moving across a block;
+    // getting there and moving between blocks is travel, which is exactly what the preview has to
+    // show. Nothing is extruded, so the moves stay hairlines.
+    {
+        // Where the bar fires comes only from the texture: `bands` holds the passes the texture cut
+        // at this layer's height produced (and was checked non-empty above), and every one of them
+        // already has its .mbd strip sitting in the archive.
+        {
+            // Same convention as the brush: the inkjet head is mounted at a fixed X/Y/Z offset from
+            // the nozzle, so the emitted moves are nozzle positions (model + offset). The Z offset is
+            // the 62 mm the post-processor used to hard-code as the head's clearance height.
+            const double inkjet_x    = config.mkp_inkjet_offset_x.value;
+            const double inkjet_y    = config.mkp_inkjet_offset_y.value;
+            const double inkjet_lift = config.mkp_inkjet_offset_z.value;
+            // Same convention as the brush: the offset is the head's firing distance above the
+            // layer. Travel - out of the dock, between blocks, back into the dock - runs higher.
+            const coordf_t inkjet_work = origin_z + inkjet_lift;
+            const coordf_t inkjet_safe = inkjet_work + MKP_TOOL_TRAVEL_CLEARANCE_MM;
+            const double inkjet_speed = config.mkp_inkjet_speed.value;
+            // Use the ordinary travel acceleration on every inkjet pass, including
+            // calibration. The inkjet feed rate still controls firing speed.
+            const unsigned int previous_acceleration = writer.get_print_acceleration();
+            const double travel_acceleration = config.travel_acceleration.get_at(nozzle_index);
+            const unsigned int inkjet_acceleration = static_cast<unsigned int>(std::lround(
+                config.default_acceleration.get_at(nozzle_index) > 0. && travel_acceleration > 0.
+                    ? travel_acceleration : 0.));
+            const bool mbrush = config.mkp_inkjet_device.value == mkpInkjetMBrush;
+            double used_filament = 0.;
+            for (const Extruder &extruder : writer.extruders())
+                used_filament += extruder.used_filament();
+            const bool flush_due = !inkjet_started ||
+                (config.mkp_inkjet_flush_mode.value == mkpFlushByFilament &&
+                 used_filament - flush_filament >= config.mkp_inkjet_flush_interval.value);
+            if (mbrush && flush_due) {
+                char mode[160];
+                ::sprintf(mode, "M400\nMBRUSH_FLUSH IP=%s SPEED=%d\n", MKP_MBRUSH_ADDRESS,
+                          std::max(1, int(inkjet_speed)));
+                gcode += mode;
+                inkjet_started = true;
+                flush_filament = used_filament;
+            }
+            std::string inkjet_grab = mkp_expand_macro(config.mkp_grab_inkjet_gcode.value, origin_z, inkjet_lift);
+            mkp_lift_after_dock(inkjet_grab, inkjet_safe);
+            gcode += writer.travel_to_z(origin_z + std::max<coordf_t>(config.z_hop.get_at(0), 2.), "clearance lift before dock travel");
+            mkp_emit_macro(gcode, writer, inkjet_grab);
+            mkp_force_z(gcode, writer, inkjet_safe);
+            // Macro recovery is deferred to the next native extrusion, not replayed on the model.
+            std::string inkjet_release = mkp_expand_macro(config.mkp_release_inkjet_gcode.value, origin_z, inkjet_lift);
+            // The head's own pass speed. The brush above uses the surface-treatment speed; the two
+            // are separate controls because they are separate motions, and the old post-processor
+            // read its print speed from the inkjet block, not from the surface-treatment one.
+            const double print_f  = (inkjet_speed > 0. ? inkjet_speed * 60. : 0.);
+            // Repeat count and the dry dwell between passes. Both were dead controls before; they are
+            // what lets one layer take more ink than a single pass can lay down.
+            const int    repeat_count = std::max(1, config.mkp_inkjet_repeat.value);
+            const int    dry_time     = std::max(0, config.mkp_inkjet_dry_time.value);
+            // MBrush takes one MBD strip per block and is told where to fetch it; MKPSjet is driven
+            // over its serial port and takes no file at all.
+            char         buf[512];
+            size_t       block = 0;
+            for (int pass_idx = 0; pass_idx < repeat_count; ++pass_idx) {
+            if (pass_idx > 0) {
+                // Everything has come to rest by now: hold still and let the ink settle.
+                gcode += role_reset;
+                gcode += "M400\n";
+                if (dry_time > 0) {
+                    char dwell[64];
+                    ::sprintf(dwell, "G4 P%d\n", dry_time * 1000);
+                    gcode += dwell;
+                }
+            }
+            for (const mkp::InkBand &band : bands) {
+                const double y_world = unscale<double>(band.y) + origin.y() + inkjet_y;
+                const double x_start = unscale<double>(band.x0) + origin.x() + inkjet_x;
+                double x_stop  = unscale<double>(band.x1) + origin.x() + inkjet_x;
+                if (mbrush) {
+                    // Match the original strip pipeline's 10 mm run-out: the
+                    // head's staggered ink channels finish after the image edge.
+                    double bed_max_x = 0.;
+                    for (const auto &point : config.printable_area.values)
+                        bed_max_x = std::max(bed_max_x, point.x());
+                    if (!(x_stop <= bed_max_x && bed_max_x < x_stop + 10.))
+                        x_stop += 10.;
+                }
+                // Travel to the block's start at travel height, then settle above it, then drop to
+                // the firing distance - the bar must not be dragged across the print to reach it.
+                gcode += role_reset;
+                mkp_z(gcode, writer, inkjet_safe);
+                gcode += writer.travel_to_xy(Vec2d(x_start, y_world));
+                gcode += "M400\n";
+                mkp_z(gcode, writer, inkjet_work, "F600");
+                gcode += writer.set_travel_acceleration(inkjet_acceleration);
+                if (mbrush) {
+                    gcode += "M400\n";
+                    ::sprintf(buf, "MBRUSH_UPLOAD IP=%s FILE=\"%slayer_%04zu/%05zu.mbd\"\n",
+                              MKP_MBRUSH_ADDRESS, ink_prefix.c_str(), layer_id, block);
+                    gcode += buf;
+                }
+                // Fire across the block.
+                gcode += role_tag + "Inkjet path\n";
+                if (print_f > 0.)
+                    writer.set_speed(gcode, print_f);
+                writer.extrude_to_xy(gcode, Vec2d(x_stop, y_world), 0., std::string(), true);
+                gcode += role_reset;
+                gcode += "M400\n";
+                ++block;
+            }
+            }
+            gcode += writer.set_print_acceleration(previous_acceleration);
+            mkp_force_z(gcode, writer, inkjet_safe);
+            mkp_emit_macro(gcode, writer, inkjet_release);
+        }
+    }
+
+    // Hand the actual dock position and outstanding retraction back to the native planner.
+    // Its next destination is the wipe tower when one is scheduled; do not detour over the model.
+    gcode += ";WIDTH:0\n";
+    gcode += ";MKP_SURFACE_END\n";
+    return gcode;
+}
+
+} // namespace
+
 LayerResult GCode::process_layer(
     const Print                    			&print,
     // Set of object & print layers of the same PrintObject and with the same print_z.
@@ -7575,6 +8328,14 @@ LayerResult GCode::process_layer(
         
         gcode += std::move(gcode_toolchange);
 
+        if (m_mkp_tower_recovery_pending && m_wipe_tower) {
+            const double layer_z = m_writer.get_position().z();
+            gcode += m_wipe_tower->recover_after_inkjet(*this);
+            m_writer.get_position().z() = layer_z;
+            m_need_change_layer_lift_z = true;
+            m_mkp_tower_recovery_pending = false;
+        }
+
         // let analyzer tag generator aware of a role type change
         if (layer_tools.has_wipe_tower && m_wipe_tower)
             m_last_processor_extrusion_role = erWipeTower;
@@ -8227,6 +8988,87 @@ LayerResult GCode::process_layer(
         gcode += insert_timelapse_gcode();
     }
 
+    // MKP: the inkjet and brush passes are geometry of *this* layer, so they are emitted here while
+    // the sliced cross-section is still at hand. Retract first: whatever happens next starts with a
+    // dock movement the nozzle must not drag filament into.
+    if (object_layer != nullptr && m_config.mkp_surface_enabled.value &&
+        m_config.mkp_surface_line_spacing.value > 0.) {
+        const Vec2d saved_origin = m_origin;
+        std::string surface_gcode;
+        for (const LayerToPrint &ltp : layers) {
+            const Layer       *ltp_layer = ltp.object_layer;
+            if (ltp_layer == nullptr || ltp_layer->lslices.empty())
+                continue;
+            const PrintObject *print_object = ltp_layer->object();
+            if (print_object == nullptr)
+                continue;
+            for (const PrintInstance &instance : print_object->instances()) {
+                this->set_origin(unscale(instance.shift));
+                const mkp::InkLayer *ink        = nullptr;
+                auto                 object_it = m_mkp_ink.find(print_object);
+                if (object_it != m_mkp_ink.end()) {
+                    auto layer_it = object_it->second.find(ltp_layer);
+                    if (layer_it != object_it->second.end())
+                        ink = &layer_it->second;
+                }
+                if (ink == nullptr || ink->empty())
+                    continue;
+                if (surface_gcode.empty()) {
+                    surface_gcode = ";_MKP_FANS_SUSPEND\n";
+                    const double length = m_config.mkp_inkjet_retract_length.value;
+                    if (length > 0.) {
+                        if (FILAMENT_CONFIG(wipe) && m_wipe.path.points.size() >= 2 &&
+                            FILAMENT_CONFIG(wipe_distance) > EPSILON) {
+                            const auto wipe = m_wipe.calculateWipeRetractionLengths(*this, false);
+                            const double before = std::min(length, wipe.retraction_length_before_wipe);
+                            if (before > EPSILON)
+                                surface_gcode += m_writer.retract(true, before);
+                            surface_gcode += m_wipe.wipe(*this, std::min(length - before, wipe.retraction_length_during_wipe));
+                        }
+                        surface_gcode += m_writer.retract(false, length);
+                    }
+                    m_wipe.reset_path();
+                    if (m_writer.filament() && length > 0.) {
+                        // Preserve Orca's selected hop shape, but run it before docking.
+                        const auto hop = ZHopType(FILAMENT_CONFIG(z_hop_types));
+                        surface_gcode += m_writer.eager_lift(hop == ZHopType::zhtAuto ? LiftType::SpiralLift : to_lift_type(hop));
+                    }
+                }
+                // Strips for this object live under its own prefix inside _temp.zip whenever more
+                // than one object shares the file.
+                static const std::string no_prefix;
+                auto                     prefix_it = m_mkp_ink_prefix.find(print_object);
+                const std::string       &ink_prefix = prefix_it != m_mkp_ink_prefix.end() ? prefix_it->second : no_prefix;
+                const ExPolygons  top_bottom = mkp_top_bottom_surfaces(*ltp_layer);
+                const Polylines walls = mkp_wall_paths(*ltp_layer, m_config.mkp_surface_inner_walls.value);
+                const std::string block = mkp_surface_block(m_writer, m_config, m_origin, print_z, layer.id(),
+                                                            ink_prefix, ltp_layer->lslices, top_bottom, walls, ink,
+                                                            m_mkp_inkjet_started, m_mkp_inkjet_flush_filament,
+                                                            get_nozzle_config_index(m_writer.filament()->id()));
+
+                if (! block.empty()) {
+                    surface_gcode += block;
+                    m_wipe.reset_path();
+                    this->set_last_pos(this->gcode_to_point(m_writer.get_position().head<2>()));
+                }
+            }
+        }
+        if (!surface_gcode.empty()) {
+            surface_gcode += ";_MKP_FANS_RESUME\n";
+            if (gcode.empty() || gcode.back() != '\n')
+                gcode += '\n';
+            gcode += wrap_custom_gcode_for_fan_mover(m_config, surface_gcode);
+            if (m_wipe_tower) {
+                if (!last_layer && wipe_tower_type() == WipeTowerType::Type2 && m_config.mkp_full_height_prime_tower.value) {
+                    m_mkp_recovery_travel_z = m_writer.get_position().z();
+                    m_mkp_tower_recovery_pending = true;
+                } else
+                    gcode += m_wipe_tower->recover_after_inkjet(*this);
+            }
+        }
+        this->set_origin(saved_origin);
+    }
+
     result.gcode = std::move(gcode);
     result.cooling_buffer_flush = object_layer || raft_layer || last_layer;
     return result;
@@ -8279,10 +9121,23 @@ void GCode::append_full_config(const Print &print, std::string &str)
                                                             : cfg.option<ConfigOptionFloats>("flush_multiplier")->values;
         std::vector<double> temp_flush_volumes_matrix = cfg.option<ConfigOptionFloats>("flush_volumes_matrix")->values;
         auto                temp_filament_color       = cfg.option<ConfigOptionStrings>("filament_colour")->values;
-        size_t              heads_count_tmp           = temp_cfg_flush_multiplier.size(),
-               matrix_value_count                     = temp_flush_volumes_matrix.size() / temp_cfg_flush_multiplier.size(),
-               filament_count_tmp                     = temp_filament_color.size();
-        if (filament_count_tmp * filament_count_tmp * heads_count_tmp == temp_flush_volumes_matrix.size()) {
+        // The authoritative nozzle/head count for flush_volumes_matrix is nozzle_diameter, because that is
+        // what get_flush_volumes_matrix() splits the flat matrix by. flush_multiplier is a per-extruder
+        // option and may legitimately carry a single value on a multi-nozzle machine, so it has to be
+        // broadcast instead of being mistaken for the head count. Getting this wrong aborted the whole
+        // G-code export with "Flush volumes matrix do not match to the correct size!" even though this
+        // block only feeds the diagnostic config dump written into the G-code header.
+        size_t filament_count_tmp = temp_filament_color.size();
+        size_t heads_count_tmp    = cfg.option<ConfigOptionFloats>("nozzle_diameter")->values.size();
+        if (heads_count_tmp == 0)
+            heads_count_tmp = 1;
+        if (temp_cfg_flush_multiplier.empty())
+            temp_cfg_flush_multiplier.assign(heads_count_tmp, 1.0);
+        else if (temp_cfg_flush_multiplier.size() == 1 && heads_count_tmp > 1)
+            temp_cfg_flush_multiplier.assign(heads_count_tmp, temp_cfg_flush_multiplier.front());
+        if (filament_count_tmp * filament_count_tmp * heads_count_tmp == temp_flush_volumes_matrix.size()
+            && temp_cfg_flush_multiplier.size() == heads_count_tmp) {
+            size_t matrix_value_count = filament_count_tmp * filament_count_tmp;
             for (size_t idx = 0; idx < heads_count_tmp; ++idx) {
                 double temp_cfg_flush_multiplier_idx = temp_cfg_flush_multiplier[idx];
                 size_t temp_begin_t = idx * matrix_value_count, temp_end_t = (idx + 1) * matrix_value_count;
@@ -8291,10 +9146,12 @@ void GCode::append_full_config(const Print &print, std::string &str)
                                [temp_cfg_flush_multiplier_idx](double inputx) { return std::round(inputx * temp_cfg_flush_multiplier_idx); });
             }
             cfg.option<ConfigOptionFloats>("flush_volumes_matrix")->values = temp_flush_volumes_matrix;
-        } else if (filament_count_tmp == 1) {
-        } // Not applicable to flush matrix situations
-        else { // flush_volumes_matrix value count error?
-            throw Slic3r::SlicingError(_(L("Flush volumes matrix do not match to the correct size!")));
+        } else {
+            // Size mismatch: keep the stored values untouched. The purge volumes actually used for
+            // printing come from get_flush_volumes_matrix() and are not affected by this header snapshot.
+            BOOST_LOG_TRIVIAL(warning) << "flush_volumes_matrix size " << temp_flush_volumes_matrix.size()
+                                       << " does not match filaments^2 * nozzles (" << filament_count_tmp << "^2 * "
+                                       << heads_count_tmp << "); keeping values as-is for the config dump";
         }
     }
     // filament_map_2 (the per-filament (extruder x volume-type) slot map) is computed during apply /
@@ -8463,7 +9320,7 @@ std::string GCode::change_layer(coordf_t print_z)
         gcode += m_writer.update_progress(++ m_layer_index, m_layer_count);
     //BBS
     coordf_t z = print_z + m_config.z_offset.value;  // in unscaled coordinates
-    if (FILAMENT_CONFIG(retract_when_changing_layer) && m_writer.will_move_z(z)) {
+    if (!m_mkp_tower_recovery_pending && FILAMENT_CONFIG(retract_when_changing_layer) && m_writer.will_move_z(z)) {
         LiftType lift_type = this->to_lift_type(ZHopType(FILAMENT_CONFIG(z_hop_types)));
         //BBS: force to use SpiralLift when change layer if lift type is auto
         gcode += this->retract(false, false, ZHopType(FILAMENT_CONFIG(z_hop_types)) == ZHopType::zhtAuto ? LiftType::SpiralLift : lift_type);
@@ -9112,12 +9969,86 @@ void GCode::GCodeOutputStream::close()
 void GCode::GCodeOutputStream::write(const char *what)
 {
     if (what != nullptr) {
-        const char* gcode = what;
+        const std::string filtered = filter_mkp_fans(what);
+        const char* gcode = filtered.c_str();
         // writes string to file
         fwrite(gcode, 1, ::strlen(gcode), this->f);
         //FIXME don't allocate a string, maybe process a batch of lines?
         m_processor.process_buffer(std::string(gcode));
     }
+}
+
+std::string GCode::GCodeOutputStream::filter_mkp_fans(const char *what)
+{
+    std::string out;
+    const std::string_view input(what);
+    for (size_t begin = 0; begin < input.size();) {
+        const size_t newline = input.find('\n', begin);
+        const size_t end = newline == std::string_view::npos ? input.size() : newline + 1;
+        const std::string raw(input.substr(begin, end - begin));
+        begin = end;
+        if (raw == ";_MKP_FANS_SUSPEND\n" || raw == ";_MKP_FANS_SUSPEND\r\n") {
+            out += ";MKP_FANS_OFF\n";
+            for (const auto &fan : m_fans)
+                out += fan.second.first;
+            m_mkp_fans_suspended = true;
+            continue;
+        }
+        if (raw == ";_MKP_FANS_RESUME\n" || raw == ";_MKP_FANS_RESUME\r\n") {
+            out += ";MKP_FANS_RESTORE\n";
+            // Preserve ordering for firmware that aliases M106 and an explicit primary channel.
+            for (const std::string &key : m_fan_order)
+                out += m_fans.at(key).second;
+            m_mkp_fans_suspended = false;
+            continue;
+        }
+
+        const bool m106 = GCodeReader::GCodeLine::cmd_is(raw, "M106");
+        const bool m107 = GCodeReader::GCodeLine::cmd_is(raw, "M107");
+        const bool maker = GCodeReader::GCodeLine::cmd_is(raw, "M126") ||
+                           GCodeReader::GCodeLine::cmd_is(raw, "M127");
+        const bool named = GCodeReader::GCodeLine::cmd_is(raw, "SET_FAN_SPEED");
+        if (!m106 && !m107 && !maker && !named) {
+            out += raw;
+            continue;
+        }
+        // Cooling/fan lead-time filters may insert commands into the interval. They must not
+        // replace the saved state either: resume means the actual state before spraying.
+        if (m_mkp_fans_suspended)
+            continue;
+        std::string key = "primary";
+        std::string off = GCodeWriter::set_fan(m_flavor, 0);
+        if (named) {
+            std::istringstream words(raw.substr(0, raw.find(';')));
+            std::string word;
+            while (words >> word)
+                if (word.compare(0, 4, "FAN=") == 0) {
+                    key = word;
+                    off = "SET_FAN_SPEED " + word + " SPEED=0\n";
+                }
+        } else if (m106 || m107) {
+            GCodeReader reader;
+            reader.parse_buffer(raw, [&](GCodeReader &, const GCodeReader::GCodeLine &line) {
+                float tool = 0.f;
+                const bool has_tool = line.has_value('T', tool);
+                const int channel = line.has_p() ? int(line.p()) : 0;
+                if (channel != 0 || has_tool) {
+                    key = "P" + std::to_string(channel);
+                    off = "M106 P" + std::to_string(channel);
+                    if (has_tool) {
+                        key += "T" + std::to_string(int(tool));
+                        off += " T" + std::to_string(int(tool));
+                    }
+                    off += " S0\n";
+                }
+            });
+        }
+        m_fans[key] = {off, raw + (raw.back() == '\n' ? "" : "\n")};
+        m_fan_order.erase(std::remove(m_fan_order.begin(), m_fan_order.end(), key), m_fan_order.end());
+        m_fan_order.emplace_back(key);
+        out += raw;
+    }
+    return out;
 }
 
 void GCode::GCodeOutputStream::writeln(const std::string &what)
@@ -9780,6 +10711,63 @@ std::string GCode::_extrude_piece(const ExtrusionPath &path, const std::string &
             }
     }
 
+    // Actual outer-wall extrusion uses the same per-layer, object-local tone map as the
+    // inkjet picture. Instance and tool offsets are applied only by the native writer below.
+    const mkp::SurfaceTone *wall_tone = nullptr;
+    if (m_config.mkp_outer_wall_linear_speed.value &&
+        (path.role() == erExternalPerimeter || path.role() == erOverhangPerimeter) && m_layer != nullptr) {
+        const auto object_it = m_mkp_ink.find(m_layer->object());
+        if (object_it != m_mkp_ink.end()) {
+            const auto layer_it = object_it->second.find(m_layer);
+            if (layer_it != object_it->second.end() && !layer_it->second.tone.darkness.empty())
+                wall_tone = &layer_it->second.tone;
+        }
+    }
+    if (wall_tone != nullptr) {
+        // Reuse native segmented extrusion so E, scarf joints, cooling, overhang fans and
+        // adaptive PA retain their normal behavior. The original, already-limited speed
+        // is a ceiling, not a replacement for first-layer / bridge / volumetric limits.
+        std::vector<ProcessedPoint> original = std::move(new_points);
+        if (original.empty()) {
+            original.reserve(path.polyline.points.size());
+            for (const Point3 &point : path.polyline.points)
+                original.push_back({point, float(speed), 1.f});
+        }
+        new_points.clear();
+        for (size_t i = 1; i < original.size(); ++i) {
+            const ProcessedPoint &a = original[i - 1];
+            const ProcessedPoint &b = original[i];
+            const Vec3d delta = b.p.cast<double>() - a.p.cast<double>();
+            const double length = delta.head<2>().norm() * SCALING_FACTOR;
+            const int count = std::max(1, int(std::ceil(length / mkp::SurfaceTone::cell_mm)));
+            const double ceiling = std::min(speed, double(a.speed));
+            const double floor = std::min(ceiling, m_config.mkp_outer_wall_speed_min.value);
+            for (int j = 0; j < count; ++j) {
+                const double t = double(j) / count;
+                const Vec3d point = a.p.cast<double>() + delta * t;
+                const Vec2d sample = (a.p.cast<double>() + delta * ((j + 0.5) / count)).head<2>() * SCALING_FACTOR;
+                ProcessedPoint next;
+                next.p = Point3(coord_t(std::llround(point.x())), coord_t(std::llround(point.y())),
+                                coord_t(std::llround(point.z())));
+                next.speed = float(floor + (ceiling - floor) * wall_tone->lightness_at(sample));
+                next.overlap = float(a.overlap + (b.overlap - a.overlap) * t);
+                // Merge equal-speed samples only inside the same straight source segment.
+                // Keep original corners and overhang/fan transitions intact.
+                if (j > 0 && !new_points.empty() &&
+                    std::lround(next.speed * 60.) == std::lround(new_points.back().speed * 60.) &&
+                    std::abs(next.overlap - new_points.back().overlap) < EPSILON)
+                    continue;
+                new_points.push_back(next);
+            }
+        }
+        if (!original.empty())
+            new_points.push_back(original.back());
+        requires_segmented_extrusion = new_points.size() >= 2;
+        // set_accel_and_jerk() above retains accel_to_decel_factor and emits Klipper's
+        // MINIMUM_CRUISE_RATIO. The firmware plans finite acceleration/deceleration
+        // across these connected segments; do not insert stops at colour boundaries.
+    }
+
     double F = speed * 60;  // convert mm/sec to mm/min
     
     // Orca: Dynamic PA
@@ -10273,7 +11261,10 @@ std::string GCode::_extrude_piece(const ExtrusionPath &path, const std::string &
             
             // Ignore small speed variations - emit speed change if the delta between current and new is greater than 60mm/min / 1mm/sec
             // Reset speed to F if delta to F is less than 1mm/sec
-            if ((std::abs(last_set_speed - new_speed) > 60)) {
+            if (wall_tone != nullptr) {
+                m_writer.set_speed(gcode, new_speed, "", comment);
+                last_set_speed = new_speed;
+            } else if ((std::abs(last_set_speed - new_speed) > 60)) {
                 m_writer.set_speed(gcode, new_speed, "", comment);
                 last_set_speed = new_speed;
             } else if ((std::abs(F - new_speed) <= 60)) {

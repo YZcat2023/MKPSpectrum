@@ -6,5 +6,6 @@
 orcaslicer_add_cmake_project(NanoSVG
     DEPENDS dep_Boost
     URL https://github.com/SoftFever/nanosvg/archive/863f6aa97ef62028126fa2c19bd4350394c2e15e.zip
-        URL_HASH SHA256=8d9c1624ad6518dd6dfa31e4f8dc7da9ec243d88bae595c7a037450617fec851
+        # Upstream repo renamed SoftFever/nanosvg -> Orca-deps-nanosvg; GitHub regenerated the archive, so the hash below is the current one for the same commit.
+    URL_HASH SHA256=1e3f94a052dd2abb139993ed3496c90ed4458d6f907027bf03cbaed889fe2567
 )

@@ -23,6 +23,7 @@
 #include "libslic3r/Config.hpp"
 #include "libslic3r/CustomGCode.hpp"
 #include "libslic3r/TextureDisplacement.hpp"
+#include "libslic3r/TexturePainting.hpp"
 #include "libslic3r_version.h"
 
 #include "bbs_3mf.hpp"
@@ -363,6 +364,11 @@ static constexpr const char* TEXTURE_DISPLACEMENT_ATTRS[Slic3r::TEXTURE_DISPLACE
     "paint_texture_4", "paint_texture_5", "paint_texture_6", "paint_texture_7" };
 static constexpr const char* TEXTURE_DISPLACEMENT_KEY = "texture_displacement";
 static constexpr const char* TEXTURE_DISPLACEMENT_DIR = "Metadata/texture_displacement/";
+// The picture a textured import is drawn with (ModelVolume::display_texture). One binary blob per volume,
+// named by the volume metadata key below (see add_model_texture()); it holds the per-face uvs and the
+// images as PNG.
+static constexpr const char* MODEL_TEXTURE_KEY = "model_texture";
+static constexpr const char* MODEL_TEXTURE_DIR = "Metadata/model_texture/";
 // BBS
 static constexpr const char* FACE_PROPERTY_ATTR = "face_property";
 
@@ -1221,6 +1227,10 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
         // every file it could refer to is already in here, whatever order the archive happened to be in.
         std::map<std::string, std::string> m_texture_displacement_files;
         void _apply_texture_displacement(ModelVolume &volume, const std::string &json_path);
+        // Original texture display data: every file under Metadata/model_texture/, by archive path, for
+        // the same reason as above - a volume names its blob only after the whole archive was walked.
+        std::map<std::string, std::string> m_model_texture_files;
+        void _apply_model_texture(ModelVolume &volume, const std::string &path);
         std::string m_curr_metadata_name;
         std::string m_curr_characters;
         std::string m_name;
@@ -2102,6 +2112,13 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                         m_texture_displacement_files.emplace(name, std::move(contents));
                     else
                         add_error("Error while reading texture displacement data");
+                }
+                else if (boost::algorithm::istarts_with(name, MODEL_TEXTURE_DIR)) {
+                    std::string contents(stat.m_uncomp_size, '\0');
+                    if (mz_zip_reader_extract_to_mem(&archive, stat.m_file_index, contents.data(), stat.m_uncomp_size, 0))
+                        m_model_texture_files.emplace(name, std::move(contents));
+                    else
+                        add_error("Error while reading model texture data");
                 }
                 else if (!dont_load_config && boost::algorithm::iequals(name, SLICE_INFO_CONFIG_FILE)) {
                     m_parsing_slice_info = true;
@@ -3383,6 +3400,44 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
         }
         volume.texture_displacement_layers  = std::move(layers);
         volume.texture_displacement_options = options;
+    }
+
+    // Restores the picture a volume is drawn with, from the blob it named. Like the displacement stack
+    // this runs while the volume is being built, after the whole archive has been walked.
+    //
+    // Nothing here reaches the slicer: a project that lost its blob (older build, hand-edited file) still
+    // opens and still prints, the volume just comes back with the printable colours instead of the
+    // picture - recoverable by importing the original file again, so a warning rather than a failure.
+    void _BBS_3MF_Importer::_apply_model_texture(ModelVolume &volume, const std::string &path)
+    {
+        const auto file = m_model_texture_files.find(path);
+        if (file == m_model_texture_files.end()) {
+            add_error("Missing model texture data: " + path);
+            return;
+        }
+        auto display = std::make_shared<TextureDisplayData>();
+        if (!texture_display_from_bytes(reinterpret_cast<const unsigned char *>(file->second.data()),
+                                        file->second.size(), *display) || display->empty()) {
+            add_error("Malformed model texture data: " + path);
+            return;
+        }
+        // The layout is indexed by triangle, so it is only meaningful against the mesh it was measured
+        // on. A volume whose mesh changed size since then would map the picture onto the wrong faces.
+        if (display->face_uv.size() != volume.mesh().its.indices.size()) {
+            add_error("Model texture data does not match the volume's triangles: " + path);
+            return;
+        }
+        volume.display_texture = display;
+        // The same per-face uv is what an inkjet layer in ModelUV mode places its ink with. Without
+        // it the slice falls back to the analytic projections, and a reopened project sprays a tiled
+        // picture instead of the one the model was painted with. It is the identical layout, already
+        // checked against this mesh above, so it travels with the picture.
+        if (! volume.has_texture_uv()) {
+            volume.texture_uv.reserve(display->face_uv.size() * 3);
+            for (const auto &face : display->face_uv)
+                for (const auto &corner : face)
+                    volume.texture_uv.emplace_back(corner[0], corner[1]);
+        }
     }
 
     void _BBS_3MF_Importer::_extract_embossed_svg_shape_file(const std::string &filename, mz_zip_archive &archive, const mz_zip_archive_file_stat &stat){
@@ -5428,6 +5483,8 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                     volume->name = metadata.value;
                 else if (metadata.key == TEXTURE_DISPLACEMENT_KEY)
                     _apply_texture_displacement(*volume, metadata.value);
+                else if (metadata.key == MODEL_TEXTURE_KEY)
+                    _apply_model_texture(*volume, metadata.value);
                 //else if ((metadata.key == MODIFIER_KEY) && (metadata.value == "1"))
 				//	volume->set_type(ModelVolumeType::PARAMETER_MODIFIER);
 				//for old format
@@ -5614,6 +5671,8 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                     volume->name = metadata.value;
                 else if (metadata.key == TEXTURE_DISPLACEMENT_KEY)
                     _apply_texture_displacement(*volume, metadata.value);
+                else if (metadata.key == MODEL_TEXTURE_KEY)
+                    _apply_model_texture(*volume, metadata.value);
                 //else if ((metadata.key == MODIFIER_KEY) && (metadata.value == "1"))
 				//	volume->set_type(ModelVolumeType::PARAMETER_MODIFIER);
 				//for old format
@@ -8293,6 +8352,29 @@ static void add_texture_displacement(std::stringstream &stream, const ModelVolum
            << VALUE_ATTR << "=\"" << xml_escape(json_path) << "\"/>\n";
 }
 
+// Writes a volume's original-texture display data into the archive and points the volume's metadata at
+// it. The picture is the one thing about a textured import that cannot be rebuilt from the geometry, so
+// it has to travel with the volume: without it a reopened project falls back to the printable colours
+// and the model no longer looks the way it was imported. One blob per volume keeps this to a single
+// archive entry and a single metadata line, whatever the model's face count.
+static void add_model_texture(std::stringstream &stream, const ModelVolume &volume, mz_zip_archive &archive,
+                              const std::string &id)
+{
+    if (!volume.display_texture || volume.display_texture->empty())
+        return;
+
+    const std::vector<unsigned char> blob = texture_display_to_bytes(*volume.display_texture);
+    if (blob.empty())
+        return;
+
+    const std::string path = std::string(MODEL_TEXTURE_DIR) + id + ".mkt";
+    // Deflate on top of the PNGs inside: the uvs and the face tables are raw floats and do compress.
+    if (!mz_zip_writer_add_mem(&archive, path.c_str(), blob.data(), blob.size(), MZ_DEFAULT_COMPRESSION))
+        return;
+    stream << "      <" << METADATA_TAG << " " << KEY_ATTR << "=\"" << MODEL_TEXTURE_KEY << "\" "
+           << VALUE_ATTR << "=\"" << xml_escape(path) << "\"/>\n";
+}
+
 bool _BBS_3MF_Exporter::_add_model_config_file_to_archive(mz_zip_archive& archive, const Model& model, PlateDataPtrs& plate_data_list, const ObjectToObjectDataMap &objects_data, const DynamicPrintConfig& config, int export_plate_idx, bool save_gcode, bool use_loaded_id)
     {
         std::stringstream stream;
@@ -8407,6 +8489,8 @@ bool _BBS_3MF_Exporter::_add_model_config_file_to_archive(mz_zip_archive& archiv
                             }
 
                             add_texture_displacement(stream, *volume, archive, std::to_string(volume->id().id));
+
+                            add_model_texture(stream, *volume, archive, std::to_string(volume->id().id));
                     
                             if (const std::optional<TextConfiguration> &tc = volume->text_configuration;
                                 tc.has_value())

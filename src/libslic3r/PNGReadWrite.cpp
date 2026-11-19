@@ -295,6 +295,8 @@ static bool write_rgb_or_gray_to_file(const char *file_name_utf8, size_t width, 
         int line_width = width;
         if (png_color_type == PNG_COLOR_TYPE_RGB)
             line_width *= 3;
+        else if (png_color_type == PNG_COLOR_TYPE_RGBA)
+            line_width *= 4;
         for (size_t y = 0; y < height; ++ y) {
             auto row = reinterpret_cast<png_byte*>(::png_malloc(png_ptr, line_width));
             row_pointers[y] = row;
@@ -341,6 +343,22 @@ bool write_rgb_to_file(const std::string &file_name_utf8, size_t width, size_t h
 bool write_gray_to_file(const char *file_name_utf8, size_t width, size_t height, const uint8_t *data_gray)
 {
     return write_rgb_or_gray_to_file(file_name_utf8, width, height, PNG_COLOR_TYPE_GRAY, data_gray);
+}
+
+bool write_rgba_to_file(const char *file_name_utf8, size_t width, size_t height, const uint8_t *data_rgba)
+{
+    return write_rgb_or_gray_to_file(file_name_utf8, width, height, PNG_COLOR_TYPE_RGBA, data_rgba);
+}
+
+bool write_rgba_to_file(const std::string &file_name_utf8, size_t width, size_t height, const uint8_t *data_rgba)
+{
+    return write_rgba_to_file(file_name_utf8.c_str(), width, height, data_rgba);
+}
+
+bool write_rgba_to_file(const std::string &file_name_utf8, size_t width, size_t height, const std::vector<uint8_t> &data_rgba)
+{
+    assert(width * height * 4 == data_rgba.size());
+    return write_rgba_to_file(file_name_utf8.c_str(), width, height, data_rgba.data());
 }
 
 bool write_gray_to_file(const std::string &file_name_utf8, size_t width, size_t height, const uint8_t *data_gray)

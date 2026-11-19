@@ -1,6 +1,9 @@
 #include "OctoPrint.hpp"
 
 #include <algorithm>
+#include <cstdlib>
+#include <boost/nowide/fstream.hpp>
+#include <boost/filesystem.hpp>
 #include <boost/optional/optional.hpp>
 #include "libslic3r/Config.hpp"
 #include "libslic3r/PrintConfig.hpp"
@@ -274,6 +277,46 @@ wxString OctoPrint::get_test_failed_msg (wxString &msg) const
 
 bool OctoPrint::upload(PrintHostUpload upload_data, ProgressFn prorgess_fn, ErrorFn error_fn, InfoFn info_fn) const
 {
+    // Moonraker's OctoPrint-compatible endpoint uploads G-code only. Native mBrush jobs also
+    // reference MBD files, so send their archive through Moonraker before uploading/starting G-code.
+    // Ordinary OctoPrint jobs do not have these commands and keep their existing upload path.
+    bool needs_inkjet_archive = false;
+    {
+        boost::nowide::ifstream gcode(upload_data.source_path.string());
+        std::string line;
+        while (std::getline(gcode, line)) {
+            if (boost::starts_with(line, "MBRUSH_UPLOAD ")) {
+                needs_inkjet_archive = true;
+                break;
+            }
+        }
+    }
+    if (needs_inkjet_archive) {
+#ifdef _WIN32
+        const char *home = std::getenv("USERPROFILE");
+#else
+        const char *home = std::getenv("HOME");
+#endif
+        const boost::filesystem::path archive = (home == nullptr ? boost::filesystem::path() :
+            boost::filesystem::path(home)) / "Documents" / "MKPSpectrum" / "Temp" / "Inkjet" / "_temp.zip";
+        bool uploaded = false;
+        auto http = Http::post(make_url("server/files/upload"));
+        set_auth(http);
+        http.form_add("root", "gcodes")
+            .form_add("print", "false")
+            .form_add_file("file", archive.string(), "_temp.zip")
+            .on_complete([&](std::string, unsigned) { uploaded = true; })
+            .on_error([&](std::string body, std::string error, unsigned status) {
+                error_fn(format_error(body, error, status));
+            })
+            .on_progress([&](Http::Progress progress, bool &cancel) { prorgess_fn(std::move(progress), cancel); })
+#ifdef WIN32
+            .ssl_revoke_best_effort(m_ssl_revoke_best_effort)
+#endif
+            .perform_sync();
+        if (!uploaded)
+            return false;
+    }
 #ifndef WIN32
     return upload_inner_with_host(std::move(upload_data), prorgess_fn, error_fn, info_fn);
 #else

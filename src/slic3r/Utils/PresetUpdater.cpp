@@ -1701,6 +1701,13 @@ void PresetUpdater::priv::check_new_vendors(const std::set<std::string>& system_
 void PresetUpdater::check_new_vendors(const std::set<std::string>& system_vendors,
                                        std::function<void(std::vector<std::string>, bool)> callback)
 {
+    // MKPSpectrum: 自建构建没有 vendor profile 服务，profile_update_url() 为空时直接
+    // 报告“没有新 vendor”，否则会拼出 "/new?..." 这种非法地址并每轮记一条警告。
+    if (! p->enabled_config_update) {
+        if (callback)
+            GUI::wxGetApp().CallAfter([callback]() { callback({}, false); });
+        return;
+    }
     p->check_new_vendors(system_vendors, std::move(callback));
 }
 

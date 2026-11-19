@@ -24,6 +24,10 @@
 
 wxDEFINE_EVENT(wxCUSTOMEVT_NOTEBOOK_SEL_CHANGED, wxCommandEvent);
 
+// MKP: how round a tab is. The selected tab is a filled pill in the design, which a square
+// corner cannot reproduce.
+#define TAB_CORNER_RADIUS 4
+
 ButtonsListCtrl::ButtonsListCtrl(wxWindow *parent, wxBoxSizer* side_tools) :
     wxControl(parent, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxBORDER_NONE | wxTAB_TRAVERSAL)
 {
@@ -35,22 +39,22 @@ ButtonsListCtrl::ButtonsListCtrl(wxWindow *parent, wxBoxSizer* side_tools) :
 #ifdef __APPLE__
     default_btn_bg = wxColour("#3B4446"); // Gradient #414B4E
 #else
-    default_btn_bg = wxColour("#2D2D30"); // Gradient #414B4E
+    default_btn_bg = wxColour("#141416"); // MKP: the darkest violet-grey, as the MKP nav bar
 #endif
 
    
     SetBackgroundColour(default_btn_bg);
 
     int em = em_unit(this);// Slic3r::GUI::wxGetApp().em_unit();
-    // BBS: no gap
-    m_btn_margin = 0; // std::lround(0.3 * em);
+    // MKP: a gap, so the tabs read as separate rounded pills instead of one continuous strip.
+    m_btn_margin = std::lround(0.45 * em);
     m_line_margin = std::lround(0.1 * em);
 
     m_sizer = new wxBoxSizer(wxHORIZONTAL);
     this->SetSizer(m_sizer);
 
     m_buttons_sizer = new wxFlexGridSizer(1, m_btn_margin, m_btn_margin);
-    m_sizer->Add(m_buttons_sizer, 0, wxALIGN_CENTER_VERTICAL | wxLEFT | wxBOTTOM, m_btn_margin);
+    m_sizer->Add(m_buttons_sizer, 0, wxALIGN_CENTER_VERTICAL | wxLEFT | wxTOP | wxBOTTOM | wxRIGHT, m_btn_margin);
 
     if (side_tools != NULL) {
         m_sizer->AddStretchSpacer(1);
@@ -114,8 +118,17 @@ void ButtonsListCtrl::Rescale()
     //m_mode_sizer->msw_rescale();
     int em = em_unit(this);
     for (Button* btn : m_pageButtons) {
-        //BBS
-        btn->SetMinSize({(btn->GetLabel().empty() ? 40 : 132) * em / 10, 36 * em / 10});
+        // MKP: keep the compact, caption-hugging size after a DPI/font change as well. The old
+        // 132x36 minimum made every tab turn into a wide slab again on the first rescale.
+        const wxString label = btn->GetLabel();
+        int text_w = 0;
+        if (!label.empty()) {
+            wxClientDC dc(btn);
+            dc.SetFont(btn->GetFont());
+            dc.GetTextExtent(label, &text_w, nullptr);
+        }
+        const int w = label.empty() ? std::lround(4.0 * em) : text_w + std::lround(2.7 * em);
+        btn->SetMinSize({w, std::lround(3.6 * em)});
         btn->Rescale();
     }
 
@@ -130,71 +143,80 @@ void ButtonsListCtrl::Rescale()
 
 void ButtonsListCtrl::SetSelection(int sel)
 {
-    if (m_selection == sel && sel >= 0 && sel < static_cast<int>(m_pageButtons.size()))
-        return;
-    // BBS: change button color
-    wxColour selected_btn_bg("#009688");    // Gradient #009688
-    if (m_selection >= 0 && m_selection < static_cast<int>(m_pageButtons.size())) {
-        StateColor bg_color = StateColor(
-        std::pair{wxColour(107, 107, 107), (int) StateColor::Hovered},
-        std::pair{wxColour(59, 68, 70), (int) StateColor::Normal});
-        m_pageButtons[m_selection]->SetBackgroundColor(bg_color);
-        StateColor text_color = StateColor(
-        std::pair{wxColour(254,254, 254), (int) StateColor::Normal}
-        );
-        m_pageButtons[m_selection]->SetTextColor(text_color);
+    // Repaint every tab from scratch. Restoring only the previously tracked tab was not enough:
+    // a tab can also be painted as selected from another path (a page switch during startup, a
+    // freshly inserted page), and the stale card then stayed highlighted next to the real one.
+    m_selection = (sel >= 0 && sel < static_cast<int>(m_pageButtons.size())) ? sel : -1;
+
+    for (int idx = 0; idx < static_cast<int>(m_pageButtons.size()); ++idx) {
+        Button *btn = m_pageButtons[idx];
+        if (idx == m_selection) {
+            // Selected: the blue-tinted card of the MKP design, which stays put while hovered so
+            // the selected tab never flickers back to the idle colour.
+            btn->SetBackgroundColor(StateColor(
+                std::pair{wxColour(0x33, 0x33, 0x5C), (int) StateColor::Hovered},
+                std::pair{wxColour(0x2A, 0x2A, 0x4A), (int) StateColor::Normal}));
+            btn->SetTextColor(StateColor(
+                std::pair{wxColour(0xE8, 0xE8, 0xF2), (int) StateColor::Normal}));
+        } else {
+            // Idle: caption on the bar, no visible rectangle; the card appears under the pointer.
+            btn->SetBackgroundColor(StateColor(
+                std::pair{wxColour(0x2A, 0x2A, 0x30), (int) StateColor::Hovered},
+                std::pair{wxColour(0x14, 0x14, 0x16), (int) StateColor::Normal}));
+            btn->SetTextColor(StateColor(
+                std::pair{wxColour(0xA8, 0xA8, 0xBE), (int) StateColor::Hovered},
+                std::pair{wxColour(0xA8, 0xA8, 0xBE), (int) StateColor::Normal}));
+        }
+        btn->Refresh();
     }
-
-    if (sel < 0 || sel >= static_cast<int>(m_pageButtons.size())) {
-        m_selection = -1;
-        Refresh();
-        return;
-    }
-
-    m_selection = sel;
-
-    StateColor bg_color = StateColor(
-        std::pair{wxColour(0, 150, 136), (int) StateColor::Hovered},
-        std::pair{wxColour(0,150, 136), (int) StateColor::Normal});
-    m_pageButtons[m_selection]->SetBackgroundColor(bg_color);
-
-    StateColor text_color = StateColor(
-        std::pair{wxColour(254, 254, 254), (int) StateColor::Normal}
-        );
-    m_pageButtons[m_selection]->SetTextColor(text_color);
-    
     Refresh();
 }
 
 bool ButtonsListCtrl::InsertPage(size_t n, const wxString &text, bool bSelect /* = false*/, const std::string &bmp_name /* = ""*/, const wxBitmap &bmp /* = wxNullBitmap */)
 {
-    Button * btn = new Button(this, text, bmp_name, wxNO_BORDER);
-    btn->SetCornerRadius(0);
+    // MKP: the captions carry no icons any more - an icon per tab ate a lot of horizontal
+    // space without adding information. Only an icon-only tab (the home button, which has an
+    // empty caption) still gets a bitmap, otherwise nothing would be drawn on it.
+    Button * btn = text.empty() ? new Button(this, text, bmp_name, wxNO_BORDER)
+                                : new Button(this, text, "", wxNO_BORDER);
+    btn->SetCornerRadius(TAB_CORNER_RADIUS);
 
-    if (bmp_name.empty() && bmp.IsOk())
+    if (text.empty() && bmp_name.empty() && bmp.IsOk())
         btn->SetIcon(bmp);
-
-    // The label no longer carries a leading space, so widen the icon<->text gap to keep the
-    // original spacing between a tab's icon and its caption.
-    {
-        wxClientDC dc(btn);
-        dc.SetFont(btn->GetFont());
-        int space_w = 0;
-        dc.GetTextExtent(" ", &space_w, nullptr);
-        btn->SetIconSpacing(5 + space_w);
-    }
 
     int em = em_unit(this);
     //BBS set size for button
-    btn->SetMinSize({(text.empty() ? 40 : 136) * em / 10, 36 * em / 10});
+    // A compact pill: the label with little padding, so the card hugs the caption the
+    // way it does in the MKP design instead of filling the whole strip.
+    {
+        const int pad_x = std::lround(0.95 * em);
+        btn->SetPaddingSize({pad_x, std::lround(0.35 * em)});
+    }
+    {
+        // Hug the caption: text width plus a little breathing room, instead of a fixed 104.
+        int text_w = 0;
+        if (!text.empty()) {
+            wxClientDC dc(btn);
+            dc.SetFont(btn->GetFont());
+            dc.GetTextExtent(text, &text_w, nullptr);
+        }
+        const int w = text.empty() ? std::lround(4.0 * em) : text_w + std::lround(2.7 * em);
+        btn->SetMinSize({w, std::lround(3.6 * em)});
+    }
 
+    // Idle tab: a slightly lifted purple-grey card that brightens under the cursor. The selected
+    // one is repainted by SetSelection() below.
+    // At rest a tab is just its caption on the bar: same colour, so no rectangle is visible. The
+    // rounded card only appears under the pointer (hover) or on the selected tab.
     StateColor bg_color = StateColor(
-        std::pair{wxColour(107, 107, 107), (int) StateColor::Hovered},
-        std::pair{wxColour(59, 68, 70), (int) StateColor::Normal});
+        std::pair{wxColour(0x2A, 0x2A, 0x30), (int) StateColor::Hovered},
+        std::pair{wxColour(0x14, 0x14, 0x16), (int) StateColor::Normal});
 
     btn->SetBackgroundColor(bg_color);
+    // Hovering must not recolour the caption, so both states carry the same colour.
     StateColor text_color = StateColor(
-        std::pair{wxColour(254,254, 254), (int) StateColor::Normal});
+        std::pair{wxColour(0xA8, 0xA8, 0xBE), (int) StateColor::Hovered},
+        std::pair{wxColour(0xA8, 0xA8, 0xBE), (int) StateColor::Normal});
     btn->SetTextColor(text_color);
     btn->Bind(wxEVT_BUTTON, [this, btn](wxCommandEvent& event) {
         if (auto it = std::find(m_pageButtons.begin(), m_pageButtons.end(), btn); it != m_pageButtons.end()) {
@@ -264,10 +286,21 @@ void ButtonsListCtrl::SetPageText(size_t n, const wxString& strText)
 // ORCA
 void ButtonsListCtrl::SetCompact(size_t n, bool compact)
 {
+    // MKP: the tabs no longer carry icons, so blanking the caption would leave nothing to click.
+    // The tabs are already as narrow as their caption, so "compact" and normal are the same size.
+    (void)compact;
     int em = em_unit(this);
     Button* btn = m_pageButtons[n];
-    btn->SetMinSize({(compact ? 40 : 136) * em / 10, 36 * em / 10});
-    btn->SetLabel(compact ? "" : m_pageLabels[n]);
+    const wxString label = m_pageLabels[n];
+    int text_w = 0;
+    if (!label.empty()) {
+        wxClientDC dc(btn);
+        dc.SetFont(btn->GetFont());
+        dc.GetTextExtent(label, &text_w, nullptr);
+    }
+    btn->SetMinSize({label.empty() ? std::lround(3.2 * em) : text_w + std::lround(2.7 * em),
+                     std::lround(3.6 * em)});
+    btn->SetLabel(label);
 }
 
 wxString ButtonsListCtrl::GetPageText(size_t n) const

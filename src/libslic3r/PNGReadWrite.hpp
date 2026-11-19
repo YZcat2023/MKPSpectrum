@@ -96,6 +96,12 @@ bool write_gray_to_file(const char *file_name_utf8, size_t width, size_t height,
 bool write_gray_to_file(const std::string &file_name_utf8, size_t width, size_t height, const uint8_t *data_gray);
 bool write_gray_to_file(const std::string &file_name_utf8, size_t width, size_t height, const std::vector<uint8_t> &data_gray);
 
+// Like write_rgb_to_file(), but four channels (r, g, b, a). A layer image carries "no ink here" as
+// transparency this way, the same way the texture slicer's own layer PNGs do.
+bool write_rgba_to_file(const char *file_name_utf8, size_t width, size_t height, const uint8_t *data_rgba);
+bool write_rgba_to_file(const std::string &file_name_utf8, size_t width, size_t height, const uint8_t *data_rgba);
+bool write_rgba_to_file(const std::string &file_name_utf8, size_t width, size_t height, const std::vector<uint8_t> &data_rgba);
+
 // Scaled variants are mostly useful for debugging purposes, for example to export images of low resolution distance fileds.
 // Scaling is done by multiplying rows and columns without any smoothing to emphasise the original pixels.
 bool write_rgb_to_file_scaled(const char *file_name_utf8, size_t width, size_t height, const uint8_t *data_rgb, size_t scale);

@@ -10,50 +10,53 @@ static bool gDarkMode = false;
 
 static bool operator<(wxColour const &l, wxColour const &r) { return l.GetRGBA() < r.GetRGBA(); }
 
+// MKP: the dark theme is deliberately violet-grey (#1a1a2e / #1e1e2e / #2a2a3a, the palette of
+// the MKP design) instead of the neutral grey one, so the panels, cards and the tab bar all sit in
+// one family. The ORCA accent stays teal and keeps its role; only its neighbours in the layout
+// changed hue.
 static std::map<wxColour, wxColour> gDarkColors{
-    {"#009688", "#00675b"}, // rgb(0, 150, 136)    ORCA color
-    {"#1F8EEA", "#2778D2"}, // rgb(31, 142, 234)   ???
-    {"#FF6F00", "#D15B00"}, // rgb(255, 111, 0)    Secondary color
-    {"#D01B1B", "#BB2A3A"}, // rgb(208, 27, 27)    ???
-    {"#262E30", "#EFEFF0"}, // rgb(38, 46, 48)     Button text color | Input Text Color
-    {"#DFDFDF", "#3E3E45"}, // rgb(223, 223, 223)  Button Background color
-    {"#D4D4D4", "#4D4D54"}, // rgb(212, 212, 212)  Button Background color on Hover
-    {"#6B6A6A", "#909090"}, // rgb(107, 107, 106)  Button Dimmed text
-    {"#26A69A", "#008172"}, // rgb(0, 150, 136)    Button Confirm Color hover | ORCA Color Hover
-    {"#6B6B6A", "#B3B3B5"}, // rgb(107, 107, 106)  Input box side text
-    {"#2C2C2E", "#B3B3B4"}, // rgb(44, 44, 46)     ???
-    {"#6B6B6B", "#818183"}, // rgb(107, 107, 107)  Disabled Text
-    {"#ACACAC", "#65656A"}, // rgb(172, 172, 172)  Disabled Text on boxes | Dimmed Elements
-    {"#EEEEEE", "#4C4C55"}, // rgb(238, 238, 238)  Separator Line | Title Line Color
-    {"#E8E8E8", "#3E3E45"}, // rgb(232, 232, 232)  ???
-    {"#323A3D", "#E5E5E4"}, // rgb(50, 58, 61)     Softer text color
-    {"#FFFFFF", "#2D2D31"}, // rgb(255, 255, 255)  Window background
-    {"#F8F8F8", "#36363C"}, // rgb(248, 248, 248)  Sidebar > Titlebar > Gradient Top | BBL monitor page titlebar bg
-    {"#F1F1F1", "#36363B"}, // rgb(241, 241, 241)  Sidebar > Titlebar > Gradient Bottom
-    {"#3B4446", "#2D2D30"}, // rgb(59, 68, 78)     Top Bar / Main tab bar bg color
-    {"#CECECE", "#54545B"}, // rgb(206, 206, 206)  Sidebar wxPanel bg | 
-    {"#DBFDD5", "#3B3B40"}, // rgb(219, 253, 213)  Not Used anymore // Was used for BBS combo boxes etc
-    {"#000000", "#FFFFFE"}, // rgb(0, 0, 0)        Mostly Text color wxBlack
-    {"#F4F4F4", "#36363D"}, // rgb(244, 244, 244)  ???
-    {"#DBDBDB", "#4A4A51"}, // rgb(219, 219, 219)  Input/Combo Box Border Color
-    {"#EDFAF2", "#283232"}, // rgb(229, 240, 238)  Not Used anymore // Was used for BBS Combo / Dropdown focused background color
-    {"#323A3C", "#E5E5E6"}, // rgb(50, 58, 60)     Text color used on search list | 
-    {"#303A3C", "#E5E5E5"}, // rgb(48, 58, 60)     Object Table > Column header text color | StaticBox Border Color
-    {"#FEFFFF", "#242428"}, // rgb(254, 255, 255)  Side Tabbar bg | 
-    {"#A6A9AA", "#2D2D29"}, // rgb(166, 169, 170)  Seperator color
-    {"#363636", "#B2B3B5"}, // rgb(54, 54, 54)     Sidebar > Parameter Label/Title color | Sidebar tab text | Create Filament window text
-    {"#F0F0F1", "#333337"}, // rgb(240, 240, 241)  Disabled element background // ORCA Used better background color for dark mode
-    {"#9E9E9E", "#53545A"}, // rgb(158, 158, 158)  ???
-    {"#D7E8DE", "#1F2B27"}, // rgb(215, 232, 222)  Not Used anymore // Leftover from BBS
-    {"#2B3436", "#808080"}, // rgb(43, 52, 54)     Not Used anymore // Leftover from BBS. Was used as main fill color of icons
+    {"#009688", "#0E7C6E"}, // rgb(0, 150, 136)    ORCA color
+    {"#1F8EEA", "#4A9EFF"}, // rgb(31, 142, 234)   accent blue of the MKP design
+    {"#FF6F00", "#D9772B"}, // rgb(255, 111, 0)    Secondary color
+    {"#D01B1B", "#C0394B"}, // rgb(208, 27, 27)    error red
+    {"#262E30", "#E5E5EA"}, // rgb(38, 46, 48)     Button text color | Input Text Color
+    {"#DFDFDF", "#27272B"}, // rgb(223, 223, 223)  Button Background color
+    {"#D4D4D4", "#313136"}, // rgb(212, 212, 212)  Button Background color on Hover
+    {"#6B6A6A", "#8E9099"}, // rgb(107, 107, 106)  Button Dimmed text
+    {"#26A69A", "#13A08F"}, // rgb(0, 150, 136)    Button Confirm Color hover | ORCA Color Hover
+    {"#6B6B6A", "#B0B1BC"}, // rgb(107, 107, 106)  Input box side text
+    {"#2C2C2E", "#B0B1BC"}, // rgb(44, 44, 46)     secondary text
+    {"#6B6B6B", "#7C7E8A"}, // rgb(107, 107, 107)  Disabled Text
+    {"#ACACAC", "#5F616A"}, // rgb(172, 172, 172)  Disabled Text on boxes | Dimmed Elements
+    {"#EEEEEE", "#313136"}, // rgb(238, 238, 238)  Separator Line | Title Line Color
+    {"#E8E8E8", "#27272B"}, // rgb(232, 232, 232)  card background
+    {"#323A3D", "#DADAE2"}, // rgb(50, 58, 61)     Softer text color
+    {"#FFFFFF", "#1E1E22"}, // rgb(255, 255, 255)  Window background
+    {"#F8F8F8", "#202024"}, // rgb(248, 248, 248)  Sidebar > Titlebar > Gradient Top
+    {"#F1F1F1", "#202024"}, // rgb(241, 241, 241)  Sidebar > Titlebar > Gradient Bottom
+    {"#3B4446", "#141416"}, // rgb(59, 68, 78)     Top Bar / Main tab bar bg color
+    {"#CECECE", "#232327"}, // rgb(206, 206, 206)  Sidebar wxPanel bg |
+    {"#DBFDD5", "#232327"}, // rgb(219, 253, 213)  Unused combo box background
+    {"#000000", "#FFFFFF"}, // rgb(0, 0, 0)        Mostly Text color wxBlack
+    {"#F4F4F4", "#202024"}, // rgb(244, 244, 244)  panel background
+    {"#DBDBDB", "#313136"}, // rgb(219, 219, 219)  Input/Combo Box Border Color
+    {"#EDFAF2", "#232327"}, // rgb(229, 240, 238)  Unused combo focused background
+    {"#323A3C", "#DADAE2"}, // rgb(50, 58, 60)     Text color used on search list |
+    {"#303A3C", "#DADAE2"}, // rgb(48, 58, 60)     Object Table column header | StaticBox Border
+    {"#FEFFFF", "#141416"}, // rgb(254, 255, 255)  Side Tabbar bg |
+    {"#A6A9AA", "#222224"}, // rgb(166, 169, 170)  Seperator color
+    {"#363636", "#B0B1BC"}, // rgb(54, 54, 54)     Sidebar > Parameter Label/Title color
+    {"#F0F0F1", "#232327"}, // rgb(240, 240, 241)  Disabled element background
+    {"#9E9E9E", "#4A4A50"}, // rgb(158, 158, 158)  muted element
+    {"#D7E8DE", "#1E2028"}, // rgb(215, 232, 222)  Unused leftover from BBS
+    {"#2B3436", "#7E808A"}, // rgb(43, 52, 54)     Unused leftover from BBS (icon fill)
     {"#ABABAB", "#ABABAB"},
-    {"#D9D9D9", "#27272A"}, // rgb(217, 217, 217)  Sidebar > Toggle button track color
-    {"#FFFEFE", "#D8D9D9"}, // rgb(255, 254, 254)  Sidebar > Toggle button thumb color
-    {"#EBF9F0", "#293F34"},
-    //{"#F0F0F0", "#4C4C54"},
+    {"#D9D9D9", "#222224"}, // rgb(217, 217, 217)  Sidebar > Toggle button track color
+    {"#FFFEFE", "#C9CAD2"}, // rgb(255, 254, 254)  Sidebar > Toggle button thumb color
+    {"#EBF9F0", "#242E33"},
     // ORCA
-    {"#BFE1DE", "#223C3C"}, // rgb(191, 225, 222)  Dropdown checked item background color > ORCA color with %25 opacity
-    {"#E5F0EE", "#283232"}, // rgb(229, 240, 238)  Combo / Dropdown focused background color > ORCA color with %10 opacity
+    {"#BFE1DE", "#26303A"}, // rgb(191, 225, 222)  Dropdown checked item background color
+    {"#E5F0EE", "#243036"}, // rgb(229, 240, 238)  Combo / Dropdown focused background color
 };
 
 std::tuple<double, double, double> StateColor::GetLAB(const wxColour& color) {

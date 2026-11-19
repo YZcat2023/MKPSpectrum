@@ -25,6 +25,7 @@
 #include "GCode/ThumbnailData.hpp"
 #include "libslic3r/ObjectID.hpp"
 #include "GCode/ExtrusionProcessor.hpp"
+#include "MkpInkjet.hpp"
 
 #include "GCode/PressureEqualizer.hpp"
 #include "GCode/SmallAreaInfillFlowCompensator.hpp"
@@ -146,6 +147,7 @@ public:
     std::string tool_change(GCode &gcodegen, int extruder_id, bool finish_layer);
     bool is_empty_wipe_tower_gcode(GCode &gcodegen, int extruder_id, bool finish_layer);
     std::string finalize(GCode &gcodegen);
+    std::string recover_after_inkjet(GCode &gcodegen) const;
     std::vector<float> used_filament_length() const;
 
     bool is_first_print() const { return m_is_first_print;}
@@ -202,6 +204,8 @@ private:
     const bool                                                   m_sparse_layers_combined;
     // Print z of the compacted tower per planned layer. Empty when the tower is not compacted.
     std::vector<float>                                           m_compacted_tower_z;
+    // Last emitted tower endpoint, in machine coordinates, including its actual print height.
+    mutable std::optional<Vec3d>                                 m_last_tower_position;
 };
 
 class ColorPrintColors
@@ -410,7 +414,16 @@ public:
 protected:
     class GCodeOutputStream {
     public:
-        GCodeOutputStream(FILE *f, GCodeProcessor &processor) : f(f), m_processor(processor) {}
+        GCodeOutputStream(FILE *f, GCodeProcessor &processor, GCodeFlavor flavor, bool auxiliary_fan)
+            : f(f), m_processor(processor), m_flavor(flavor)
+        {
+            m_fans["primary"] = {GCodeWriter::set_fan(flavor, 0), GCodeWriter::set_fan(flavor, 0)};
+            m_fan_order.emplace_back("primary");
+            if (auxiliary_fan) {
+                m_fans["P2"] = {"M106 P2 S0\n", "M106 P2 S0\n"};
+                m_fan_order.emplace_back("P2");
+            }
+        }
         ~GCodeOutputStream() { this->close(); }
 
         bool is_open() const { return f; }
@@ -434,6 +447,13 @@ protected:
     private:
         FILE *f = nullptr;
         GCodeProcessor &m_processor;
+        // Track commands after cooling and fan lead-time processing, including custom start G-code.
+        // Each entry contains the command that disables the fan, and its latest requested state.
+        std::map<std::string, std::pair<std::string, std::string>> m_fans;
+        std::vector<std::string> m_fan_order;
+        GCodeFlavor m_flavor;
+        bool m_mkp_fans_suspended = false;
+        std::string filter_mkp_fans(const char *what);
     };
 
     // Virtual hooks for belt printer subclass (BeltGCode).
@@ -927,6 +947,17 @@ protected:
 
     // BBS
     Print* m_curr_print = nullptr;
+    // MKP: ink coverage of every layer, computed by mkp::build_inkjet_layers() before any G-code is
+    // written - it is texture slicing, and it has to happen before the emitter reads it.
+    std::map<const PrintObject *, std::map<const Layer *, mkp::InkLayer>> m_mkp_ink;
+    // Where each object's strips sit inside the archive that travels with the G-code. Empty for a
+    // single object, "obj<N>/" when several share one file, because layer_NNNN would otherwise clash.
+    std::map<const PrintObject *, std::string> m_mkp_ink_prefix;
+    bool   m_mkp_inkjet_started = false;
+    bool   m_mkp_tower_recovery_pending = false;
+    std::optional<Vec2f> m_mkp_last_grid_refill;
+    double m_mkp_recovery_travel_z = 0.;
+    double m_mkp_inkjet_flush_filament = 0.;
     unsigned int m_toolchange_count;
     coordf_t m_nominal_z;
     // Mixed-color sublayer state. Non-zero only while emitting a mixed slot's sub-layer:

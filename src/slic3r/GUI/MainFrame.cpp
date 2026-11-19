@@ -8,6 +8,21 @@
 #include "slic3r/GUI/GUI_Utils.hpp"
 #include <wx/filehistory.h>
 #include "slic3r/GUI/BBLTopbar.hpp"
+
+#include <fstream>
+static void mkp_dump_wx_tree(wxWindow *w, int depth, std::ofstream &out)
+{
+    const wxRect r = w->GetRect();
+    const wxColour bg = w->GetBackgroundColour();
+    for (int i = 0; i < depth; ++i) out << "  ";
+    out << w->GetClassInfo()->GetClassName() << " name='" << std::string(w->GetName().ToUTF8()) << "'"
+        << " rect=" << r.x << "," << r.y << "," << r.width << "x" << r.height
+        << " bg=" << (int)bg.Red() << "," << (int)bg.Green() << "," << (int)bg.Blue()
+        << " shown=" << w->IsShownOnScreen() << std::endl;
+    for (wxWindow *c : w->GetChildren())
+        mkp_dump_wx_tree(c, depth + 1, out);
+}
+
 #include "libslic3r/Format/bbs_3mf.hpp"
 #include <boost/lexical_cast.hpp>
 #include <optional>
@@ -22,6 +37,8 @@
 #include "slic3r/GUI/LazyPage.hpp"
 #include "slic3r/GUI/Monitor.hpp"
 #include "slic3r/GUI/PrinterWebView.hpp"
+#include "slic3r/GUI/MkpWebPage.hpp"
+#include "slic3r/GUI/MkpInjectFloat.hpp"
 #include "slic3r/GUI/MultiMachinePage.hpp"
 #include "slic3r/GUI/CalibrationPanel.hpp"
 #include "slic3r/GUI/ReleaseNote.hpp"
@@ -1639,6 +1656,98 @@ void MainFrame::init_tabpanel() {
     m_lazy_pages.push_back(m_calibration_page);
     m_tabpanel->AddPage(TAB_ID_CALIBRATION, m_calibration_page, _L("Calibration"), "tab_calibration_active");
 
+    // MKPSpectrum pages. The MKP app's own Device page is equivalent to Orca's native one, so
+    // only the manufacturing pages are brought over: 平面喷墨 / 绘图仪 / 激光雕刻 / 拖刀切割 / 配置.
+    {
+        struct MkpTab { const char *id; const char *page; const wxString label; };
+        const MkpTab mkp_tabs[] = {
+            {TAB_ID_MKP_FLAT, "flat", wxString::FromUTF8("\xE5\xB9\xB3\xE9\x9D\xA2\xE5\x96\xB7\xE5\xA2\xA8")},
+            {TAB_ID_MKP_PLOTTER, "plotter", wxString::FromUTF8("\xE7\xBB\x98\xE5\x9B\xBE\xE4\xBB\xAA")},
+            {TAB_ID_MKP_LASER, "laser", wxString::FromUTF8("\xE6\xBF\x80\xE5\x85\x89\xE9\x9B\x95\xE5\x88\xBB")},
+            {TAB_ID_MKP_KNIFE, "knife", wxString::FromUTF8("\xE6\x8B\x96\xE5\x88\x80\xE5\x88\x87\xE5\x89\xB2")},
+            {TAB_ID_MKP_CALIBRATE, "calibrate", wxString::FromUTF8("\xE5\x81\x8F\xE7\xA7\xBB\xE6\xA0\xA1\xE5\x87\x86")},
+        };
+        // Prebuilt during the startup idle pass (order 70+), not on first click: the page then
+        // loads its webview while still hidden, so selecting the tab shows an already-rendered
+        // page instead of a white viewport that has to load and wait for the Python bridge.
+        // 只预建第一个（平面喷墨）：5 个 WebView 同时预建会把主线程占住十几秒，
+        // 剩下的页改成首次点开时构建；MkpWebPage 自带深色底，不会闪白。
+        int mkp_tab_index = 0;
+        for (const MkpTab &tab : mkp_tabs) {
+            const wxString page = tab.page;   // captured by the factory below
+            const int order = (mkp_tab_index++ == 0) ? 70 : -1;   // 只有首个子页预建
+            auto *lazy = new LazyPage<MkpWebPage>(m_tabpanel, tab.id, order,
+                [page](wxWindow *parent) { return new MkpWebPage(parent, page); });
+            m_lazy_pages.push_back(lazy);
+            m_tabpanel->AddPage(tab.id, lazy, tab.label, "");
+        }
+    }
+
+    // 设备页悬浮窗：shell 插件 + 不规则网床固件包的检查与补装。它挂在标签页本身上，
+    // 只在设备页显示，每次切到设备页都会自动复查，未注入时自动补装。
+    m_mkp_inject = new MkpInjectFloat(m_tabpanel, [this] {
+        // 「打印机设置」= MKP 的配置页（地址、SSH 主机密钥指纹都在那里）。
+        m_tabpanel->SelectPageByName(TAB_ID_MKP_CALIBRATE);
+    });
+    m_tabpanel->Bind(wxEVT_NOTEBOOK_PAGE_CHANGED, [this](wxBookCtrlEvent &evt) {
+        evt.Skip();
+        on_device_tab_changed();
+    });
+    m_tabpanel->Bind(wxEVT_SIZE, [this](wxSizeEvent &evt) {
+        evt.Skip();
+        if (m_mkp_inject)
+            m_mkp_inject->layout_in_parent(m_tabpanel);
+    });
+
+    // ORCA_OPEN_PARAMS=printer|print opens the parameters dialog on that page at startup.
+    // Diagnostics only: lets a screenshot/日志 reach the settings page without touching the mouse.
+    {
+        wxString params_page;
+        if (wxGetEnv("ORCA_OPEN_PARAMS", &params_page) && !params_page.IsEmpty())
+            wxTheApp->CallAfter([this, params_page] {
+                wxMilliSleep(900);
+                if (m_param_dialog == nullptr || m_param_dialog->panel() == nullptr)
+                    return;
+                ParamsPanel *panel = m_param_dialog->panel();
+                wxPanel *target = (params_page == "printer") ? panel->printer_panel() : nullptr;
+                m_param_dialog->Popup();
+                if (target != nullptr)
+                    panel->set_active_tab(target);
+                BOOST_LOG_TRIVIAL(info) << "ORCA_OPEN_PARAMS -> " << std::string(params_page.ToUTF8());
+            });
+    }
+
+    // ORCA_START_TAB=<page id> opens that tab on startup. Used to reach a page (e.g. mkp_flat)
+    // without touching the mouse, and handy for screenshots.
+    {
+        wxString start_tab;
+        if (wxGetEnv("ORCA_START_TAB", &start_tab) && !start_tab.IsEmpty())
+            wxTheApp->CallAfter([this, start_tab] {
+                wxMilliSleep(600);   // let the frame finish showing before the switch
+                m_tabpanel->SelectPageByName(start_tab);
+                // Startup keeps rearranging the tab book: the shared plater is inserted as both
+                // Prepare and Preview and one of the two is dropped again, and wx re-selects a
+                // neighbouring tab whenever a page is removed. A one-shot selection therefore
+                // lands one tab off. Re-assert the tab by NAME until it sticks - names survive
+                // the index shifts, raw indices do not.
+                auto *timer = new wxTimer();
+                auto *left  = new int(8);
+                timer->Bind(wxEVT_TIMER, [this, start_tab, timer, left](wxTimerEvent &) {
+                    if (m_tabpanel->GetSelectedPageName() == start_tab || --*left <= 0) {
+                        timer->Stop();
+                        // Deleted outside the handler: a timer must not be destroyed while it is
+                        // dispatching its own event.
+                        wxTheApp->CallAfter([timer, left] { delete timer; delete left; });
+                        BOOST_LOG_TRIVIAL(info) << "ORCA_START_TAB settled -> "
+                                                << m_tabpanel->GetSelectedPageName().ToUTF8().data();
+                        return;
+                    }
+                    m_tabpanel->SelectPageByName(start_tab);
+                });
+                timer->Start(400);
+            });
+    }
+
     // Plugin pages are appended after the built-in tabs; their ids are namespaced
     // (plugin.<plugin_key>.<name>) so they can't collide with the built-in TAB_ID_* constants.
     m_plugin_pages.initialize(m_tabpanel);
@@ -1655,6 +1764,19 @@ void MainFrame::init_tabpanel() {
             m_plater->on_filament_count_change(full_config.option<ConfigOptionStrings>("filament_colour")->values.size());
         }
     }
+}
+
+void MainFrame::on_device_tab_changed()
+{
+    if (!m_mkp_inject)
+        return;
+    const wxString page = m_tabpanel->GetSelectedPageName();
+    const bool on_device = page == TAB_ID_MONITOR || page == TAB_ID_MONITOR_WEB;
+    m_mkp_inject->Show(on_device);
+    if (!on_device)
+        return;
+    m_mkp_inject->layout_in_parent(m_tabpanel);
+    m_mkp_inject->refresh(true);
 }
 
 // SoftFever
@@ -3732,6 +3854,22 @@ void MainFrame::init_menubar_as_editor()
     append_menu_item(m_topbar->GetCalibMenu(), wxID_ANY, _L("VFA"), _L("VFA"),
         [this](wxCommandEvent&) { run_calibration(CalibKind::VFA); }, "", nullptr,
         [this]() {return m_plater->is_view3D_shown();; }, this);
+    // MKPSpectrum: jump straight to the MKP offset-calibration page (inkjet / brush / knife / laser
+    append_menu_item(m_topbar->GetCalibMenu(), wxID_ANY, wxString::FromUTF8("\xE5\x96\xB7\xE5\xA2\xA8\xE5\x81\x8F\xE7\xA7\xBB"), wxString::FromUTF8("\xE5\x96\xB7\xE5\xA2\xA8\xE5\x81\x8F\xE7\xA7\xBB\xE6\xA0\xA1\xE5\x87\x86"),
+        [this](wxCommandEvent&) {
+            // Load the inkjet calibration block and drop it in the middle of the bed.
+            const std::string path = Slic3r::resources_dir() + "/mkp/calibe.glb";
+            if (! boost::filesystem::exists(path))
+                return;
+            wxArrayString files;
+            files.Add(wxString::FromUTF8(path));
+            m_tabpanel->SelectPageByName(TAB_ID_PREPARE);
+            m_plater->load_files(files);
+            m_plater->arrange();
+        }, "", nullptr,
+        [this]() { return true; }, this);
+
+
 
     // help
     append_menu_item(m_topbar->GetCalibMenu(), wxID_ANY, _L("Calibration Guide"), _L("Calibration Guide"), [](wxCommandEvent &)
@@ -3838,6 +3976,22 @@ void MainFrame::init_menubar_as_editor()
     append_menu_item(calib_menu, wxID_ANY, _L("VFA"), _L("VFA"),
         [this](wxCommandEvent&) { run_calibration(CalibKind::VFA); }, "", nullptr,
         [this]() {return m_plater->is_view3D_shown();; }, this);
+    // MKPSpectrum: jump straight to the MKP offset-calibration page (inkjet / brush / knife / laser
+    append_menu_item(calib_menu, wxID_ANY, wxString::FromUTF8("\xE5\x96\xB7\xE5\xA2\xA8\xE5\x81\x8F\xE7\xA7\xBB"), wxString::FromUTF8("\xE5\x96\xB7\xE5\xA2\xA8\xE5\x81\x8F\xE7\xA7\xBB\xE6\xA0\xA1\xE5\x87\x86"),
+        [this](wxCommandEvent&) {
+            // Load the inkjet calibration block and drop it in the middle of the bed.
+            const std::string path = Slic3r::resources_dir() + "/mkp/calibe.glb";
+            if (! boost::filesystem::exists(path))
+                return;
+            wxArrayString files;
+            files.Add(wxString::FromUTF8(path));
+            m_tabpanel->SelectPageByName(TAB_ID_PREPARE);
+            m_plater->load_files(files);
+            m_plater->arrange();
+        }, "", nullptr,
+        [this]() { return true; }, this);
+
+
     // help
     append_menu_item(calib_menu, wxID_ANY, _L("Calibration Guide"), _L("Calibration Guide"),
         [](wxCommandEvent&) { wxLaunchDefaultBrowser("https://www.orcaslicer.com/wiki/calibration_guide", wxBROWSER_NEW_WINDOW); }, "", nullptr,
@@ -4360,7 +4514,6 @@ void MainFrame::select_tab(const wxString& id/* = wxString()*/)
         //BBS GUI refactor: remove unused layout new/dlg
         //size_t new_selection = tab == (size_t)(-1) ? m_last_selected_tab : (m_layout == ESettingsLayout::Dlg && tab != 0) ? tab - 1 : tab;
         wxString new_selection = id.empty() ? m_last_selected_tab : id;
-
         if (m_tabpanel->GetSelectedPageName() != new_selection)
             m_tabpanel->SelectPageByName(new_selection);
 #ifdef _MSW_DARK_MODE

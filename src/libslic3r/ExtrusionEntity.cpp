@@ -712,6 +712,8 @@ std::string ExtrusionEntity::role_to_string(ExtrusionRole role)
         case erSupportTransition            : return L("Support transition");
         case erWipeTower                    : return L("Prime tower");
         case erCustom                       : return L("Custom");
+        case erMkpInkjetPath                : return L("喷墨路径");
+        case erMkpSurfacePath               : return L("表面处理");
         case erMixed                        : return L("Multiple");
         default                             : assert(false);
     }
@@ -756,6 +758,10 @@ ExtrusionRole ExtrusionEntity::string_to_role(const std::string_view role)
         return erWipeTower;
     else if (role == L("Custom"))
         return erCustom;
+    else if (role == L("喷墨路径") || role == "Inkjet path")
+        return erMkpInkjetPath;
+    else if (role == L("表面处理") || role == "Surface treatment")
+        return erMkpSurfacePath;
     else if (role == L("Multiple"))
         return erMixed;
     else

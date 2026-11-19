@@ -43,6 +43,8 @@ enum ExtrusionRole : uint8_t {
     erSupportTransition,
     erWipeTower,
     erCustom,
+    erMkpInkjetPath,
+    erMkpSurfacePath,
     // Extrusion role for a collection with multiple extrusion roles.
     erMixed,
     erCount

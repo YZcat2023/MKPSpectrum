@@ -1,7 +1,10 @@
 #include "Moonraker.hpp"
 
+#include <cstdlib>
 #include <exception>
 #include <sstream>
+
+#include <boost/filesystem.hpp>
 
 #include <boost/format.hpp>
 #include <boost/log/trivial.hpp>
@@ -18,6 +21,31 @@
 #include "Http.hpp"
 
 namespace pt = boost::property_tree;
+
+namespace {
+
+// MKP: the slicer leaves the inkjet strips (one .mbd strip per ink pass, packed as _temp.zip) in
+// this fixed folder - see GCode.cpp. The upload job has no way to know which export folder a
+// G-code came from, so both sides agree on this one path.
+std::string mkp_inkjet_zip_path()
+{
+#ifdef _WIN32
+    const char *home = std::getenv("USERPROFILE");
+#else
+    const char *home = std::getenv("HOME");
+#endif
+    if (home == nullptr || *home == '\0')
+        return std::string();
+    std::string path(home);
+#ifdef _WIN32
+    path += "\\Documents\\MKPSpectrum\\Temp\\Inkjet\\_temp.zip";
+#else
+    path += "/Documents/MKPSpectrum/Temp/Inkjet/_temp.zip";
+#endif
+    return path;
+}
+
+} // namespace
 
 namespace Slic3r {
 
@@ -243,6 +271,35 @@ bool Moonraker::upload(PrintHostUpload upload_data, ProgressFn progress_fn, Erro
     bool result = true;
     std::string uploaded_path;
     bool moonraker_started_print = false;
+
+    // MKP: the G-code tells the printer to unpack _temp.zip in PRINT_START, so the archive has to
+    // be on the printer before the G-code starts running - hence it goes up first, with print=false.
+    // A model with nothing to spray has no archive: that is normal, and it is skipped rather than
+    // failing an otherwise fine print.
+    {
+        const std::string        inkjet_zip = mkp_inkjet_zip_path();
+        boost::system::error_code zip_ec;
+        if (!inkjet_zip.empty() && boost::filesystem::exists(inkjet_zip, zip_ec)) {
+            BOOST_LOG_TRIVIAL(info) << boost::format("%1%: Uploading inkjet archive %2%") % name % inkjet_zip;
+            auto zip_http = Http::post(make_url("server/files/upload"));
+            set_auth(zip_http);
+            zip_http.form_add("root", root)
+                    .form_add("print", "false")
+                    .form_add_file("file", inkjet_zip, "_temp.zip")
+                    .on_complete([&](std::string body, unsigned status) {
+                        BOOST_LOG_TRIVIAL(info) << boost::format("%1%: inkjet archive upload HTTP %2%: %3%")
+                            % name % status % body;
+                    })
+                    .on_error([&](std::string body, std::string error, unsigned status) {
+                        BOOST_LOG_TRIVIAL(warning) << boost::format("%1%: inkjet archive upload failed (%2%, HTTP %3%): %4%")
+                            % name % error % status % body;
+                    })
+#ifdef WIN32
+                    .ssl_revoke_best_effort(m_ssl_revoke_best_effort)
+#endif
+                    .perform_sync();
+        }
+    }
 
     //ORCA: gcode inside a .gcode.3mf is index-coded (Metadata/plate_<N>.gcode), so the upload names the
     //      plate via a 1-based `plateindex` (set only in the .3mf path, see Plater::send_gcode_legacy);

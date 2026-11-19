@@ -2,6 +2,8 @@
 
 #include "../TexturePainting.hpp"
 #include "ResourcePathUtils.hpp"
+#include "GlbMeshSimplify.hpp"
+#include "GlbBake.hpp"
 
 #include <assimp/Importer.hpp>
 #include <assimp/color4.h>
@@ -21,6 +23,7 @@
 #include <boost/nowide/fstream.hpp>
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <ios>
@@ -66,9 +69,12 @@ bool should_flip_uvs(const std::string& path)
 unsigned int assimp_import_flags(const std::string& path)
 {
     unsigned int flags = aiProcess_Triangulate
-                       | aiProcess_GenNormals
                        | aiProcess_PreTransformVertices
                        | aiProcess_SortByPType;
+    // TexturedMesh consumes positions and UVs only; normals for the reduced mesh
+    // are built by the renderer. Avoid generating millions of unused GLB normals.
+    if (!boost::algorithm::iends_with(path, ".glb"))
+        flags |= aiProcess_GenNormals;
     if (should_flip_uvs(path))
         flags |= aiProcess_FlipUVs;
     return flags;
@@ -278,8 +284,10 @@ std::string scene_failure_summary(const std::string& path, const char* assimp_er
 
 } // namespace
 
-bool load_assimp_textured_model(const std::string& path, TexturedMesh& out, std::string* error_message)
+bool load_assimp_textured_model(const std::string& path, TexturedMesh& out, std::string* error_message,
+    const std::function<size_t(size_t)>& choose_triangle_count)
 {
+    const auto started = std::chrono::steady_clock::now();
     clear_textured_mesh(out);
 
     Assimp::Importer importer;
@@ -287,6 +295,7 @@ bool load_assimp_textured_model(const std::string& path, TexturedMesh& out, std:
     configure_importer(importer, path, flags);
 
     const aiScene* scene = importer.ReadFile(path, flags);
+    const auto parsed = std::chrono::steady_clock::now();
     if (!scene || (scene->mFlags & AI_SCENE_FLAGS_INCOMPLETE) || !scene->mRootNode) {
         const std::string message = scene_failure_summary(path, importer.GetErrorString());
         BOOST_LOG_TRIVIAL(error) << "AssimpImport: " << message;
@@ -301,21 +310,57 @@ bool load_assimp_textured_model(const std::string& path, TexturedMesh& out, std:
         return false;
     }
 
-    size_t vertex_offset = 0;
-    for (unsigned int mesh_index = 0; mesh_index < scene->mNumMeshes; ++mesh_index) {
-        const aiMesh* mesh = scene->mMeshes[mesh_index];
-        if (!mesh || !mesh->HasPositions())
-            continue;
-        std::string mesh_error;
-        if (!collect_mesh(*mesh, vertex_offset, out, mesh_error)) {
-            const std::string message = mesh_error + ": " + path;
-            BOOST_LOG_TRIVIAL(error) << "AssimpImport: " << message;
-            set_error_message(error_message, message);
-            clear_textured_mesh(out);
-            return false;
+    const bool is_glb = boost::algorithm::iends_with(path, ".glb");
+    std::vector<size_t> face_counts(scene->mNumMeshes, 0);
+    size_t original_faces = 0;
+    for (unsigned int i = 0; i < scene->mNumMeshes; ++i) {
+        const aiMesh* mesh = scene->mMeshes[i];
+        if (mesh && mesh->HasPositions())
+            for (unsigned int j = 0; j < mesh->mNumFaces; ++j)
+                face_counts[i] += mesh->mFaces[j].mNumIndices == 3;
+        original_faces += face_counts[i];
+    }
+    size_t triangle_limit = glb_triangle_limit;
+    if (is_glb && original_faces > glb_triangle_limit && choose_triangle_count) {
+        triangle_limit = choose_triangle_count(original_faces);
+        if (triangle_limit == 0)
+            return false; // The GUI caller handles cancellation without an error dialog.
+        triangle_limit = std::min(triangle_limit, original_faces);
+    }
+    const std::vector<size_t> budgets = is_glb ? glb_mesh_budgets(face_counts, triangle_limit) : face_counts;
+    if (is_glb && budgets.empty() && original_faces != 0) {
+        set_error_message(error_message, "GLB has too many separate meshes for the selected triangle count");
+        return false;
+    }
+    collect_materials(*scene, boost::filesystem::path(path).parent_path(), out);
+    std::string mesh_error;
+    bool collected = true;
+    if (is_glb && original_faces > triangle_limit) {
+        std::vector<const aiMesh *> meshes(scene->mMeshes, scene->mMeshes + scene->mNumMeshes);
+        collected = reduce_glb_native(meshes, budgets, out, mesh_error);
+    } else {
+        size_t vertex_offset = 0;
+        for (unsigned int i = 0; i < scene->mNumMeshes; ++i) {
+            const aiMesh* mesh = scene->mMeshes[i];
+            if (mesh && mesh->HasPositions() && !collect_mesh(*mesh, vertex_offset, out, mesh_error)) {
+                collected = false;
+                break;
+            }
         }
     }
+    if (!collected) {
+        const std::string message = mesh_error + ": " + path;
+        BOOST_LOG_TRIVIAL(error) << "AssimpImport: " << message;
+        set_error_message(error_message, message);
+        clear_textured_mesh(out);
+        return false;
+    }
 
+    if (is_glb && out.indices.size() > triangle_limit) {
+        set_error_message(error_message, "GLB exceeds the selected triangle count");
+        clear_textured_mesh(out);
+        return false;
+    }
     if (out.vertices.empty() || out.indices.empty()) {
         const std::string message = "Assimp extracted no valid triangles: " + path;
         BOOST_LOG_TRIVIAL(error) << "AssimpImport: " << message;
@@ -324,8 +369,10 @@ bool load_assimp_textured_model(const std::string& path, TexturedMesh& out, std:
         return false;
     }
 
-    collect_materials(*scene, boost::filesystem::path(path).parent_path(), out);
-
+    BOOST_LOG_TRIVIAL(info) << "AssimpImport: " << original_faces << " -> " << out.indices.size()
+        << " triangles; parse " << std::chrono::duration<double>(parsed - started).count()
+        << " s; collect/simplify "
+        << std::chrono::duration<double>(std::chrono::steady_clock::now() - parsed).count() << " s";
     BOOST_LOG_TRIVIAL(info) << "AssimpImport: loaded " << out.vertices.size()
                             << " vertices, " << out.indices.size()
                             << " triangles, " << out.textures.size()

@@ -575,6 +575,9 @@ public:
 
     void send_to_printer(bool isall = false);
     void export_gcode(bool prefer_removable);
+    // MKP: 把当前盘的 G-code 直接导出到 path（不弹保存框），
+    // 以便工艺里的 post_process 钩子在无人值守的路径上跑 MKPSpectrum 后处理。
+    void export_gcode_to_path(const std::string &path);
     void export_gcode_3mf(bool export_all = false);
     void send_gcode_finish(wxString name);
     void export_core_3mf();

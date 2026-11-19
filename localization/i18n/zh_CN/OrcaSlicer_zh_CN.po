@@ -39886,3 +39886,19 @@ msgstr ""
 #~ "%1%\n"
 #~ "\n"
 #~ "如果仍要保存，这些预设将不会保留这些设置的插件引用。在其他计算机上，Orca Slicer 将无法确定要提供哪些插件，这些设置也可能无法正常工作。"
+
+# AI Translated
+#: src/slic3r/GUI/Plater.cpp
+#, c-format
+msgid "Original triangle count: %s"
+msgstr "原始三角面数：%s"
+
+# AI Translated
+#: src/slic3r/GUI/Plater.cpp
+msgid "Choose the total triangle count for this model. Higher counts preserve more detail but take longer to import and slice."
+msgstr "请选择整个模型的目标三角面数。面数越多，保留的细节越丰富，但导入和切片耗时也越长。"
+
+# AI Translated
+#: src/slic3r/GUI/Plater.cpp
+msgid "Target triangle count"
+msgstr "目标三角面数"

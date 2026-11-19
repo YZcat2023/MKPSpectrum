@@ -23,6 +23,7 @@
 #include <boost/algorithm/string/predicate.hpp>
 #include <boost/algorithm/string/case_conv.hpp>
 #include <boost/algorithm/string/trim.hpp>
+#include <cstdlib>
 #include <boost/asio/buffer.hpp>
 #include <boost/asio/connect.hpp>
 #include <boost/asio/io_context.hpp>
@@ -2344,6 +2345,47 @@ bool MoonrakerPrinterAgent::upload_gcode(const std::string& local_path,
 
     // Sanitize filename to prevent path traversal attacks
     std::string safe_filename = sanitize_filename(filename);
+
+    // MKP: the inkjet strips have to be on the printer before the G-code starts, because PRINT_START
+    // unpacks _temp.zip. They are sliced into one fixed folder (libslic3r/GCode.cpp), so upload them
+    // here first, with print=false. No archive means nothing to spray - skip, do not fail.
+    {
+        std::string inkjet_zip;
+#ifdef _WIN32
+        const char *mkp_home = std::getenv("USERPROFILE");
+#else
+        const char *mkp_home = std::getenv("HOME");
+#endif
+        if (mkp_home != nullptr && *mkp_home != '\0') {
+            inkjet_zip  = mkp_home;
+#ifdef _WIN32
+            inkjet_zip += "\\Documents\\MKPSpectrum\\Temp\\Inkjet\\_temp.zip";
+#else
+            inkjet_zip += "/Documents/MKPSpectrum/Temp/Inkjet/_temp.zip";
+#endif
+        }
+        boost::system::error_code zip_ec;
+        if (!inkjet_zip.empty() && fs::exists(inkjet_zip, zip_ec)) {
+            auto zip_http = Http::post(join_url(base_url, "/server/files/upload"));
+            if (!api_key.empty())
+                zip_http.header("X-Api-Key", api_key);
+            zip_http.form_add("root", "gcodes")
+                    .form_add("print", "false")
+                    .form_add_file("file", inkjet_zip, "_temp.zip")
+                    .timeout_connect(5)
+                    .timeout_max(300)
+                    .on_complete([&](std::string body, unsigned status) {
+                        (void) body;
+                        BOOST_LOG_TRIVIAL(info) << "MoonrakerPrinterAgent: inkjet archive uploaded, HTTP " << status;
+                    })
+                    .on_error([&](std::string body, std::string err, unsigned status) {
+                        (void) body;
+                        BOOST_LOG_TRIVIAL(warning) << "MoonrakerPrinterAgent: inkjet archive upload failed: "
+                                                   << err << " HTTP " << status;
+                    })
+                    .perform_sync();
+        }
+    }
 
     bool        result = true;
     std::string http_error;

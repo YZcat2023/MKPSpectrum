@@ -400,6 +400,10 @@ set(SLIC3R_GUI_SOURCES
     GUI/MonitorPage.hpp
     GUI/MixedFilamentDialog.cpp
     GUI/MixedFilamentDialog.hpp
+    GUI/MkpWebPage.cpp
+    GUI/MkpWebPage.hpp
+    GUI/MkpInjectFloat.cpp
+    GUI/MkpInjectFloat.hpp
     GUI/GradientCurveEditor.cpp
     GUI/GradientCurveEditor.hpp
     GUI/ColorDecomposeDialog.cpp

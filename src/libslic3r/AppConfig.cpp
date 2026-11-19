@@ -58,8 +58,13 @@ using namespace nlohmann;
 
 namespace Slic3r {
 
-static const std::string VERSION_CHECK_URL = "https://check-version.orcaslicer.com/latest";
-static const std::string PROFILE_UPDATE_URL = "https://check-version.orcaslicer.com/profile";
+// MKPSpectrum: 更新检查指向我们自己的 GitHub 仓库；GitHub releases 的 JSON 字段
+// (tag_name / prerelease / html_url / body) 正好是 check_new_version_sf() 期望的格式。
+// 发布 tag 必须是纯 semver（v2.5.1、v2.6.0-beta1），否则会被解析器跳过。
+static const std::string VERSION_CHECK_URL = "https://api.github.com/repos/YZcat2023/OrcaSlicer/releases?per_page=10";
+// MKPSpectrum: 没有自建 vendor profile 服务，留空即关闭 OTA 配置下载
+// （PresetUpdater::set_download_prefs(): 空 URL -> enabled_config_update = false）。
+static const std::string PROFILE_UPDATE_URL = "";
 
 constexpr const char* CONFIG_ORCA_UPDATER_URL = "orca_updater_url";
 

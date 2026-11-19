@@ -715,6 +715,26 @@ static const t_config_enum_values s_keys_map_WipeTowerWallType{
 };
 CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(WipeTowerWallType)
 
+static const t_config_enum_values s_keys_map_MKPSurfacePattern{
+    {"line", mkpLine},
+    {"grid", mkpGrid},
+    {"inkjet_path", mkpInkjetPath},
+    {"surface_path", mkpSurfacePath},
+};
+CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(MKPSurfacePattern)
+
+static const t_config_enum_values s_keys_map_MKPInkjetFlushMode{
+    {"start_only", mkpFlushAtStart},
+    {"filament_length", mkpFlushByFilament},
+};
+CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(MKPInkjetFlushMode)
+
+static const t_config_enum_values s_keys_map_MKPInkjetDevice{
+    {"mkpsjet", mkpInkjetMKPSjet},
+    {"mbrush", mkpInkjetMBrush},
+};
+CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(MKPInkjetDevice)
+
 static const t_config_enum_values s_keys_map_ExtruderType = {
     { "Direct Drive",   etDirectDrive },
     { "Bowden",        etBowden }
@@ -2708,6 +2728,22 @@ void PrintConfigDef::init_fff_params()
     def->mode = comAdvanced;
     def->nullable = true;
     def->set_default_value(new ConfigOptionFloatsNullable{60});
+
+    def = this->add("mkp_outer_wall_linear_speed", coBool);
+    def->label = L("外墙纹理线性减速");
+    def->category = L("Speed");
+    def->tooltip = L("按纹理亮度降低实际挤出打印的外墙速度，包括悬垂外墙。白色和无色保持原有速度，黑色降至下限。保留首层、悬垂、体积流量等原有限速，以及打印机的加速度和平滑设置。不改变表面处理速度。");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionBool(false));
+
+    def = this->add("mkp_outer_wall_speed_min", coFloat);
+    def->label = L("外墙纹理速度下限");
+    def->category = L("Speed");
+    def->sidetext = L("mm/s");
+    def->tooltip = L("黑色区域的外墙打印目标速度；浅色在此值与原有外墙速度之间线性变化。此值不会提高已经被其他设置降低的速度。");
+    def->mode = comAdvanced;
+    def->min = 0.1;
+    def->set_default_value(new ConfigOptionFloat(10.0));
 
     def = this->add("small_perimeter_speed", coFloatsOrPercents);
     def->label = L("Small perimeters");
@@ -5337,6 +5373,42 @@ void PrintConfigDef::init_fff_params()
     def = this->add("template_custom_gcode", coString);
     def->label = L("Custom G-code");
     def->tooltip = L("This G-code will be used as a custom code.");
+    def->multiline = true;
+    def->full_width = true;
+    def->height = 12;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionString());
+
+    def = this->add("mkp_grab_brush_gcode", coString);
+    def->label = L("取得笔刷");
+    def->tooltip = L("使用笔刷前执行的取笔刷 G-code。");
+    def->multiline = true;
+    def->full_width = true;
+    def->height = 12;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionString());
+
+    def = this->add("mkp_release_brush_gcode", coString);
+    def->label = L("放回笔刷");
+    def->tooltip = L("使用完笔刷后执行的放回笔刷 G-code。");
+    def->multiline = true;
+    def->full_width = true;
+    def->height = 12;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionString());
+
+    def = this->add("mkp_grab_inkjet_gcode", coString);
+    def->label = L("取得喷墨头");
+    def->tooltip = L("打印前执行的取喷墨头 G-code。");
+    def->multiline = true;
+    def->full_width = true;
+    def->height = 12;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionString());
+
+    def = this->add("mkp_release_inkjet_gcode", coString);
+    def->label = L("放回喷墨头");
+    def->tooltip = L("打印结束后执行的放回喷墨头 G-code。");
     def->multiline = true;
     def->full_width = true;
     def->height = 12;
@@ -8258,6 +8330,337 @@ void PrintConfigDef::init_fff_params()
     def->mode = comSimple;
     def->set_default_value(new ConfigOptionBool(false));
 
+    def = this->add("mkp_full_height_prime_tower", coBool);
+    def->label = L("擦嘴塔与模型等高");
+    def->tooltip = L("让擦嘴塔在模型存在的每一层都打印，使塔顶与模型顶部齐平，而不是停在最后一个换头层。"
+                     "用于切片后再插入换头动作的流程。");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionBool(false));
+
+
+    // ================= MKP surface treatment =================
+    def = this->add("mkp_surface_enabled", coBool);
+    def->label = L("启用表面处理");
+    def->tooltip = L("在涂刷区域内执行表面处理（笔刷/喷墨）。");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionBool(true));
+
+    def = this->add("mkp_surface_speed", coFloat);
+    def->label = L("填充表面处理速度");
+    def->sidetext = L("mm/s");
+    def->tooltip = L("顶面和底面填充区域的表面处理扫描速度。");
+    def->mode = comAdvanced;
+    def->min = 0;
+    def->set_default_value(new ConfigOptionFloat(20.0));
+
+    def = this->add("mkp_surface_wall_speed", coFloat);
+    def->label = L("外墙表面处理速度");
+    def->sidetext = L("mm/s");
+    def->tooltip = L("沿墙轮廓（包括孔壁和悬垂墙）执行表面处理的速度。设为 0 时沿用填充表面处理速度。");
+    def->mode = comAdvanced;
+    def->min = 0;
+    def->set_default_value(new ConfigOptionFloat(0.0));
+
+    def = this->add("mkp_surface_linear_speed", coBool);
+    def->label = L("线性处理速度");
+    def->tooltip = L("按喷墨亮度调整墙面和填充的表面处理速度：黑色用下限，白色和无色用上限。");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionBool(false));
+
+    def = this->add("mkp_surface_speed_min", coFloat);
+    def->label = L("表面处理速度下限");
+    def->sidetext = L("mm/s");
+    def->mode = comAdvanced;
+    def->min = 0.1;
+    def->set_default_value(new ConfigOptionFloat(10.0));
+
+    def = this->add("mkp_surface_speed_max", coFloat);
+    def->label = L("表面处理速度上限");
+    def->sidetext = L("mm/s");
+    def->mode = comAdvanced;
+    def->min = 0.1;
+    def->set_default_value(new ConfigOptionFloat(50.0));
+
+    def = this->add("mkp_surface_inner_walls", coBool);
+    def->label = L("同时处理内墙");
+    def->tooltip = L("关闭时只处理外墙；开启时处理外墙和内墙。孔洞的外墙和悬垂墙也属于墙面处理范围。顶面和底面的填充处理不受此选项影响。");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionBool(false));
+
+    def = this->add("mkp_surface_pattern", coEnum);
+    def->label = L("走线类型");
+    def->tooltip = L("走线类型：直线或网格。");
+    def->enum_keys_map = &ConfigOptionEnum<MKPSurfacePattern>::get_enum_values();
+    def->enum_values.emplace_back("line");
+    def->enum_values.emplace_back("grid");
+    def->enum_labels.emplace_back(L("直线"));
+    def->enum_labels.emplace_back(L("网格"));
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionEnum<MKPSurfacePattern>(mkpGrid));
+    def = this->add("mkp_surface_line_spacing", coFloat);
+    def->label = L("排线间距");
+    def->sidetext = L("mm");
+    def->tooltip = L("相邻两条表面处理走线之间的距离。");
+    def->mode = comAdvanced;
+    def->min = 0;
+    def->set_default_value(new ConfigOptionFloat(0.3));
+    // ================= MKP inkjet (process) =================
+    def = this->add("mkp_inkjet_density", coFloat);
+    def->label = L("喷墨浓度");
+    def->tooltip = L("MBD 条带的出墨浓度（0.05~1.0，1.0 = 满墨）。内核在 1.0 已饱和，故上限即 1.0。");
+    def->mode = comAdvanced;
+    def->min = 0.05;
+    def->max = 1.0;
+    def->set_default_value(new ConfigOptionFloat(1.0));
+
+    def = this->add("mkp_inkjet_speed", coFloat);
+    def->label = L("喷墨速度");
+    def->sidetext = L("mm/s");
+    def->tooltip = L("喷墨打印时工具头的移动速度。");
+    def->mode = comAdvanced;
+    def->min = 1.0;
+    def->max = 400.0;
+    def->set_default_value(new ConfigOptionFloat(50.0));
+
+    def = this->add("mkp_inkjet_retract_length", coFloat);
+    def->label = L("回抽量");
+    def->sidetext = L("mm");
+    def->tooltip = L("模型本层打印结束后、抬 Z 前的喷墨回抽总量。已有回抽计入该总量。取放工具和喷墨期间不再移动 E 轴，速度沿用当前有效回抽速度。");
+    def->mode = comAdvanced;
+    def->min = 0.;
+    def->set_default_value(new ConfigOptionFloat(10.));
+
+    def = this->add("mkp_inkjet_recovery_length", coFloat);
+    def->label = L("回填量");
+    def->sidetext = L("mm");
+    def->tooltip = L("喷墨完成后到达擦嘴塔时的回填量，速度沿用当前有效回填速度。取放宏中的纯 E 动作不再执行。");
+    def->mode = comAdvanced;
+    def->min = 0.;
+    def->set_default_value(new ConfigOptionFloat(10.));
+
+    def = this->add("mkp_inkjet_flush_mode", coEnum);
+    def->label = L("喷墨头冲刷方式");
+    def->tooltip = L("仅开始：首次喷墨前冲刷一次。按挤出长度：首次喷墨前冲刷，此后累计达到指定耗材挤出长度时，在下一次喷墨前再次冲刷。");
+    def->enum_keys_map = &ConfigOptionEnum<MKPInkjetFlushMode>::get_enum_values();
+    def->enum_values.emplace_back("start_only");
+    def->enum_values.emplace_back("filament_length");
+    def->enum_labels.emplace_back(L("仅开始"));
+    def->enum_labels.emplace_back(L("按挤出长度"));
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionEnum<MKPInkjetFlushMode>(mkpFlushAtStart));
+
+    def = this->add("mkp_inkjet_flush_interval", coFloat);
+    def->label = L("喷墨头冲刷间隔");
+    def->sidetext = L("mm");
+    def->tooltip = L("两次喷墨头冲刷之间累计的耗材挤出长度，不是喷墨路径长度。仅在按挤出长度冲刷时生效。");
+    def->mode = comAdvanced;
+    def->min = 0.1;
+    def->set_default_value(new ConfigOptionFloat(1000.0));
+
+    def = this->add("mkp_inkjet_repeat", coInt);
+    def->label = L("重复喷墨");
+    def->tooltip = L("同一块图案重复喷墨的次数。");
+    def->mode = comAdvanced;
+    def->min = 1;
+    def->max = 10;
+    def->set_default_value(new ConfigOptionInt(1));
+
+    def = this->add("mkp_inkjet_dry_time", coInt);
+    def->label = L("干燥时间");
+    def->sidetext = L("s");
+    def->tooltip = L("每次重复喷墨之间的等待时间。");
+    def->mode = comAdvanced;
+    def->min = 0;
+    def->max = 60;
+    def->set_default_value(new ConfigOptionInt(3));
+
+    def = this->add("mkp_inkjet_c", coFloat);
+    def->label = L("青色出墨 C");
+    def->tooltip = L("青色墨量系数，1.0 为标准出墨。");
+    def->mode = comAdvanced;
+    def->min = 0.0;
+    def->max = 3.0;
+    def->set_default_value(new ConfigOptionFloat(1.0));
+
+    def = this->add("mkp_inkjet_m", coFloat);
+    def->label = L("洋红出墨 M");
+    def->tooltip = L("洋红墨量系数，1.0 为标准出墨。");
+    def->mode = comAdvanced;
+    def->min = 0.0;
+    def->max = 3.0;
+    def->set_default_value(new ConfigOptionFloat(1.0));
+
+    def = this->add("mkp_inkjet_y", coFloat);
+    def->label = L("黄色出墨 Y");
+    def->tooltip = L("黄色墨量系数，1.0 为标准出墨。");
+    def->mode = comAdvanced;
+    def->min = 0.0;
+    def->max = 3.0;
+    def->set_default_value(new ConfigOptionFloat(1.0));
+
+    def = this->add("mkp_inkjet_saturation", coFloat);
+    def->label = L("鲜艳度");
+    def->tooltip = L("-1 全灰，0 不变，+1 加倍鲜艳。");
+    def->mode = comAdvanced;
+    def->min = -1.0;
+    def->max = 1.0;
+    def->set_default_value(new ConfigOptionFloat(0.0));
+
+    def = this->add("mkp_inkjet_brightness", coFloat);
+    def->label = L("明亮度");
+    def->tooltip = L("-1 全黑，0 不变，+1 全白。");
+    def->mode = comAdvanced;
+    def->min = -1.0;
+    def->max = 1.0;
+    def->set_default_value(new ConfigOptionFloat(0.0));
+
+    def = this->add("mkp_inkjet_contrast", coFloat);
+    def->label = L("对比度");
+    def->tooltip = L("以 128 为中点拉伸对比度，1.0 为不变。");
+    def->mode = comAdvanced;
+    def->min = 0.1;
+    def->max = 3.0;
+    def->set_default_value(new ConfigOptionFloat(1.0));
+
+    def = this->add("mkp_inkjet_shear", coFloat);
+    def->label = L("平行四边形剪切");
+    def->sidetext = L("mm");
+    def->tooltip = L("条带顶部的水平偏移量，用来补偿喷头倾斜（平行四边形处理）。");
+    def->mode = comAdvanced;
+    def->min = -20.0;
+    def->max = 20.0;
+    def->set_default_value(new ConfigOptionFloat(0.0));
+
+
+    def = this->add("mkp_inkjet_wall_band", coFloat);
+    def->label = L("喷墨带宽度");
+    def->sidetext = L("mm");
+    def->tooltip = L("竖直墙轮廓描边的总带宽，单位 mm。宽度按 684 行 / 14.29 mm 折算成像素：0.627 mm 即 30 像素。轮廓两侧的分配为 35% 朝外、65% 朝内，让喷头偏一点也不会在零件外沿露出白边。");
+    def->mode = comAdvanced;
+    def->min = 0.05;
+    def->max = 10.0;
+    def->set_default_value(new ConfigOptionFloat(0.62675));
+    // ================= MKP inkjet device (machine) =================
+    def = this->add("mkp_inkjet_device", coEnum);
+    def->label = L("喷墨设备");
+    def->tooltip = L("表面处理使用的喷墨设备：MKPSjet 是自研 HP63 控制板，走串口且不接受 MBD；MBrush 走 USB 虚拟网卡并使用 MBD 条带。");
+    def->enum_keys_map = &ConfigOptionEnum<MKPInkjetDevice>::get_enum_values();
+    def->enum_values.emplace_back("mkpsjet");
+    def->enum_values.emplace_back("mbrush");
+    def->enum_labels.emplace_back(L("MKPSjet"));
+    def->enum_labels.emplace_back(L("MBrush"));
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionEnum<MKPInkjetDevice>(mkpInkjetMKPSjet));
+    // ================= MKP inkjet offset (machine) =================
+    // 喷墨头相对喷嘴的物理偏移；以前存在 Printsetting/*.json，现在跟随机器预设。
+    def = this->add("mkp_inkjet_offset_x", coFloat);
+    def->label = L("喷墨偏移 X");
+    def->sidetext = L("mm");
+    def->tooltip = L("喷墨头相对喷嘴在 X 方向的物理偏移。");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(0.0));
+
+    def = this->add("mkp_inkjet_offset_y", coFloat);
+    def->label = L("喷墨偏移 Y");
+    def->sidetext = L("mm");
+    def->tooltip = L("喷墨头相对喷嘴在 Y 方向的物理偏移。");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(0.0));
+
+    def = this->add("mkp_inkjet_offset_z", coFloat);
+    def->label = L("喷墨偏移 Z");
+    def->sidetext = L("mm");
+    def->tooltip = L("喷墨头喷面相对喷嘴在 Z 方向的高度差：取到喷墨头后抬升到该高度再喷印。旧版后处理里写死的 62 mm 由它接管。");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(62.0));
+
+    // ================= MKP brush offset (machine) =================
+    def = this->add("mkp_brush_offset_x", coFloat);
+    def->label = L("笔刷偏移 X");
+    def->sidetext = L("mm");
+    def->tooltip = L("笔刷相对喷嘴在 X 方向的偏移。笔刷用于喷墨表面处理。");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(20.0));
+
+    def = this->add("mkp_brush_offset_y", coFloat);
+    def->label = L("笔刷偏移 Y");
+    def->sidetext = L("mm");
+    def->tooltip = L("笔刷相对喷嘴在 Y 方向的偏移。笔刷用于喷墨表面处理。");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(-10.0));
+
+    def = this->add("mkp_brush_offset_z", coFloat);
+    def->label = L("笔刷偏移 Z");
+    def->sidetext = L("mm");
+    def->tooltip = L("笔刷相对喷嘴在 Z 方向的偏移。笔刷用于喷墨表面处理。");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(0.0));
+
+    // ================= MKP tool offsets (machine) =================
+    // 每种加工工具各自一套 X/Y/Z 偏移（相对喷嘴）。目前绘图笔 / 拖刀 / 激光尚未开发，默认 0。
+    def = this->add("mkp_pen_offset_x", coFloat);
+    def->label = L("绘图笔偏移 X");
+    def->sidetext = L("mm");
+    def->tooltip = L("绘图笔（写字笔）相对喷嘴在 X 方向的偏移（尚未开发，保持 0）。");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(0.0));
+
+    def = this->add("mkp_pen_offset_y", coFloat);
+    def->label = L("绘图笔偏移 Y");
+    def->sidetext = L("mm");
+    def->tooltip = L("绘图笔（写字笔）相对喷嘴在 Y 方向的偏移（尚未开发，保持 0）。");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(0.0));
+
+    def = this->add("mkp_pen_offset_z", coFloat);
+    def->label = L("绘图笔偏移 Z");
+    def->sidetext = L("mm");
+    def->tooltip = L("绘图笔（写字笔）相对喷嘴在 Z 方向的偏移（尚未开发，保持 0）。");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(0.0));
+
+    def = this->add("mkp_knife_offset_x", coFloat);
+    def->label = L("拖刀偏移 X");
+    def->sidetext = L("mm");
+    def->tooltip = L("拖刀（刻字切割）相对喷嘴在 X 方向的偏移（尚未开发，保持 0）。");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(0.0));
+
+    def = this->add("mkp_knife_offset_y", coFloat);
+    def->label = L("拖刀偏移 Y");
+    def->sidetext = L("mm");
+    def->tooltip = L("拖刀（刻字切割）相对喷嘴在 Y 方向的偏移（尚未开发，保持 0）。");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(0.0));
+
+    def = this->add("mkp_knife_offset_z", coFloat);
+    def->label = L("拖刀偏移 Z");
+    def->sidetext = L("mm");
+    def->tooltip = L("拖刀（刻字切割）相对喷嘴在 Z 方向的偏移（尚未开发，保持 0）。");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(0.0));
+
+    def = this->add("mkp_laser_offset_x", coFloat);
+    def->label = L("激光偏移 X");
+    def->sidetext = L("mm");
+    def->tooltip = L("激光相对喷嘴在 X 方向的偏移（尚未开发，保持 0）。");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(0.0));
+
+    def = this->add("mkp_laser_offset_y", coFloat);
+    def->label = L("激光偏移 Y");
+    def->sidetext = L("mm");
+    def->tooltip = L("激光相对喷嘴在 Y 方向的偏移（尚未开发，保持 0）。");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(0.0));
+
+    def = this->add("mkp_laser_offset_z", coFloat);
+    def->label = L("激光偏移 Z");
+    def->sidetext = L("mm");
+    def->tooltip = L("激光相对喷嘴在 Z 方向的偏移（尚未开发，保持 0）。");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(0.0));
+
     def = this->add("prime_tower_enable_framework", coBool);
     def->label = L("Internal ribs");
     def->tooltip = L("Enable internal ribs to increase the stability of the prime tower.");
@@ -10403,9 +10806,15 @@ void DynamicPrintConfig::normalize_fdm(int used_filaments)
 
         ConfigOptionEnum<TimelapseType>* timelapse_opt = this->option<ConfigOptionEnum<TimelapseType>>("timelapse_type");
         bool is_smooth_timelapse = timelapse_opt != nullptr && timelapse_opt->value == TimelapseType::tlSmooth;
-        if (!is_smooth_timelapse && (used_filaments == 1 || ps_opt->value == PrintSequence::ByObject)) {
+        ConfigOptionBool* mkp_tower_opt = this->option<ConfigOptionBool>("mkp_full_height_prime_tower");
+        const bool mkp_force_tower = mkp_tower_opt != nullptr && mkp_tower_opt->value;
+        if (!is_smooth_timelapse && (used_filaments == 1 || ps_opt->value == PrintSequence::ByObject) && !mkp_force_tower) {
             ept_opt->value = false;
         }
+        // MKP: the profile asks for a tower unconditionally, so turn it back on for any
+        // non-by-object print instead of relying on the profile's enable_prime_tower value.
+        if (mkp_force_tower && ps_opt->value != PrintSequence::ByObject)
+            ept_opt->value = true;
 
         if (ept_opt->value) {
             if (islh_opt)
@@ -10496,14 +10905,21 @@ t_config_option_keys DynamicPrintConfig::normalize_fdm_2(int num_objects, int us
             if (mixed_opt)
                 has_mixed_filament = has_any_mixed_filament(mixed_opt->values);
         }
+        ConfigOptionBool* mkp_tower_opt = this->option<ConfigOptionBool>("mkp_full_height_prime_tower");
+        const bool mkp_force_tower = mkp_tower_opt != nullptr && mkp_tower_opt->value;
         if (!is_smooth_timelapse && !enable_wrapping
-            && (  (used_filaments == 1 && !has_mixed_filament)
+            && (  (used_filaments == 1 && !has_mixed_filament && !mkp_force_tower)
                 || (ps_opt->value == PrintSequence::ByObject && num_objects > 1))) {
             if (ept_opt->value) {
                 ept_opt->value = false;
                 changed_keys.push_back("enable_prime_tower");
             }
             //ept_opt->value = false;
+        }
+        // MKP: honour the profile's unconditional tower request.
+        if (mkp_force_tower && ps_opt->value != PrintSequence::ByObject && !ept_opt->value) {
+            ept_opt->value = true;
+            changed_keys.push_back("enable_prime_tower");
         }
 
         if (ept_opt->value) {

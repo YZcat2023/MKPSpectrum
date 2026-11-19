@@ -1092,6 +1092,17 @@ void ToolOrdering::fill_wipe_tower_partitions(const PrintConfig &config, coordf_
         lt.has_wipe_tower |= ((lt.has_object || lt.has_support) && (config.timelapse_type == TimelapseType::tlSmooth || lt.wipe_tower_partitions > 0))
             || (! belt_no_raft_gap && lt.print_z < object_bottom_z + EPSILON);
 
+    // MKP: force the tower onto every layer that carries the object, so the tower ends level
+    // with the model instead of stopping at the last layer with a tool change.
+    if (config.mkp_full_height_prime_tower.value)
+        for (LayerTools &lt : m_layer_tools)
+            if (lt.has_object || lt.has_support)
+                lt.has_wipe_tower = true;
+
+    { int nwt = 0; for (const LayerTools &lt_ : m_layer_tools) if (lt_.has_wipe_tower) ++nwt;
+      BOOST_LOG_TRIVIAL(info) << "MKPDBG toolorder layers=" << m_layer_tools.size() << " with_tower=" << nwt
+                              << " mkpflag=" << config.mkp_full_height_prime_tower.value; }
+
     // Test for a raft, insert additional wipe tower layer to fill in the raft separation gap.
     // Skipped on belt printers for the same reason as the clause above: layers
     // below the object are brim apron, not raft.

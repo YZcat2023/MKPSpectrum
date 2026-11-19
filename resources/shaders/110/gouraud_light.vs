@@ -17,12 +17,15 @@ const vec3 LIGHT_FRONT_DIR = vec3(0.6985074, 0.1397015, 0.6985074);
 uniform mat4 view_model_matrix;
 uniform mat4 projection_matrix;
 uniform mat3 view_normal_matrix;
+// World z of the fragment, for the preview shell's height ramp (see gouraud_light.fs).
+uniform mat4 volume_world_matrix;
 
 attribute vec3 v_position;
 attribute vec3 v_normal;
 
 // x = tainted, y = specular;
 varying vec2 intensity;
+varying float v_world_z;
 
 void main()
 {
@@ -41,5 +44,6 @@ void main()
     NdotL = max(dot(normal, LIGHT_FRONT_DIR), 0.0);
     intensity.x += NdotL * LIGHT_FRONT_DIFFUSE;
 
+    v_world_z = (volume_world_matrix * vec4(v_position, 1.0)).z;
     gl_Position = projection_matrix * position;
 }

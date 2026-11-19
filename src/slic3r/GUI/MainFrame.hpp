@@ -52,6 +52,12 @@
 #define TAB_ID_MULTI_DEVICE  "multi_device"
 #define TAB_ID_PROJECT       "project"
 #define TAB_ID_CALIBRATION   "calibration"
+// MKPSpectrum pages, hosted in the same tab book as a web view onto mkp_bridge.py.
+#define TAB_ID_MKP_FLAT      "mkp_flat"
+#define TAB_ID_MKP_PLOTTER   "mkp_plotter"
+#define TAB_ID_MKP_LASER     "mkp_laser"
+#define TAB_ID_MKP_KNIFE     "mkp_knife"
+#define TAB_ID_MKP_CALIBRATE "mkp_calibrate"
 
 #define ENABEL_PRINT_ALL 0
 
@@ -80,6 +86,7 @@ class MultiMachinePage;
 class ProjectPanel;
 class CalibrationPanel;
 class PrinterWebView;
+class MkpInjectFloat;
 class FilamentGroupPopup;
 class PA_Calibration_Dlg;
 class FlowRateCalibrationDialog;
@@ -496,6 +503,8 @@ public:
     void show_device(bool should_use_native);
     void fit_tab_labels(); // ORCA
     // True while either of the two tabs backed by m_plater is selected.
+    // Shows the injection panel only on the Device pages, and re-checks them on every switch.
+    void on_device_tab_changed();
     bool is_prepare_or_preview_tab() const;
     PluginPages& plugin_pages() { return m_plugin_pages; }
 
@@ -538,6 +547,8 @@ public:
     // BBS
     //wxBookCtrlBase*       m_tabpanel { nullptr };
     Notebook*             m_tabpanel{ nullptr };
+    // 设备页悬浮窗：检查/补装 shell 插件与不规则网床固件包
+    MkpInjectFloat*       m_mkp_inject{ nullptr };
     wxBoxSizer*           m_side_tools{ nullptr };
     ParamsPanel*          m_param_panel{ nullptr };
     ParamsDialog*         m_param_dialog{ nullptr };

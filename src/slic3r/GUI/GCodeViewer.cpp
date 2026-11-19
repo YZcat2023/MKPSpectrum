@@ -418,6 +418,9 @@ static std::string to_string(libvgcode::EGCodeExtrusionRole role)
     case libvgcode::EGCodeExtrusionRole::Brim:                     { return _u8L("Brim"); }
     case libvgcode::EGCodeExtrusionRole::SupportTransition:        { return _u8L("Support transition"); }
     case libvgcode::EGCodeExtrusionRole::Mixed:                    { return _u8L("Mixed"); }
+    // MKPSpectrum
+    case libvgcode::EGCodeExtrusionRole::InkjetPath:               { return _u8L("喷墨路径"); }
+    case libvgcode::EGCodeExtrusionRole::SurfacePath:              { return _u8L("表面处理"); }
     default:                                                       { return _u8L("Unknown"); }
     }
 }
@@ -1624,24 +1627,29 @@ void GCodeViewer::load_as_gcode(const GCodeProcessorResult& gcode_result, const 
     m_viewer.reset_default_extrusion_roles_colors();
     m_viewer.load(std::move(data));
 
-    // Belt printers: libvgcode labels a layer with the height of its toolpaths, which
-    // on a tilted layer is wherever its last extrusion happened to end, and the layer
-    // slider looks its labels and the colour-change ticks up in that list assuming it
-    // increases.  Give it the layers' print Z instead (the slicer's layer Z, which
-    // increases along the belt), numbered the way libvgcode::convert() numbers the
-    // layers: consecutively over the moves that exist.
-    m_belt_layer_zs.clear();
-    if (is_belt) {
+    // Every layer's slicer Z: the height its ;Z: comment gives, which the layer slider labels, the
+    // colour-change ticks and the ink-jet layer pictures are all keyed to. libvgcode labels a layer
+    // with the height of its toolpaths, which the ink-jet and brush moves inserted into a layer drag
+    // tens of millimetres up, so a layer is given the lowest print Z of its moves instead - taken
+    // over all of them, not just the first, the inserted moves often coming first.
+    m_layers_print_zs.clear();
+    {
         unsigned int src_layer_id = std::numeric_limits<unsigned int>::max();
         for (size_t i = 1; i < gcode_result.moves.size(); ++ i) {
             const GCodeProcessorResult::MoveVertex &mv = gcode_result.moves[i];
             if (mv.layer_id != src_layer_id) {
                 src_layer_id = mv.layer_id;
-                m_belt_layer_zs.emplace_back(double(mv.print_z));
-            }
+                m_layers_print_zs.emplace_back(double(mv.print_z));
+            } else if (double(mv.print_z) < m_layers_print_zs.back())
+                m_layers_print_zs.back() = double(mv.print_z);
         }
-        if (m_belt_layer_zs.size() != m_viewer.get_layers_count())
-            m_belt_layer_zs.clear();
+        // Kept only when it is a proper ladder of distinct heights, one per layer: a gcode without a
+        // print Z on its moves leaves every entry zero, and then libvgcode's own list is the better one.
+        bool usable = m_layers_print_zs.size() == m_viewer.get_layers_count();
+        for (size_t i = 1; usable && i < m_layers_print_zs.size(); ++ i)
+            usable = m_layers_print_zs[i] > m_layers_print_zs[i - 1];
+        if (! usable)
+            m_layers_print_zs.clear();
     }
 
 // #if !VGCODE_ENABLE_COG_AND_TOOL_MARKERS
@@ -1905,7 +1913,13 @@ void GCodeViewer::update_shells_color_by_extruder(const DynamicPrintConfig *conf
         m_shells.volumes.update_colors_by_extruder(config, false);
 }
 
-void GCodeViewer::set_shell_transparency(float alpha) { m_shells.volumes.set_transparency(alpha); }
+void GCodeViewer::set_shell_transparency(float alpha)
+{
+    // This is the skin's ghost alpha: over the layers being shown it is replaced by the solid one
+    // in render_shells().
+    m_shell_alpha_outside = alpha;
+    m_shells.volumes.set_transparency(alpha);
+}
 
 //BBS: always load shell at preview
 void GCodeViewer::reset_shell()
@@ -1920,7 +1934,7 @@ void GCodeViewer::reset()
     //BBS: should also reset the result id
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": current result id %1% ")%m_last_result_id;
     m_last_result_id = -1;
-    m_belt_layer_zs.clear();
+    m_layers_print_zs.clear();
     //BBS: add only gcode mode
     m_only_gcode_in_preview = false;
 
@@ -2171,12 +2185,17 @@ GCodeViewer::ImexMarkerPlan GCodeViewer::resolve_imex_marker_plan(const DynamicP
 void GCodeViewer::render_scene(int canvas_width, int canvas_height)
 {
     glsafe(::glEnable(GL_DEPTH_TEST));
-    render_shells(canvas_width, canvas_height);
-
-    if (m_viewer.get_extrusion_roles_count() == 0)
+    if (m_viewer.get_extrusion_roles_count() == 0) {
+        // Nothing sliced yet: the shells are all there is to draw.
+        render_shells(canvas_width, canvas_height);
         return;
+    }
 
     render_toolpaths();
+    // The model's skin is the picture of the print, so it is composited over the toolpaths and not
+    // under them: solid across the layers being shown, a faint ghost above and below, so what is
+    // printed reads through it instead of the model hiding it.
+    render_shells(canvas_width, canvas_height);
     // ORCA: the markers write depth, which would hide the translucent toolpaths behind them
     if (!m_viewer.has_translucent_toolpaths())
         render_markers(canvas_width, canvas_height);
@@ -3408,6 +3427,10 @@ void GCodeViewer::render_toolpaths()
 #endif // ENABLE_NEW_GCODE_VIEWER_DEBUG
 }
 
+// The skin's alpha over the layers being shown: solid enough to read the imported picture, thin
+// enough that the toolpaths running under it still show where they are.
+static const float SHELL_ALPHA_OVER_SHOWN_LAYERS = 0.62f;
+
 void GCodeViewer::render_shells(int canvas_width, int canvas_height)
 {
     //BBS: add shell previewing logic
@@ -3419,7 +3442,25 @@ void GCodeViewer::render_shells(int canvas_width, int canvas_height)
     if (shader == nullptr)
         return;
 
+    // The skin fades between the two alphas in the shaders, from the fragment's world z: the
+    // boundaries are the bottom and the top of the layers the slider shows.
+    const std::vector<double> layer_zs = get_layers_zs();
+    if (layer_zs.size() > 1) {
+        const std::array<size_t, 2>& layers_range = get_layers_z_range();
+        const size_t top    = std::min<size_t>(layers_range[1], layer_zs.size() - 1);
+        const size_t bottom = std::min<size_t>(layers_range[0], top);
+        // A layer's toolpaths reach one layer height above the z of that layer.
+        const double layer_step = top > 0 ? std::max(layer_zs[top] - layer_zs[top - 1], 0.01) : 0.2;
+        m_shells.volumes.set_shell_alpha_ramp(static_cast<float>(layer_zs[bottom]),
+                                              static_cast<float>(layer_zs[top] + layer_step),
+                                              m_shell_alpha_outside, SHELL_ALPHA_OVER_SHOWN_LAYERS);
+    }
+
     glsafe(::glDepthMask(GL_FALSE));
+    // The skin wraps perimeters that were drawn before it, so its fragments land at the same
+    // depth: pull it a hair towards the eye to win the comparison and reach the blender.
+    glsafe(::glEnable(GL_POLYGON_OFFSET_FILL));
+    glsafe(::glPolygonOffset(-1.0f, -1.0f));
 
     shader->start_using();
     shader->set_uniform("emission_factor", 0.1f);
@@ -3430,6 +3471,8 @@ void GCodeViewer::render_shells(int canvas_width, int canvas_height)
     shader->set_uniform("emission_factor", 0.0f);
     shader->stop_using();
 
+    glsafe(::glDisable(GL_POLYGON_OFFSET_FILL));
+    m_shells.volumes.reset_shell_alpha_ramp();
     glsafe(::glDepthMask(GL_TRUE));
 }
 

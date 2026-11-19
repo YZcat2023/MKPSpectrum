@@ -3060,7 +3060,9 @@ bool GCodeProcessor::check_multi_extruder_gcode_valid(const int                 
             // clearance above the belt; the two are not comparable, so the over-height check
             // is skipped, as the preview's ToolHeightOutside warning already is.
             // Print::validate() checks the object's height against the clearance.
-            if ( !m_belt_printer && iter->second.max_print_z > plate_printable_height ) { //over height
+            // A printable height of 0 means 'not set': profiles and 3mf projects ship 0 here when the
+            // printer never declared one, and every layer would then read as over height.
+            if ( !m_belt_printer && plate_printable_height > 0. && iter->second.max_print_z > plate_printable_height ) { //over height
                 m_result.gcode_check_result.error_code |= (1 << 3);
                 std::pair<int, int> filament_to_object_id;
                 filament_to_object_id.first  = iter->first;
@@ -3097,7 +3099,7 @@ bool GCodeProcessor::check_multi_extruder_gcode_valid(const int                 
                 }
 
                 // check printable height
-                if (!m_belt_printer && (extruder_id < printable_heights.size()) && (iter->second.max_print_z > printable_heights[extruder_id])) {
+                if (!m_belt_printer && (extruder_id < printable_heights.size()) && (printable_heights[extruder_id] > 0.) && (iter->second.max_print_z > printable_heights[extruder_id])) {
                     m_result.gcode_check_result.error_code |= (1 << 1);
                     std::pair<int, int> filament_to_object_id;
                     filament_to_object_id.first  = iter->first;
@@ -4453,11 +4455,11 @@ void GCodeProcessor::process_tags(const std::string_view comment, bool producers
         return;
     }
 
-    // ;Z: -- the layer Z tag non-BBL printers write.  Only read on a belt printer,
-    // where the preview labels its layers with it (GCodeViewer::load_as_gcode);
-    // elsewhere print_z stays unset, as it always was, so nothing downstream of
-    // it changes for other printers.
-    if (m_belt_printer && boost::starts_with(comment, "Z:")) {
+    // ;Z: -- the layer Z tag every printer writes before a layer. Kept on the moves, it is the one
+    // height that stays the layer's own even when ink-jet or brush moves are inserted into it tens of
+    // millimetres higher, which is what the preview keys its layer labels and the ink-jet layer
+    // pictures to.
+    if (boost::starts_with(comment, "Z:")) {
         m_print_z = get_z_height(comment);
         return;
     }
@@ -5234,6 +5236,11 @@ void GCodeProcessor::process_G1(const std::array<std::optional<double>, 4>& axes
     float area_filament_cross_section = static_cast<float>(M_PI) * sqr(filament_radius);
 
     auto move_type = [this](const AxisCoords& delta_pos) {
+        // MKP: inkjet / surface-treatment moves carry no extrusion, but they are toolpaths rather
+        // than travels - as Travel libvgcode would draw them as travel cylinders and drop the role.
+        if ((m_extrusion_role == erMkpInkjetPath || m_extrusion_role == erMkpSurfacePath) &&
+            (delta_pos[X] != 0.0f || delta_pos[Y] != 0.0f))
+            return EMoveType::Extrude;
         if (m_wiping)
             return EMoveType::Wipe;
         else if (delta_pos[E] < 0.0f)
@@ -5451,7 +5458,10 @@ void GCodeProcessor::process_G1(const std::array<std::optional<double>, 4>& axes
         // consumes it.
         block.skippable_type = m_skippable_type;
         //BBS: don't calculate travel time into extrusion path, except travel inside start and end gcode.
-        block.role = (type != EMoveType::Travel || m_extrusion_role == erCustom) ? m_extrusion_role : erNone;
+        block.role = (type != EMoveType::Travel || m_extrusion_role == erCustom ||
+                      m_extrusion_role == erMkpInkjetPath || m_extrusion_role == erMkpSurfacePath)
+                         ? m_extrusion_role
+                         : erNone;
         block.distance = distance;
         block.g1_line_id = m_g1_line_id;
         block.move_id = static_cast<unsigned int>(m_result.moves.size());
@@ -5873,7 +5883,10 @@ void GCodeProcessor::process_VG1(const GCodeReader::GCodeLine& line)
         // consumes it.
         block.skippable_type = m_skippable_type;
         //BBS: don't calculate travel time into extrusion path, except travel inside start and end gcode.
-        block.role = (type != EMoveType::Travel || m_extrusion_role == erCustom) ? m_extrusion_role : erNone;
+        block.role = (type != EMoveType::Travel || m_extrusion_role == erCustom ||
+                      m_extrusion_role == erMkpInkjetPath || m_extrusion_role == erMkpSurfacePath)
+                         ? m_extrusion_role
+                         : erNone;
         block.distance = distance;
         block.g1_line_id = m_g1_line_id;
         block.layer_id = std::max<unsigned int>(1, m_layer_id);

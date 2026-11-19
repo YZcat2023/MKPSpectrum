@@ -113,19 +113,46 @@ static DWORD execute_process_winapi(const std::wstring& command_line)
         FreeEnvironmentStrings(env);
     }
 
+    // MKP: a post-processing script must never pop a console window. OrcaSlicer is a GUI
+    // process with no console of its own, so Windows would hand the child (python3.exe is a
+    // console program) a brand new visible console - that is the black window with the
+    // [strip] lines that used to appear when printing. Hide it, and give the child a log
+    // file for stdout/stderr instead of a console, so a failing script can still be read
+    // back from %TEMP%\\mkp_postprocess.log.
+    wchar_t      temp_dir[MAX_PATH] = { 0 };
+    std::wstring log_path = (::GetTempPathW(MAX_PATH, temp_dir) > 0 ? std::wstring(temp_dir) : std::wstring(L".\\"))
+                          + L"mkp_postprocess.log";
+    SECURITY_ATTRIBUTES inherit_attrs;
+    inherit_attrs.nLength              = sizeof(inherit_attrs);
+    inherit_attrs.lpSecurityDescriptor = nullptr;
+    inherit_attrs.bInheritHandle       = TRUE;
+    HANDLE log_handle  = ::CreateFileW(log_path.c_str(), FILE_APPEND_DATA,
+                                       FILE_SHARE_READ | FILE_SHARE_WRITE, &inherit_attrs,
+                                       OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    HANDLE null_handle = ::CreateFileW(L"NUL", GENERIC_READ,
+                                       FILE_SHARE_READ | FILE_SHARE_WRITE, &inherit_attrs,
+                                       OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    const bool redirect = log_handle != INVALID_HANDLE_VALUE;
+
     STARTUPINFOW startup_info;
     memset(&startup_info, 0, sizeof(startup_info));
-    startup_info.cb = sizeof(STARTUPINFO);
-#if 0
-	startup_info.dwFlags	 = STARTF_USESHOWWINDOW;
-	startup_info.wShowWindow = SW_HIDE;
-#endif
+    startup_info.cb          = sizeof(STARTUPINFO);
+    startup_info.dwFlags     = STARTF_USESHOWWINDOW;
+    startup_info.wShowWindow = SW_HIDE;
+    if (redirect) {
+        startup_info.dwFlags   |= STARTF_USESTDHANDLES;
+        startup_info.hStdOutput = log_handle;
+        startup_info.hStdError  = log_handle;
+        startup_info.hStdInput  = (null_handle != INVALID_HANDLE_VALUE) ? null_handle : nullptr;
+    }
     PROCESS_INFORMATION process_info;
     if (!::CreateProcessW(nullptr /* lpApplicationName */, (LPWSTR) command_line.c_str(), nullptr /* lpProcessAttributes */,
-                          nullptr /* lpThreadAttributes */, false /* bInheritHandles */,
-                          CREATE_UNICODE_ENVIRONMENT /* | CREATE_NEW_CONSOLE */ /* dwCreationFlags */, (LPVOID) envstr.c_str(),
+                          nullptr /* lpThreadAttributes */, redirect /* bInheritHandles */,
+                          CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW /* dwCreationFlags */, (LPVOID) envstr.c_str(),
                           nullptr /* lpCurrentDirectory */, &startup_info, &process_info)) {
         const int error = int(::GetLastError());
+        if (log_handle  != INVALID_HANDLE_VALUE) ::CloseHandle(log_handle);
+        if (null_handle != INVALID_HANDLE_VALUE) ::CloseHandle(null_handle);
         throw Slic3r::RuntimeError(Slic3r::format(_u8L("Failed starting the script %1%, Win32 error: %2%"), boost::nowide::narrow(command_line), error));
     }
     ::WaitForSingleObject(process_info.hProcess, INFINITE);
@@ -133,6 +160,8 @@ static DWORD execute_process_winapi(const std::wstring& command_line)
     ::GetExitCodeProcess(process_info.hProcess, &rc);
     ::CloseHandle(process_info.hThread);
     ::CloseHandle(process_info.hProcess);
+    if (log_handle  != INVALID_HANDLE_VALUE) ::CloseHandle(log_handle);
+    if (null_handle != INVALID_HANDLE_VALUE) ::CloseHandle(null_handle);
     return rc;
 }
 

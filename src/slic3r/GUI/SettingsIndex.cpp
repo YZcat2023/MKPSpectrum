@@ -20,6 +20,7 @@
 namespace Slic3r {
 
 using GUI::into_u8;
+using GUI::from_u8;
 
 namespace Search {
 
@@ -92,7 +93,7 @@ void SettingsIndex::append_options(DynamicPrintConfig *config, Preset::Type type
         if (type == Preset::TYPE_FILAMENT && filament_options_with_variant.find(opt_key) != filament_options_with_variant.end())
             opt_key += "#0";
 
-        wxString label = opt.full_label.empty() ? opt.label : opt.full_label;
+        wxString label = from_u8(opt.full_label.empty() ? opt.label : opt.full_label);
 
         std::string key = get_key(opt_key, type);
         auto add = [&](const std::string &k) {

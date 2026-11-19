@@ -615,6 +615,230 @@ bool apply_painted_mesh_to_volume(
     return true;
 }
 
+bool build_texture_display_data(const TexturedMesh& mesh, TextureDisplayData& out)
+{
+    out = TextureDisplayData{};
+
+    const size_t nf = mesh.indices.size();
+    if (nf == 0)
+        return false;
+    // An OBJ with divergent uvs carries a per-face-corner pool; plain per-vertex uvs are the
+    // fallback for the loaders that only produce those. Without either there is nothing to map an
+    // image through, and the caller keeps the colour it would have drawn anyway.
+    if (!mesh.has_face_uvs() && mesh.uvs.empty())
+        return false;
+
+    std::vector<TextureDisplayData::Image> images;
+    images.reserve(mesh.textures.size());
+    bool any_image = false;
+    for (const TextureImage& ti : mesh.textures) {
+        TextureDisplayData::Image img;
+        std::vector<unsigned char> bgr;
+        int w = 0, h = 0;
+        if (decode_texture_to_pixels(ti, bgr, w, h) && !bgr.empty() && w > 0 && h > 0) {
+            img.width  = w;
+            img.height = h;
+            img.rgb.resize(bgr.size());
+            // decode_texture_to_pixels yields BGR; the GL upload wants RGB.
+            for (size_t p = 0; p + 2 < bgr.size(); p += 3) {
+                img.rgb[p]     = bgr[p + 2];
+                img.rgb[p + 1] = bgr[p + 1];
+                img.rgb[p + 2] = bgr[p];
+            }
+            any_image = true;
+        }
+        images.push_back(std::move(img));
+    }
+
+    out.face_uv.resize(nf);
+    out.face_image.assign(nf, -1);
+    out.face_rgb.assign(nf, std::array<float, 3>{1.f, 1.f, 1.f});
+
+    for (size_t fi = 0; fi < nf; ++fi) {
+        if (mesh.has_face_uvs()) {
+            const std::array<int, 3>& ui = mesh.uv_indices[fi];
+            for (int k = 0; k < 3; ++k) {
+                const int idx = ui[k];
+                out.face_uv[fi][k] = (idx >= 0 && size_t(idx) < mesh.uv_coords.size())
+                    ? mesh.uv_coords[idx]
+                    : std::array<float, 2>{0.f, 0.f};
+            }
+        } else {
+            const std::array<int, 3>& face = mesh.indices[fi];
+            for (int k = 0; k < 3; ++k) {
+                const int idx = face[k];
+                out.face_uv[fi][k] = (idx >= 0 && size_t(idx) < mesh.uvs.size())
+                    ? mesh.uvs[idx]
+                    : std::array<float, 2>{0.f, 0.f};
+            }
+        }
+
+        const int mat = (fi < mesh.material_ids.size()) ? mesh.material_ids[fi] : -1;
+        int tex = -1;
+        if (mat >= 0 && size_t(mat) < mesh.material_texture_map.size())
+            tex = mesh.material_texture_map[mat];
+        if (tex >= 0 && (size_t(tex) >= images.size() || images[size_t(tex)].rgb.empty()))
+            tex = -1; // material pointed at an image that failed to decode
+        if (tex < 0 && mat >= 0 && size_t(mat) < mesh.material_colors.size()) {
+            const std::array<float, 4>& c = mesh.material_colors[mat];
+            out.face_rgb[fi] = std::array<float, 3>{c[0], c[1], c[2]};
+        }
+        out.face_image[fi] = tex;
+    }
+
+    out.images = std::move(images);
+    return any_image;
+}
+
+namespace {
+
+// Little-endian byte sink/source for the project blob. Everything is written field by field so the
+// format is independent of struct padding and of the compiler.
+struct TextureBlobWriter
+{
+    std::vector<unsigned char> bytes;
+
+    void raw(const void *data, size_t size)
+    {
+        if (data != nullptr && size > 0)
+            bytes.insert(bytes.end(), static_cast<const unsigned char *>(data),
+                         static_cast<const unsigned char *>(data) + size);
+    }
+    void u32(unsigned int value) { raw(&value, sizeof(value)); }
+    void i32(int value) { raw(&value, sizeof(value)); }
+    void f32(float value) { raw(&value, sizeof(value)); }
+};
+
+struct TextureBlobReader
+{
+    const unsigned char *data = nullptr;
+    size_t               size = 0;
+    size_t               pos  = 0;
+    bool                 ok   = true;
+
+    bool take(void *out, size_t n)
+    {
+        if (!ok || pos + n > size || pos + n < pos) {
+            ok = false;
+            return false;
+        }
+        if (out != nullptr)
+            std::memcpy(out, data + pos, n);
+        pos += n;
+        return true;
+    }
+    unsigned int u32() { unsigned int v = 0; take(&v, sizeof(v)); return v; }
+    int          i32() { int v = 0; take(&v, sizeof(v)); return v; }
+    float        f32() { float v = 0.f; take(&v, sizeof(v)); return v; }
+};
+
+constexpr char TEXTURE_BLOB_MAGIC[8] = { 'M', 'K', 'P', 'T', 'E', 'X', '0', '1' };
+
+} // namespace
+
+std::vector<unsigned char> texture_display_to_bytes(const TextureDisplayData &display)
+{
+    TextureBlobWriter writer;
+    writer.raw(TEXTURE_BLOB_MAGIC, sizeof(TEXTURE_BLOB_MAGIC));
+    writer.u32((unsigned int) display.face_uv.size());
+    writer.u32((unsigned int) display.images.size());
+    for (const std::array<std::array<float, 2>, 3> &face : display.face_uv)
+        for (const std::array<float, 2> &uv : face) {
+            writer.f32(uv[0]);
+            writer.f32(uv[1]);
+        }
+    for (size_t i = 0; i < display.face_uv.size(); ++i)
+        writer.i32(i < display.face_image.size() ? display.face_image[i] : -1);
+    for (size_t i = 0; i < display.face_uv.size(); ++i) {
+        const std::array<float, 3> rgb = i < display.face_rgb.size() ? display.face_rgb[i]
+                                                                    : std::array<float, 3>{ 1.f, 1.f, 1.f };
+        writer.f32(rgb[0]);
+        writer.f32(rgb[1]);
+        writer.f32(rgb[2]);
+    }
+    for (const TextureDisplayData::Image &image : display.images) {
+        std::vector<unsigned char> png;
+        if (image.width > 0 && image.height > 0 &&
+            image.rgb.size() >= size_t(image.width) * size_t(image.height) * 3) {
+            // The buffer is RGB and OpenCV speaks BGR, so one conversion rather than a per-pixel loop.
+            const cv::Mat rgb(image.height, image.width, CV_8UC3, const_cast<unsigned char *>(image.rgb.data()));
+            cv::Mat       bgr;
+            cv::cvtColor(rgb, bgr, cv::COLOR_RGB2BGR);
+            cv::imencode(".png", bgr, png);
+        }
+        writer.u32((unsigned int) image.width);
+        writer.u32((unsigned int) image.height);
+        writer.u32((unsigned int) png.size());
+        writer.raw(png.data(), png.size());
+    }
+    return std::move(writer.bytes);
+}
+
+bool texture_display_from_bytes(const unsigned char *data, size_t size, TextureDisplayData &out)
+{
+    out = TextureDisplayData{};
+    TextureBlobReader reader{ data, size };
+    char magic[sizeof(TEXTURE_BLOB_MAGIC)] = {};
+    if (!reader.take(magic, sizeof(magic)) || std::memcmp(magic, TEXTURE_BLOB_MAGIC, sizeof(magic)) != 0)
+        return false;
+
+    const unsigned int n_faces  = reader.u32();
+    const unsigned int n_images = reader.u32();
+    // A count is a file's claim about this process's memory; refuse anything a real model cannot be.
+    if (!reader.ok || n_faces == 0 || n_faces > (1u << 28) || n_images > 1024)
+        return false;
+
+    out.face_uv.resize(n_faces);
+    for (size_t f = 0; f < n_faces; ++f)
+        for (size_t k = 0; k < 3; ++k) {
+            out.face_uv[f][k][0] = reader.f32();
+            out.face_uv[f][k][1] = reader.f32();
+        }
+    out.face_image.resize(n_faces);
+    for (size_t f = 0; f < n_faces; ++f)
+        out.face_image[f] = reader.i32();
+    out.face_rgb.resize(n_faces);
+    for (size_t f = 0; f < n_faces; ++f)
+        for (size_t k = 0; k < 3; ++k)
+            out.face_rgb[f][k] = reader.f32();
+    if (!reader.ok)
+        return false;
+
+    out.images.reserve(n_images);
+    for (unsigned int i = 0; i < n_images && reader.ok; ++i) {
+        TextureDisplayData::Image image;
+        image.width  = (int) reader.u32();
+        image.height = (int) reader.u32();
+        const unsigned int png_size = reader.u32();
+        if (!reader.ok || image.width < 0 || image.height < 0 || png_size > size - reader.pos)
+            return false;
+        const unsigned char *png = data + reader.pos;
+        reader.pos += png_size;
+        if (png_size > 0 && image.width > 0 && image.height > 0) {
+            const cv::Mat encoded(1, (int) png_size, CV_8UC1, const_cast<unsigned char *>(png));
+            const cv::Mat bgr = cv::imdecode(encoded, cv::IMREAD_COLOR);
+            if (!bgr.empty()) {
+                cv::Mat rgb;
+                cv::cvtColor(bgr, rgb, cv::COLOR_BGR2RGB);
+                image.rgb.assign(rgb.data, rgb.data + size_t(rgb.cols) * size_t(rgb.rows) * 3);
+                image.width  = rgb.cols;
+                image.height = rgb.rows;
+            }
+        }
+        out.images.push_back(std::move(image));
+    }
+    if (!reader.ok)
+        return false;
+
+    // A picture that did not decode cannot be sampled: those faces fall back to their material colour
+    // instead of being drawn with an image that is not there.
+    for (int &image_index : out.face_image)
+        if (image_index >= 0 && (size_t(image_index) >= out.images.size() ||
+                                 out.images[size_t(image_index)].rgb.empty()))
+            image_index = -1;
+    return true;
+}
+
 bool decode_texture_to_pixels(
     const TextureImage& img,
     std::vector<unsigned char>& out_pixels,

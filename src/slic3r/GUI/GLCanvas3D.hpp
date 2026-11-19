@@ -797,6 +797,23 @@ private:
     //BBS store camera view
     Camera camera;
 
+    // MKPSpectrum ink overlay. The picture the ink stage dumped for one layer, drawn as a quad at
+    // that layer's height. Nothing is read from disk until the preview first asks for it.
+    struct InkOverlayLayer {
+        std::string file;
+        double      z  { 0.0 };
+        long long   px { 0 };
+    };
+    GLModel                      m_ink_overlay_quad;
+    unsigned int                 m_ink_overlay_texture { 0 };
+    std::string                  m_ink_overlay_file;
+    std::vector<InkOverlayLayer> m_ink_overlay_layers;
+    double                       m_ink_overlay_x0 { 0.0 };
+    double                       m_ink_overlay_y0 { 0.0 };
+    double                       m_ink_overlay_w  { 0.0 };
+    double                       m_ink_overlay_h  { 0.0 };
+    long long                    m_ink_overlay_meta_stamp { -1 };
+
     // Following variable is obsolete and it should be safe to remove it.
     // I just don't want to do it now before a release (Lukas Matena 24.3.2019)
     bool m_render_sla_auxiliaries;
@@ -1569,6 +1586,9 @@ private:
     // Realistic view: binds, or unbinds, the shadow map the toolpaths read on texture unit 4. False without a map.
     bool _bind_gcode_shadow_map(bool bind) const;
     void _render_gcode_overlay(int canvas_width, int canvas_height);
+    // MKPSpectrum: the ink cross-section the slicer sprayed at the layer the preview is showing,
+    // drawn as a textured quad at that layer's height so the review pictures can be checked in place.
+    void _render_ink_overlay();
     //BBS: render a plane for assemble
     void _render_plane() const;
     void _render_selection();

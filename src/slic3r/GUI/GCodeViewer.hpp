@@ -82,7 +82,7 @@ public:
             // the offset is used to show the correct value of tool position in the "ToolPosition" window
             // see implementation of render() method
             Vec3f m_world_offset;
-            float m_z_offset{ 0.0f };
+            float m_z_offset{ 0.0f };
             // z offset of the model
             float m_model_z_offset{ 0.5f };
             bool m_visible{ true };
@@ -209,8 +209,9 @@ private:
     unsigned int m_last_result_id{ 0 };
     // Belt printers: the view the loaded result was converted for (see load_as_gcode).
     bool m_last_belt_show_designed{ true };
-    // Belt printers: the print Z of each viewer layer, in the viewer's layer numbering.
-    std::vector<double> m_belt_layer_zs;
+    // The slicer's print Z of each viewer layer, in the viewer's layer numbering: the one height that
+    // stays the layer's own even when ink-jet or brush moves are inserted into it far above.
+    std::vector<double> m_layers_print_zs;
     //BBS: save m_gcode_result as well
     const GCodeProcessorResult* m_gcode_result;
     std::array<unsigned int, static_cast<size_t>(EMoveType::Count)> m_move_type_counts{};
@@ -223,6 +224,10 @@ private:
     std::vector<ExtruderFilament> m_left_extruder_filament;
     std::vector<ExtruderFilament> m_right_extruder_filament;
     size_t m_nozzle_nums;
+    // The shell's alpha outside the layers being shown, i.e. what set_shell_transparency() sets;
+    // over the shown layers render_shells() uses the solid one instead.
+    float m_shell_alpha_outside{ 0.2f };
+
 
     // bounding box of toolpaths
     BoundingBoxf3 m_paths_bounding_box;
@@ -436,10 +441,10 @@ public:
     const BoundingBoxf3& get_max_bounding_box() const { return m_max_bounding_box; }
     const BoundingBoxf3& get_shell_bounding_box() const { return m_shell_bounding_box; }
     std::vector<double> get_layers_zs() const {
-        // Belt printers: the layer Z the slider labels and the colour-change ticks
-        // use is the layer's print Z (see load_as_gcode), not a toolpath height.
-        if (! m_belt_layer_zs.empty())
-            return m_belt_layer_zs;
+        // The layer Z the slider labels, the colour-change ticks and the ink-jet layer pictures use is
+        // the layer's print Z (see load_as_gcode), not a toolpath height.
+        if (! m_layers_print_zs.empty())
+            return m_layers_print_zs;
         const std::vector<float> zs = m_viewer.get_layers_zs();
         std::vector<double> ret;
         std::transform(zs.begin(), zs.end(), std::back_inserter(ret), [](float z) { return static_cast<double>(z); });

@@ -679,6 +679,17 @@ Option ConfigOptionsGroup::get_option(const std::string& opt_key, int opt_index 
 {
     if (!m_config->has(opt_key)) {
         std::cerr << "No " << opt_key << " in ConfigOptionsGroup config.\n";
+        // A preset that came out of a project file carries the option set of the build that saved
+        // it, so an option this build defines but that file predates is simply absent. The field
+        // built below reads its value straight out of this config, and a missing option there is a
+        // null dereference (0xC0000005) the moment the page is opened. Seed the definition's
+        // default so the field appears with its default and stays editable.
+        if (opt_index == -1) {
+            if (const ConfigOptionDef *optdef = m_config->def()->get(opt_key); optdef != nullptr) {
+                if (ConfigOption *seeded = optdef->create_default_option())
+                    const_cast<DynamicPrintConfig *>(m_config)->set_key_value(opt_key, seeded);
+            }
+        }
     }
 
     std::string opt_id = opt_index == -1 ? opt_key : opt_key + "#" + std::to_string(opt_index);

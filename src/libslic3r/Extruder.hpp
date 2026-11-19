@@ -40,7 +40,7 @@ public:
     unsigned int extruder_id() const;
     double extrude(double dE);
     double retract(double length, double restart_extra);
-    double unretract();
+    double unretract(double recovery_length = -1.);
     double E() const { return m_share_extruder ? m_share_E[extruder_id()] : m_E; }
     // E() plus extra, as written to the G-code for the current move. high_precision is the precision of that move,
     // see GCodeWriter::high_precision().

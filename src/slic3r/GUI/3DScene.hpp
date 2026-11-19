@@ -13,6 +13,7 @@
 #include "libslic3r/ObjectID.hpp"
 
 #include "GLModel.hpp"
+#include "GLTexture.hpp"
 #include "GLShader.hpp"
 #include "MeshUtils.hpp"
 
@@ -248,6 +249,22 @@ public:
     EHoverState         	hover;
 
     GUI::GLModel            model;
+
+    // Original-texture display (ModelVolume::display_texture): one model and one GL texture per
+    // distinct material map, each model holding only the faces that sample that map. Drawn with the
+    // "model_texture" shader instead of the one GLVolumeCollection::render() has bound, so the rest
+    // of the volume pipeline - lighting convention, outline pass, picking - stays as it is.
+    struct TextureDisplay
+    {
+        GUI::GLModel   model;
+        GUI::GLTexture texture;
+    };
+    // unique_ptr: GLTexture owns a compressor thread and is neither copyable nor movable, so the
+    // vector must not be asked to move its elements.
+    std::vector<std::unique_ptr<TextureDisplay>> texture_display;
+    bool has_texture_display() const { return !texture_display.empty(); }
+    void render_texture_display(GLShaderProgram *shader, const ColorRGBA &tint) const;
+
     // raycaster used for picking
     std::unique_ptr<GUI::MeshRaycaster> mesh_raycaster;
     // BBS
@@ -447,6 +464,10 @@ private:
     // plane coeffs for clipping in shaders
     std::array<double, 4> m_clipping_plane;
 
+    // Preview shell height ramp, see set_shell_alpha_ramp()
+    std::array<float, 2>  m_shell_alpha_z { 1.f, 0.f };
+    std::array<float, 2>  m_shell_alpha   { 1.f, 1.f };
+
     // plane coeffs for render volumes with different colors in shaders
     // used by cut gizmo
     std::array<double, 4> m_color_clip_plane;
@@ -538,6 +559,18 @@ public:
 
     const std::array<float, 2>& get_z_range() const { return m_z_range; }
     const std::array<double, 4>& get_clipping_plane() const { return m_clipping_plane; }
+
+    // Preview shell: the model's skin is drawn over the toolpaths by GCodeViewer::render_shells()
+    // and its alpha follows the printed height the layer slider shows. z_low / z_high are the
+    // bottom and top of that range, alpha_outside is the skin's ordinary (ghost) alpha, and
+    // alpha_inside the solid one over the shown layers. Off - z_low > z_high - unless the shell
+    // pass turns it on, so every other draw keeps the alpha it sets itself.
+    void set_shell_alpha_ramp(float z_low, float z_high, float alpha_outside, float alpha_inside)
+    {
+        m_shell_alpha_z = { z_low, z_high };
+        m_shell_alpha   = { alpha_outside, alpha_inside };
+    }
+    void reset_shell_alpha_ramp() { m_shell_alpha_z = { 1.f, 0.f }; }
 
     void set_use_color_clip_plane(bool use) { m_use_color_clip_plane = use; }
     void set_color_clip_plane(const Vec3d& cp_normal, double offset) {

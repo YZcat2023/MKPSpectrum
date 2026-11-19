@@ -65,6 +65,7 @@
 #include <string_view>
 #include "slic3r/GUI/Selection.hpp"
 #include "GLCanvas3D.hpp"
+#include "InkOverlayLoader.hpp"
 #include "SequentialPrintClearance.hpp"
 #ifdef SLIC3R_CAD
 #include "slic3r/GUI/CAD/DesignSketchTool.hpp"   // Design tab: interactive 2D sketch tool
@@ -183,6 +184,12 @@
 #ifdef __WXMSW__
 #if wxUSE_POPUPWIN
 #include <wx/popupwin.h>
+#include "libslic3r/PNGReadWrite.hpp"
+#include <nlohmann/json.hpp>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <system_error>
 extern wxPopupWindow* wxCurrentPopupWindow;
 #endif
 #endif
@@ -210,6 +217,11 @@ void Slic3r::GUI::GLCanvas3D::load_render_colors()
 
 namespace Slic3r {
 namespace GUI {
+
+namespace {
+void ink_stop_loader();
+void ink_drop_textures();
+}
 
 static void pan_camera(Camera& camera, const Vec2d& screen_delta, const Vec3d& anchor)
 {
@@ -1676,7 +1688,11 @@ GLCanvas3D::GLCanvas3D(wxGLCanvas* canvas, Bed3D &bed)
 
 GLCanvas3D::~GLCanvas3D()
 {
+    if (m_canvas_type == ECanvasType::CanvasPreview)
+        ink_stop_loader();
     if (_set_current()) {
+        if (m_canvas_type == ECanvasType::CanvasPreview)
+            ink_drop_textures();
         m_scene_cache.reset();
         m_frame_profiler.reset();
         if (m_fxaa_texture_id != 0) {
@@ -2769,6 +2785,12 @@ void GLCanvas3D::_render_frame(bool scene_dirty, bool only_init)
         m_scene_cache.render(m_background);
     }
 
+    // The ink-jet layer picture: the model cut open at the layer the preview is showing. Drawn after
+    // the scene, so it is neither burned into the scene cache nor left behind the layer slider, whose
+    // value _render_gcode_overlay() above has already applied.
+    if (m_canvas_type == ECanvasType::CanvasPreview && m_render_preview)
+        _render_ink_overlay();
+
     _render_overlay_toolbars();
     m_frame_profiler.mark("toolbars");
 
@@ -3610,6 +3632,11 @@ void GLCanvas3D::reload_scene(bool refresh_immediately, bool force_full_scene_re
         if (dconfig.has("enable_wrapping_detection")) {
             need_wipe_tower |= dynamic_cast<const ConfigOptionBool*>(dconfig.option("enable_wrapping_detection"))->value;
         }
+
+        // MKP: the forced full-height tower prints on a single filament. Without this the whole
+        // placement/clamp block below is skipped, leaving a stale position that the slice rejects.
+        if (const auto *mkp_full = dconfig.option<ConfigOptionBool>("mkp_full_height_prime_tower"); mkp_full != nullptr && mkp_full->value)
+            need_wipe_tower = true;
 
         // Belt printers replace the classic wipe tower with the auto-generated
         // belt purge prism (a real model object), so never draw the tower widget.
@@ -7160,7 +7187,45 @@ void GLCanvas3D::render_thumbnail_internal(ThumbnailData& thumbnail_data, const 
             vol->simple_render(shader,  model_objects, extruder_colors, ban_light);
             vol->is_active = is_active;
         }
-        shader->stop_using();
+
+        // A volume that arrived with its own picture is drawn the same way in the thumbnail as in the
+        // viewport: a plate image is meant to show what the plate looks like, and a textured part
+        // rendered in plain filament colour would show the wrong thing. Same program and matrices as
+        // GLVolumeCollection::render(); no selection glow, this is a still of the plate.
+        bool drew_texture = false;
+        if (wxTheApp != nullptr) {
+            GLShaderProgram *texture_shader = GUI::wxGetApp().get_shader("model_texture");
+            if (texture_shader != nullptr) {
+                bool any_textured = false;
+                for (const GLVolume *vol : visible_volumes)
+                    any_textured |= vol->has_texture_display();
+                if (any_textured) {
+                    shader->stop_using();
+                    texture_shader->start_using();
+                    texture_shader->set_uniform("is_outline", false);
+                    texture_shader->set_uniform("projection_matrix", projection_matrix);
+                    // The texture pass re-draws the triangles the paint pass left behind, so it has to
+                    // compare equal against their depth, not less.
+                    glsafe(::glDepthFunc(GL_LEQUAL));
+                    glsafe(::glActiveTexture(GL_TEXTURE0));
+                    for (GLVolume *vol : visible_volumes) {
+                        if (!vol->has_texture_display())
+                            continue;
+                        const Transform3d model_matrix = vol->world_matrix();
+                        texture_shader->set_uniform("view_model_matrix", view_matrix * model_matrix);
+                        const Matrix3d view_normal_matrix = view_matrix.matrix().block(0, 0, 3, 3) *
+                                                            model_matrix.matrix().block(0, 0, 3, 3).inverse().transpose();
+                        texture_shader->set_uniform("view_normal_matrix", view_normal_matrix);
+                        vol->render_texture_display(texture_shader, ColorRGBA(1.f, 1.f, 1.f, 1.f));
+                    }
+                    glsafe(::glDepthFunc(GL_LESS));
+                    texture_shader->stop_using();
+                    drew_texture = true;
+                }
+            }
+        }
+        if (!drew_texture)
+            shader->stop_using();
     }
 
     glsafe(::glDisable(GL_DEPTH_TEST));
@@ -9995,6 +10060,371 @@ void GLCanvas3D::_render_gcode(int canvas_width, int canvas_height)
 
     m_gcode_viewer.render_scene(canvas_width, canvas_height);
     _bind_gcode_shadow_map(false);
+}
+
+
+// ---- MKPSpectrum ink overlay -------------------------------------------------------------------
+// The ink stage dumps one review PNG per layer plus preview_meta.json, both framed on the model in
+// print coordinates. The preview is where those pictures are worth looking at: a plane at the
+// layer's own height answers "did the ink land on the surface I meant" at a glance.
+namespace {
+// Documents/MKPSpectrum/Temp/Texture/Preview - the folder the ink stage writes into.
+std::string mkp_ink_preview_dir()
+{
+    const char *home = std::getenv("USERPROFILE");
+    if (home == nullptr)
+        home = std::getenv("HOME");
+    if (home == nullptr)
+        return std::string();
+    return (std::filesystem::path(home) / "Documents" / "MKPSpectrum" / "Temp" / "Texture" / "Preview").string();
+}
+} // namespace
+
+static void mkp_ink_log(const std::string &line)
+{
+    static std::ofstream out;
+    static bool tried = false;
+    if (! tried) {
+        tried = true;
+        const char *tmp = std::getenv("TEMP");
+        if (tmp != nullptr)
+            out.open((std::filesystem::path(tmp) / "mkp_ink_overlay.log").string(), std::ios::app);
+    }
+    if (out.is_open()) {
+        out << line << "\n";
+        out.flush();
+    }
+}
+
+// Draws the ink-jet layer picture of the layer the preview is showing, flat on top of the
+// toolpaths, in the native 3D preview. Every early return logs why it gave up, so a missing
+// overlay can be diagnosed from %TEMP%\mkp_ink_overlay.log instead of by guesswork.
+namespace {
+// One group per textured object: each model has its own canvas (framed on that model) and its own
+// layer list. Two textured objects on one plate used to write into the same layer_XXXX.png and the
+// same preview_meta.json, so the model processed last erased the other one's pictures and only one
+// overlay was ever visible.
+struct InkPic
+{
+    std::string file;
+    double      z  = 0.0;
+    long long   px = 0;
+};
+struct InkGroup
+{
+    std::string         dir;
+    double              x0 = 0.0, y0 = 0.0, w = 0.0, h = 0.0;
+    std::vector<InkPic> layers;
+};
+struct InkTex
+{
+    GLuint  tex = 0;
+    GLModel quad;
+    double  z = 0.0;
+    size_t bytes = 0;
+    uint64_t last_used = 0;
+};
+
+std::vector<InkGroup>                    s_ink_groups;
+uint64_t                                 s_ink_stamp = 0;
+uint64_t                                 s_ink_generation = 0;
+size_t                                   s_ink_cached_bytes = 0;
+std::unique_ptr<InkOverlayLoader>        s_ink_loader;
+std::map<std::string, std::chrono::steady_clock::time_point> s_ink_failed_until;
+std::map<std::string, std::unique_ptr<InkTex>> s_ink_tex;
+
+void ink_stop_loader()
+{
+    // Join while the UI is still alive, before Windows unloads the application's DLL.
+    s_ink_loader.reset();
+    s_ink_stamp = 0;
+    s_ink_groups.clear();
+    s_ink_failed_until.clear();
+}
+
+bool ink_read_meta(const std::filesystem::path &meta_path, InkGroup &group)
+{
+    std::ifstream in(meta_path.string());
+    if (! in.is_open())
+        return false;
+    try {
+        const nlohmann::json meta = nlohmann::json::parse(in);
+        const double mm_per_px = meta.value("mm_per_px", 0.0);
+        group.x0 = meta.value("x0_mm", 0.0);
+        group.y0 = meta.value("y0_mm", 0.0);
+        group.w  = meta.value("width_px", 0.0)  * mm_per_px;
+        group.h  = meta.value("height_px", 0.0) * mm_per_px;
+        for (const nlohmann::json &layer : meta.value("layers", nlohmann::json::array())) {
+            InkPic pic;
+            pic.file = layer.value("file", std::string());
+            pic.z    = layer.value("z", 0.0);
+            pic.px   = layer.value("px", (long long) 0);
+            if (! pic.file.empty())
+                group.layers.push_back(std::move(pic));
+        }
+    } catch (const std::exception &) {
+        return false;
+    }
+    return group.w > 0.0 && group.h > 0.0 && ! group.layers.empty();
+}
+
+void ink_drop_textures()
+{
+    for (auto &item : s_ink_tex)
+        if (item.second && item.second->tex != 0)
+            glsafe(::glDeleteTextures(1, &item.second->tex));
+    s_ink_tex.clear();
+    s_ink_cached_bytes = 0;
+}
+} // namespace
+
+void GLCanvas3D::_render_ink_overlay()
+{
+    static uint64_t s_frame = 0;
+    ++ s_frame;
+    const bool loud  = (s_frame % 60) == 1;    // a line a second on the failure paths
+    const bool trace = (s_frame % 600) == 1;   // the full picture every ~10 s
+
+    if (m_canvas_type != ECanvasType::CanvasPreview) {
+        if (loud) mkp_ink_log("skip: canvas_type=" + std::to_string((int) m_canvas_type));
+        return;
+    }
+    if (! m_gcode_viewer.has_data()) {
+        if (loud) mkp_ink_log("skip: gcode viewer has no data");
+        return;
+    }
+
+    if (!s_ink_loader)
+        s_ink_loader = std::make_unique<InkOverlayLoader>();
+
+    const std::vector<double> layer_zs = m_gcode_viewer.get_layers_zs();
+    if (layer_zs.empty()) {
+        if (loud) mkp_ink_log("skip: empty layers_zs");
+        return;
+    }
+    // The slider holds the layer the user just dragged to. The viewer's range is only written from it
+    // in _render_gcode_overlay(), which runs later in the frame, so reading the range here would leave
+    // the picture one drag behind.
+    const std::array<size_t, 2> range = m_gcode_viewer.get_layers_z_range();
+    size_t top_idx = range[1];
+    if (IMSlider *layers_slider = m_gcode_viewer.get_layers_slider(); layers_slider != nullptr)
+        top_idx = static_cast<size_t>(std::max(layers_slider->GetHigherValue(), 0));
+    top_idx = std::min<size_t>(top_idx, layer_zs.size() - 1);
+    const double z_shown = layer_zs[top_idx];
+
+    const std::string dir = mkp_ink_preview_dir();
+    if (dir.empty()) {
+        if (loud) mkp_ink_log("skip: neither USERPROFILE nor HOME is set");
+        return;
+    }
+
+    // Metadata can change during slicing; check at most four times a second, not once per frame.
+    // Filesystem queries use error_code because the worker may replace an object directory.
+    static auto next_meta_check = std::chrono::steady_clock::time_point::min();
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= next_meta_check) {
+        next_meta_check = now + std::chrono::milliseconds(250);
+        std::vector<std::filesystem::path> metas;
+        std::error_code ec;
+        const std::filesystem::path root(dir);
+        metas.push_back(root / "preview_meta.json");
+        for (std::filesystem::directory_iterator it(root, ec), end; !ec && it != end; it.increment(ec)) {
+            std::error_code type_ec;
+            if (!it->is_directory(type_ec) || type_ec)
+                continue;
+            if (it->path().filename().string().rfind("obj", 0) == 0)
+                metas.push_back(it->path() / "preview_meta.json");
+        }
+        std::sort(metas.begin(), metas.end());
+        uint64_t stamp = 14695981039346656037ULL;
+        for (const auto &p : metas) {
+            std::error_code time_ec;
+            const auto time = std::filesystem::last_write_time(p, time_ec);
+            if (time_ec)
+                continue;
+            for (unsigned char ch : p.string())
+                stamp = (stamp ^ ch) * 1099511628211ULL;
+            stamp = (stamp ^ static_cast<uint64_t>(time.time_since_epoch().count())) * 1099511628211ULL;
+        }
+        if (stamp != s_ink_stamp) {
+            s_ink_stamp = stamp;
+            ++s_ink_generation;
+            s_ink_loader->request(s_ink_generation, {});
+            s_ink_groups.clear();
+            s_ink_failed_until.clear();
+            ink_drop_textures();
+            for (const auto &p : metas) {
+                InkGroup group;
+                group.dir = p.parent_path().string();
+                if (ink_read_meta(p, group)) {
+                    s_ink_groups.push_back(std::move(group));
+                } else {
+                    std::error_code exists_ec;
+                    if (std::filesystem::exists(p, exists_ec))
+                        s_ink_stamp = 0; // The writer may still be finishing JSON; retry next check.
+                }
+            }
+            mkp_ink_log("meta groups=" + std::to_string(s_ink_groups.size()) + " in " + dir);
+        }
+    }
+    if (s_ink_groups.empty()) {
+        if (loud) mkp_ink_log("skip: no ink pictures to draw");
+        return;
+    }
+
+    GLShaderProgram *shader = wxGetApp().get_shader("flat_texture");
+    if (shader == nullptr) {
+        if (loud) mkp_ink_log("skip: flat_texture shader missing");
+        return;
+    }
+
+    // Per object, the picture cut at the height the slider is on. Only that picture: falling back to
+    // the nearest inked layer below made an empty mid-model layer show somebody else's ink, which
+    // reads as "the ink landed here" when it did not.
+    std::vector<std::pair<const InkGroup *, const InkPic *>> picks;
+    for (const InkGroup &group : s_ink_groups) {
+        const InkPic *pick = nullptr;
+        double        best = std::numeric_limits<double>::max();
+        for (const InkPic &pic : group.layers) {
+            const double dz = std::abs(pic.z - z_shown);
+            if (dz < best) {
+                best = dz;
+                pick = &pic;
+            }
+        }
+        if (pick == nullptr || best > 1e-3 || pick->px == 0)
+            continue;
+        picks.emplace_back(&group, pick);
+    }
+    if (picks.empty()) {
+        s_ink_loader->request(s_ink_generation, {});
+        if (loud) mkp_ink_log("skip: no ink picture for z=" + std::to_string(z_shown));
+        return;
+    }
+
+    std::vector<std::string> requested_paths;
+    std::vector<std::string> visible_keys;
+    for (const auto &pick : picks) {
+        const std::string key = pick.first->dir + "|" + pick.second->file;
+        visible_keys.push_back(key);
+        const auto failed = s_ink_failed_until.find(key);
+        if (s_ink_tex.count(key) == 0 && (failed == s_ink_failed_until.end() || now >= failed->second))
+            requested_paths.push_back((std::filesystem::path(pick.first->dir) / pick.second->file).string());
+    }
+    s_ink_loader->request(s_ink_generation, requested_paths);
+
+    glsafe(::glDisable(GL_DEPTH_TEST));
+    glsafe(::glEnable(GL_BLEND));
+    glsafe(::glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA));
+    shader->start_using();
+    // The live preview camera, not the stored GLCanvas3D::camera copy: the copy does not follow the
+    // preview's orbit/zoom, which parks the quad outside the frustum.
+    const Camera &live_camera = wxGetApp().plater()->get_camera();
+    shader->set_uniform("view_model_matrix", live_camera.get_view_matrix());
+    shader->set_uniform("projection_matrix", live_camera.get_projection_matrix());
+    shader->set_uniform("uniform_texture", 0);
+    glsafe(::glActiveTexture(GL_TEXTURE0));
+
+    for (const auto &pick : picks) {
+        const InkGroup &group = *pick.first;
+        const InkPic   &pic   = *pick.second;
+        const std::string key = group.dir + "|" + pic.file;
+        auto it = s_ink_tex.find(key);
+        if (it == s_ink_tex.end()) {
+            const std::string path = (std::filesystem::path(group.dir) / pic.file).string();
+            const auto failed = s_ink_failed_until.find(key);
+            if (failed != s_ink_failed_until.end() && now < failed->second)
+                continue;
+            auto decoded = s_ink_loader->take(s_ink_generation, path);
+            if (!decoded) {
+                request_extra_frame();
+                continue;
+            }
+            if (!decoded->valid) {
+                s_ink_failed_until[key] = now + std::chrono::milliseconds(250);
+                if (loud) mkp_ink_log("skip: png decode failed " + key);
+                continue;
+            }
+            s_ink_failed_until.erase(key);
+            auto &image = decoded->image;
+            const size_t bytes = image.buf.size();
+            // Keep the selected objects, evict the least recently used old layer one at a time.
+            // A single large selected layer may exceed the cache budget; it is still displayed.
+            constexpr size_t cache_budget = 128u * 1024u * 1024u;
+            while (!s_ink_tex.empty() && (s_ink_cached_bytes + bytes > cache_budget || s_ink_tex.size() >= 64)) {
+                auto victim = s_ink_tex.end();
+                for (auto candidate = s_ink_tex.begin(); candidate != s_ink_tex.end(); ++candidate) {
+                    if (std::find(visible_keys.begin(), visible_keys.end(), candidate->first) != visible_keys.end())
+                        continue;
+                    if (victim == s_ink_tex.end() || candidate->second->last_used < victim->second->last_used)
+                        victim = candidate;
+                }
+                if (victim == s_ink_tex.end())
+                    break;
+                glsafe(::glDeleteTextures(1, &victim->second->tex));
+                s_ink_cached_bytes -= victim->second->bytes;
+                s_ink_tex.erase(victim);
+            }
+
+            auto entry = std::make_unique<InkTex>();
+            glsafe(::glGenTextures(1, &entry->tex));
+            glsafe(::glBindTexture(GL_TEXTURE_2D, entry->tex));
+            glsafe(::glPixelStorei(GL_UNPACK_ALIGNMENT, 1));
+            const GLenum fmt = image.bytes_per_pixel == 4 ? GL_RGBA : GL_RGB;
+            glsafe(::glTexImage2D(GL_TEXTURE_2D, 0, GLint(fmt), GLsizei(image.cols), GLsizei(image.rows), 0,
+                                  fmt, GL_UNSIGNED_BYTE, image.buf.data()));
+            glsafe(::glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR));
+            glsafe(::glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR));
+            glsafe(::glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE));
+            glsafe(::glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE));
+            glsafe(::glBindTexture(GL_TEXTURE_2D, 0));
+
+            // The dump flips rows on the way out (row = height-1-cy) and the decoder flips them again
+            // (bottom_up = true), so texture row 0 is the model's smallest y: v = 0 belongs to y0.
+            GLModel::Geometry quad;
+            quad.format = { GLModel::Geometry::EPrimitiveType::Triangles, GLModel::Geometry::EVertexLayout::P3T2 };
+            quad.reserve_vertices(4);
+            quad.reserve_indices(6);
+            // A hundredth of a millimetre, not a twentieth of a layer: the plate sits on the surface
+            // the layer ends at, and anything more reads as the picture floating above the toolpath.
+            const float z  = float(pic.z + 0.01);
+            const float x0 = float(group.x0);
+            const float y0 = float(group.y0);
+            const float x1 = float(group.x0 + group.w);
+            const float y1 = float(group.y0 + group.h);
+            quad.add_vertex(Vec3f(x0, y0, z), Vec2f(0.f, 0.f));
+            quad.add_vertex(Vec3f(x1, y0, z), Vec2f(1.f, 0.f));
+            quad.add_vertex(Vec3f(x1, y1, z), Vec2f(1.f, 1.f));
+            quad.add_vertex(Vec3f(x0, y1, z), Vec2f(0.f, 1.f));
+            quad.add_triangle(0, 1, 2);
+            quad.add_triangle(2, 3, 0);
+            entry->quad.init_from(std::move(quad));
+            entry->z = pic.z;
+            entry->bytes = bytes;
+            s_ink_cached_bytes += bytes;
+            mkp_ink_log("tex " + key + " " + std::to_string(image.cols) + "x" + std::to_string(image.rows) +
+                        " bpp=" + std::to_string(image.bytes_per_pixel) + " quad z=" + std::to_string(pic.z));
+            it = s_ink_tex.emplace(key, std::move(entry)).first;
+        }
+        it->second->last_used = static_cast<uint64_t>(s_frame);
+        glsafe(::glBindTexture(GL_TEXTURE_2D, it->second->tex));
+        it->second->quad.render(shader);
+    }
+
+    glsafe(::glBindTexture(GL_TEXTURE_2D, 0));
+    shader->stop_using();
+    glsafe(::glEnable(GL_DEPTH_TEST));
+
+    if (trace) {
+        const BoundingBoxf3 &bb = m_gcode_viewer.get_paths_bounding_box();
+        std::string line = "draw z_shown=" + std::to_string(z_shown) + " groups=" +
+                           std::to_string(s_ink_groups.size()) + " picks=" + std::to_string(picks.size()) +
+                           " gcode_bb=(" + std::to_string(bb.min.x()) + "," + std::to_string(bb.min.y()) + ")-(" +
+                           std::to_string(bb.max.x()) + "," + std::to_string(bb.max.y()) + ")";
+        for (const auto &pick : picks)
+            line += " [" + std::string(pick.second->file) + " z=" + std::to_string(pick.second->z) + "]";
+        mkp_ink_log(line);
+    }
 }
 
 void GLCanvas3D::_render_gcode_translucent(int canvas_width, int canvas_height)

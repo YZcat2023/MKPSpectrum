@@ -52,6 +52,43 @@ struct TexturedMesh {
     std::vector<std::array<float,4>> precomputed_vertex_colors;
 };
 
+// What the 3D editor needs to draw a volume with the texture the file shipped with, instead of the
+// printable colours the import pipeline derives from it. One entry per triangle of the volume mesh,
+// in that mesh's own face order, and one image per distinct material map.
+struct TextureDisplayData
+{
+    struct Image
+    {
+        int                        width  = 0;
+        int                        height = 0;
+        // width * height * 3, RGB, row 0 at v = 0 (any flip is already folded into face_uv).
+        std::vector<unsigned char> rgb;
+    };
+
+    // The three uvs of every face, corner for corner.
+    std::vector<std::array<std::array<float, 2>, 3>> face_uv;
+    // Entry of images[] a face samples, or -1 when its material carried no map.
+    std::vector<int>                 face_image;
+    // Albedo for the faces whose material had no map, 0..1.
+    std::vector<std::array<float, 3>> face_rgb;
+    std::vector<Image>               images;
+
+    bool empty() const { return face_uv.empty(); }
+};
+
+// Decode `mesh`'s images and lay its per-face uvs out for TextureDisplayData. False when the mesh
+// carries no uv layout at all, or when none of its images decodes.
+bool build_texture_display_data(const TexturedMesh &mesh, TextureDisplayData &out);
+
+// Serializes display data for a project file. A project cannot rebuild the picture from the geometry, so
+// the images travel with the volume that samples them; the uvs stay raw floats so a round trip does not
+// drift the mapping, and the images go in as PNG because that is what makes the blob small enough to
+// carry through every save. Returns an empty vector for empty data.
+std::vector<unsigned char> texture_display_to_bytes(const TextureDisplayData &display);
+// Reads back what texture_display_to_bytes() wrote. False on anything that is not one of those blobs
+// (an older project, a truncated file), leaving `out` empty rather than half-filled.
+bool texture_display_from_bytes(const unsigned char *data, size_t size, TextureDisplayData &out);
+
 struct PaintedMesh {
     std::vector<std::array<float,3>>            vertices;
     std::vector<std::array<int,3>>              indices;

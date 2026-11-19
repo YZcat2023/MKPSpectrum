@@ -276,6 +276,9 @@ private:
     float           m_extra_loading_move        = 0.f;
     float           m_bridging                  = 0.f;
     bool            m_sparse_layers_skipped     = false;
+    // MKP: print the full planned depth on layers that carry no tool change, so a forced
+    // full-height tower keeps a real body instead of collapsing into a single perimeter.
+    bool            m_mkp_full_height            = false;
     bool            m_sparse_layers_combined    = false;
     bool            m_set_extruder_trimpot      = false;
     bool            m_adhesion                  = true;
@@ -371,6 +374,9 @@ private:
             float first_wipe_line;
             float wipe_volume;
 			float wipe_volume_total;
+            // MKP: sizing-only tool change on a forced full-height tower. It feeds the native
+            // depth/rib/brim planning but prints no ram or purge, so the body stays hollow.
+            bool  fake = false;
             ToolChange(size_t old, size_t newtool, float depth=0.f, float ramming_depth=0.f, float fwl=0.f, float wv=0.f)
             : old_tool{old}, new_tool{newtool}, required_depth{depth}, ramming_depth{ramming_depth}, first_wipe_line{fwl}, wipe_volume{wv}, wipe_volume_total{wv} {}
 		};

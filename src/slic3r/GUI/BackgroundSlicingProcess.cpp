@@ -507,6 +507,13 @@ void BackgroundSlicingProcess::call_process(std::exception_ptr& ex) throw()
         assert(m_print->canceled());
         ex = std::current_exception();
         BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ":got cancelled exception" << std::endl;
+    } catch (const SlicingErrors& errors) {
+        ex = std::current_exception();
+        for (const auto& error : errors.errors_)
+            BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": " << error.what();
+    } catch (const std::exception& error) {
+        ex = std::current_exception();
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": " << error.what();
     } catch (...) {
         ex = std::current_exception();
         BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ":got other exception" << std::endl;

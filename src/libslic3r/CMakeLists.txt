@@ -229,6 +229,10 @@ set(lisbslic3r_sources
     Format/OBJ.hpp
     Format/AssimpImport.hpp
     Format/AssimpImport.cpp
+    Format/GlbMeshSimplify.hpp
+    Format/GlbBake.hpp
+    Format/GlbBake.cpp
+    Format/xatlas/xatlas.cpp
     Format/ResourcePathUtils.hpp
     Format/objparser.cpp
     Format/objparser.hpp
@@ -267,6 +271,10 @@ set(lisbslic3r_sources
     GCode/TimelapsePosPicker.cpp
     GCode/TimelapsePosPicker.hpp
     GCode.cpp
+    MkpInkjet.cpp
+    MkpInkjet.hpp
+    MkpMbd.cpp
+    MkpMbd.hpp
     GCode/ExtrusionProcessor.hpp
     GCode/FanMover.cpp
     GCode/FanMover.hpp

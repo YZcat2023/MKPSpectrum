@@ -609,6 +609,27 @@ enum CounterboreHoleBridgingOption {
      wtwRib
  };
 
+// MKP: surface (brush / inkjet) treatment pattern
+enum MKPSurfacePattern {
+    mkpLine = 0,
+    mkpGrid,
+    mkpInkjetPath,
+    mkpSurfacePath
+};
+
+enum MKPInkjetFlushMode {
+    mkpFlushAtStart = 0,
+    mkpFlushByFilament
+};
+
+// MKP: which inkjet device performs the surface treatment.
+//   mkpInkjetMKPSjet - our own HP63 control board; talks over a serial port and does not take MBD files.
+//   mkpInkjetMBrush  - MBrush head on the USB virtual NIC (192.168.88.1); consumes MBD strips.
+enum MKPInkjetDevice {
+    mkpInkjetMKPSjet = 0,
+    mkpInkjetMBrush
+};
+
 // BBS
 enum ExtruderType {
     etDirectDrive = 0,
@@ -828,6 +849,9 @@ CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(CounterboreHoleBridgingOption)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(PrintHostType)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(AuthorizationType)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(WipeTowerWallType)
+CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(MKPSurfacePattern)
+CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(MKPInkjetFlushMode)
+CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(MKPInkjetDevice)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(PerimeterGeneratorType)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(ToolChangeOrderingType)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(PowerLossRecoveryMode)
@@ -1706,6 +1730,8 @@ PRINT_CONFIG_CLASS_DEFINE(
 PRINT_CONFIG_CLASS_DEFINE(
     GCodeConfig,
 
+    ((ConfigOptionBool,               mkp_outer_wall_linear_speed))
+    ((ConfigOptionFloat,              mkp_outer_wall_speed_min))
     ((ConfigOptionString,              before_layer_change_gcode))
     ((ConfigOptionString,              printing_by_object_gcode))
     ((ConfigOptionFloats,              deretraction_speed))
@@ -1848,6 +1874,10 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionFloatsNullable,      travel_speed_z))
     ((ConfigOptionString,              machine_pause_gcode))
     ((ConfigOptionString,              template_custom_gcode))
+    ((ConfigOptionString,              mkp_grab_brush_gcode))
+    ((ConfigOptionString,              mkp_release_brush_gcode))
+    ((ConfigOptionString,              mkp_grab_inkjet_gcode))
+    ((ConfigOptionString,              mkp_release_inkjet_gcode))
     //BBS
     ((ConfigOptionEnumsGenericNullable,nozzle_type))
     ((ConfigOptionInt,                 nozzle_hrc))
@@ -1998,6 +2028,27 @@ PRINT_CONFIG_CLASS_DERIVED_DEFINE(
     ((ConfigOptionStrings,            parallel_printheads_bed_exclude_areas))
     //BBS: add bed_exclude_area
     ((ConfigOptionPoints,             bed_exclude_area))
+    // MKP: inkjet device selection + brush / print head offset relative to the nozzle (machine settings)
+    ((ConfigOptionEnum<MKPInkjetDevice>, mkp_inkjet_device))
+    // MKP: 喷墨头相对喷嘴的物理偏移（原来存在 Printsetting/MKP standard.json，现并入机器预设）
+    ((ConfigOptionFloat,              mkp_inkjet_offset_x))
+    ((ConfigOptionFloat,              mkp_inkjet_offset_y)) \
+    ((ConfigOptionFloat,              mkp_inkjet_offset_z))
+    ((ConfigOptionFloat,              mkp_brush_offset_x))
+    ((ConfigOptionFloat,              mkp_brush_offset_y))
+    ((ConfigOptionFloat,              mkp_brush_offset_z))
+    // MKP: 绘图笔 offset
+    ((ConfigOptionFloat,              mkp_pen_offset_x))
+    ((ConfigOptionFloat,              mkp_pen_offset_y))
+    ((ConfigOptionFloat,              mkp_pen_offset_z))
+    // MKP: 拖刀 offset
+    ((ConfigOptionFloat,              mkp_knife_offset_x))
+    ((ConfigOptionFloat,              mkp_knife_offset_y))
+    ((ConfigOptionFloat,              mkp_knife_offset_z))
+    // MKP: 激光 offset
+    ((ConfigOptionFloat,              mkp_laser_offset_x))
+    ((ConfigOptionFloat,              mkp_laser_offset_y))
+    ((ConfigOptionFloat,              mkp_laser_offset_z))
     ((ConfigOptionString,             bed_exclude_volumes))
     ((ConfigOptionEnum<BedExcludeVolumeMode>, bed_exclude_volume_mode))
     ((ConfigOptionStrings,            extruder_bed_exclude_volumes))
@@ -2097,6 +2148,34 @@ PRINT_CONFIG_CLASS_DERIVED_DEFINE(
     ((ConfigOptionFloats,             wipe_distance))
     ((ConfigOptionBool,               enable_mixed_color_sublayer))
     ((ConfigOptionBool,               enable_prime_tower))
+    ((ConfigOptionBool,               mkp_full_height_prime_tower))
+    // MKP: surface treatment (print settings)
+    ((ConfigOptionBool,               mkp_surface_enabled))
+    ((ConfigOptionFloat,              mkp_surface_speed))
+    ((ConfigOptionFloat,              mkp_surface_wall_speed))
+    ((ConfigOptionBool,               mkp_surface_linear_speed))
+    ((ConfigOptionFloat,              mkp_surface_speed_min))
+    ((ConfigOptionFloat,              mkp_surface_speed_max))
+    ((ConfigOptionBool,               mkp_surface_inner_walls))
+    ((ConfigOptionEnum<MKPSurfacePattern>, mkp_surface_pattern))
+    ((ConfigOptionFloat,              mkp_surface_line_spacing))
+    // MKP: 喷墨（工艺预设）—— 浓度/速度/重复/干燥/色调/对比度/平行四边形剪切
+    ((ConfigOptionFloat,              mkp_inkjet_density))
+    ((ConfigOptionFloat,              mkp_inkjet_speed))
+    ((ConfigOptionFloat,              mkp_inkjet_retract_length))
+    ((ConfigOptionFloat,              mkp_inkjet_recovery_length))
+    ((ConfigOptionEnum<MKPInkjetFlushMode>, mkp_inkjet_flush_mode))
+    ((ConfigOptionFloat,              mkp_inkjet_flush_interval))
+    ((ConfigOptionInt,                mkp_inkjet_repeat))
+    ((ConfigOptionInt,                mkp_inkjet_dry_time))
+    ((ConfigOptionFloat,              mkp_inkjet_c))
+    ((ConfigOptionFloat,              mkp_inkjet_m))
+    ((ConfigOptionFloat,              mkp_inkjet_y))
+    ((ConfigOptionFloat,              mkp_inkjet_saturation))
+    ((ConfigOptionFloat,              mkp_inkjet_brightness))
+    ((ConfigOptionFloat,              mkp_inkjet_contrast))
+    ((ConfigOptionFloat,              mkp_inkjet_shear))
+    ((ConfigOptionFloat,              mkp_inkjet_wall_band))
     ((ConfigOptionBool,               prime_tower_enable_framework))
     // BBS: change wipe_tower_x and wipe_tower_y data type to floats to add partplate logic
     ((ConfigOptionFloats,             wipe_tower_x))

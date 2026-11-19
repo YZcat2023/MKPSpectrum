@@ -186,6 +186,8 @@ class ParamsPanel : public wxPanel
         StaticBox* get_top_panel() { return m_top_panel; }
 
         wxPanel* filament_panel() { return m_tab_filament; }
+        // 机器页入口（给 ORCA_OPEN_PARAMS 调试和外部跳转用）
+        wxPanel* printer_panel() { return m_tab_printer; }
 
         wxScrolledWindow* get_paged_view() { return m_page_view;}
         wxPanel*    get_current_tab() { return m_current_tab; }

@@ -1339,6 +1339,34 @@ static std::vector<std::string> s_Preset_print_options{
     "xy_hole_compensation",
     "resolution",
     "enable_prime_tower",
+    "mkp_full_height_prime_tower",
+    "mkp_surface_enabled",
+    "mkp_outer_wall_linear_speed",
+    "mkp_outer_wall_speed_min",
+    "mkp_surface_speed",
+    "mkp_surface_wall_speed",
+    "mkp_surface_linear_speed",
+    "mkp_surface_speed_min",
+    "mkp_surface_speed_max",
+    "mkp_surface_inner_walls",
+    "mkp_surface_pattern",
+    "mkp_surface_line_spacing",
+    "mkp_inkjet_density",
+    "mkp_inkjet_speed",
+    "mkp_inkjet_retract_length",
+    "mkp_inkjet_recovery_length",
+    "mkp_inkjet_flush_mode",
+    "mkp_inkjet_flush_interval",
+    "mkp_inkjet_repeat",
+    "mkp_inkjet_dry_time",
+    "mkp_inkjet_c",
+    "mkp_inkjet_m",
+    "mkp_inkjet_y",
+    "mkp_inkjet_saturation",
+    "mkp_inkjet_brightness",
+    "mkp_inkjet_contrast",
+    "mkp_inkjet_shear",
+    "mkp_inkjet_wall_band",
     "prime_tower_enable_framework",
     "prime_tower_width",
     "prime_tower_brim_width",
@@ -1603,7 +1631,7 @@ static std::vector<std::string> s_Preset_machine_limits_options {
 
 static std::vector<std::string> s_Preset_printer_options {
     "printer_technology",
-    "printable_area", "extruder_printable_area", "support_parallel_printheads", "parallel_printheads_count", "parallel_printheads_bed_exclude_areas", "bed_exclude_area","bed_custom_texture", "bed_custom_model", "build_plate_tilt_x", "build_plate_tilt_y", "belt_printer", "belt_printer_infinite_y",
+    "printable_area", "mkp_inkjet_device", "mkp_inkjet_offset_x", "mkp_inkjet_offset_y", "mkp_inkjet_offset_z", "mkp_brush_offset_x", "mkp_brush_offset_y", "mkp_brush_offset_z", "mkp_pen_offset_x", "mkp_pen_offset_y", "mkp_pen_offset_z", "mkp_knife_offset_x", "mkp_knife_offset_y", "mkp_knife_offset_z", "mkp_laser_offset_x", "mkp_laser_offset_y", "mkp_laser_offset_z", "extruder_printable_area", "support_parallel_printheads", "parallel_printheads_count", "parallel_printheads_bed_exclude_areas", "bed_exclude_area","bed_custom_texture", "bed_custom_model", "build_plate_tilt_x", "build_plate_tilt_y", "belt_printer", "belt_printer_infinite_y",
     "belt_slice_rotation", "belt_slice_rotation_angle",
     "gcode_remap_x", "gcode_remap_y", "gcode_remap_z",
     "belt_frame_tilt_decouple", "belt_frame_tilt_angle",
@@ -1618,6 +1646,7 @@ static std::vector<std::string> s_Preset_printer_options {
     "nozzle_height", "master_extruder_id",
     "default_print_profile", "inherits",
     "scan_first_layer", "enable_power_loss_recovery", "wrapping_detection_layers", "wrapping_exclude_area", "machine_load_filament_time", "machine_unload_filament_time", "machine_tool_change_time", "time_cost", "machine_pause_gcode", "template_custom_gcode",
+    "mkp_grab_brush_gcode", "mkp_release_brush_gcode", "mkp_grab_inkjet_gcode", "mkp_release_inkjet_gcode",
     "nozzle_type", "nozzle_hrc","auxiliary_fan", "fan_direction", "nozzle_volume","upward_compatible_machine", "z_hop_types", "travel_slope", "retract_lift_enforce","support_chamber_temp_control","support_air_filtration","support_cooling_filter","cooling_filter_enabled","printer_structure","farthest_point_timelapse",
     "best_object_pos", "head_wrap_detect_zone",
     "host_type", "print_host", "printhost_apikey", "flashforge_serial_number", "bbl_use_printhost", "printer_agent",
@@ -2363,6 +2392,7 @@ void PresetCollection::load_project_embedded_presets(std::vector<Preset*>& proje
             Preset::normalize(preset->config);
             // Report configuration fields, which are misplaced into a wrong group.
             std::string incorrect_keys = Preset::remove_invalid_keys(preset->config, default_preset.config);
+
             if (!incorrect_keys.empty()) {
                 ++m_errors;
                 BOOST_LOG_TRIVIAL(error) << "Error in a preset file: The preset \"" << preset->name
@@ -3068,6 +3098,26 @@ std::pair<Preset*, bool> PresetCollection::load_external_preset(
             return nullptr;
         }, &keys);
     std::string                 &inherits = Preset::inherits(cfg);
+
+    // MKPSpectrum: mkp_* (inkjet density/CMY/shear/speed, brush/pen/knife/laser offsets, the
+    // grab/release macros and the surface-treatment switches) are machine and process preset
+    // data, not project data. Without this, opening a 3mf replaces them with whatever the file
+    // carried, so a value the user just saved silently reverts and the print comes out identical.
+    // The preset the user is on therefore wins over the file, for mkp_* only.
+    {
+        const Preset *mkp_src = nullptr;
+        if (found && ! it->is_system)
+            mkp_src = &(*it);
+        else if (m_idx_selected < m_presets.size())
+            mkp_src = &m_presets[m_idx_selected];
+        if (mkp_src != nullptr) {
+            DynamicPrintConfig keep;
+            for (const std::string &k : cfg.keys())
+                if (k.rfind("mkp_", 0) == 0 && mkp_src->config.has(k))
+                    keep.set_key_value(k, mkp_src->config.option(k)->clone());
+            cfg.apply(keep);
+        }
+    }
 
     //BBS: add config related logs
     BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << boost::format(" enter, type %1% , path %2%, name %3%, original_name %4%, inherits %5%")%Preset::get_type_string(m_type) %path %name %original_name %inherits;

@@ -1737,6 +1737,7 @@ wxBEGIN_EVENT_TABLE(TextureImportDialog, DPIDialog)
     EVT_BUTTON(TextureImportDialog::ID_COLOR_AUTO,  TextureImportDialog::on_color_preset_clicked)
     EVT_BUTTON(TextureImportDialog::ID_BTN_APPLY,   TextureImportDialog::on_apply_clicked)
     EVT_BUTTON(TextureImportDialog::ID_BTN_SKIP,    TextureImportDialog::on_skip_clicked)
+    EVT_BUTTON(TextureImportDialog::ID_BTN_KEEP_ORIGINAL, TextureImportDialog::on_keep_original_clicked)
     EVT_BUTTON(wxID_OK,                              TextureImportDialog::on_ok_clicked)
 wxEND_EVENT_TABLE()
 
@@ -2236,6 +2237,22 @@ void TextureImportDialog::build_bottom_buttons(wxSizer* sizer)
     m_btn_skip->SetToolTip(_L("Skip filament mapping and import as a single-color model"));
     m_btn_skip->SetStyle(ButtonStyle::Regular, ButtonType::Choice);
 
+    // Third way out of the dialog: don't quantize at all, just draw the model with the picture the
+    // file came with. The geometry and the extruder assignment are untouched, so this prints like
+    // "Skip Matching" does - the difference is only what the 3D view shows.
+    //
+    // Offered only when there is something to draw with: a uv layout to map through and at least one
+    // image to sample. A vertex-colour OBJ has neither, and offering it would silently drop the
+    // colours this dialog exists to turn into filaments.
+    const bool can_keep_texture = (m_textured_mesh.has_face_uvs() || !m_textured_mesh.uvs.empty())
+                               && !m_textured_mesh.textures.empty();
+    if (can_keep_texture) {
+        m_btn_keep_original = new Button(this, _L("Keep Original Texture"));
+        m_btn_keep_original->SetId(ID_BTN_KEEP_ORIGINAL);
+        m_btn_keep_original->SetToolTip(_L("Import the geometry as it is and show the model with its own texture instead of printable colors"));
+        m_btn_keep_original->SetStyle(ButtonStyle::Regular, ButtonType::Choice);
+    }
+
     m_btn_ok = new Button(this, _L("Confirm"));
     m_btn_ok->SetId(wxID_OK);
     m_btn_ok->SetStyle(ButtonStyle::Confirm, ButtonType::Choice);
@@ -2243,7 +2260,9 @@ void TextureImportDialog::build_bottom_buttons(wxSizer* sizer)
     
     btn_sizer->AddStretchSpacer();
     btn_sizer->Add(m_btn_ok, 0, wxRIGHT, FromDIP(16)); // Match ordering of choice buttons on whole UI
-    btn_sizer->Add(m_btn_skip, 0);
+    btn_sizer->Add(m_btn_skip, 0, m_btn_keep_original != nullptr ? wxRIGHT : 0, FromDIP(8));
+    if (m_btn_keep_original != nullptr)
+        btn_sizer->Add(m_btn_keep_original, 0);
 
     sizer->Add(btn_sizer, 0, wxEXPAND | wxTOP, FromDIP(8));
 }
@@ -4074,6 +4093,17 @@ void TextureImportDialog::highlight_view_button(int view_index)
         btns[i]->SetStyle(i == view_index ? ButtonStyle::Confirm : ButtonStyle::Regular, ButtonType::Parameter);
         btns[i]->Refresh();
     }
+}
+
+void TextureImportDialog::on_keep_original_clicked(wxCommandEvent&)
+{
+    m_keep_texture = true;
+    m_new_filament_colors.clear();
+    m_new_filament_preset_names.clear();
+    m_new_mixed_filaments.clear();
+    m_current_matches.clear();
+    cancel_computation();
+    EndModal(wxID_OK);
 }
 
 void TextureImportDialog::on_skip_clicked(wxCommandEvent&)

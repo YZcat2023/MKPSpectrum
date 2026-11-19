@@ -112,6 +112,8 @@ std::pair<bool, std::string> GLShadersManager::init()
         valid &= append_shader("mm_gouraud", { prefix + "mm_gouraud.vs", prefix + "mm_gouraud.fs" }, { "FLIP_TRIANGLE_NORMALS"sv });
     else
         valid &= append_shader("mm_gouraud", { prefix + "mm_gouraud.vs", prefix + "mm_gouraud.fs" });
+    // Draws a volume with the texture it was imported with (see GLVolume::render_texture_display()).
+    valid &= append_shader("model_texture", { prefix + "model_texture.vs", prefix + "model_texture.fs" });
     // Fast shaded preview for the texture displacement gizmo (see libslic3r/TextureDisplacement.hpp).
     valid &= append_shader("texture_displacement_shaded", { prefix + "texture_displacement_shaded.vs", prefix + "texture_displacement_shaded.fs" });
     // UV-check overlay for the same gizmo: a procedural checker or a distortion heatmap over the

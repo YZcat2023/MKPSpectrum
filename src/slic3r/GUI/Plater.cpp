@@ -97,6 +97,8 @@
 #include <string>
 #include <regex>
 #include <atomic>
+#include <chrono>
+#include <future>
 #include <mutex>
 #include <boost/algorithm/string.hpp>
 #include <boost/algorithm/string/trim.hpp>
@@ -147,6 +149,7 @@
 #include <wx/tglbtn.h>
 #include <wx/wupdlock.h>
 #include <wx/numdlg.h>
+#include <climits>
 #include <wx/debug.h>
 #include <wx/busyinfo.h>
 #include <wx/event.h>
@@ -281,6 +284,8 @@
 #include "MixedFilamentDialog.hpp"
 #include "TextureImportDialog.hpp"
 #include "libslic3r/TexturePainting.hpp"
+#include "libslic3r/TextureDisplacement.hpp"
+#include "libslic3r/PNGReadWrite.hpp"
 #include "ColorDecomposeSupport.hpp"
 #include "FilamentBitmapUtils.hpp"
 #include "libslic3r/FilamentMixer.hpp"
@@ -314,6 +319,11 @@ using namespace nlohmann;
 static const std::pair<unsigned int, unsigned int> THUMBNAIL_SIZE_3MF = { 512, 512 };
 
 namespace Slic3r {
+
+// Defined in libslic3r/Model.cpp and called from the model readers, so that a model opened here and
+// one sliced headless get the very same inkjet source. Declared here rather than in Model.hpp: that
+// header is pulled in nearly everywhere, and a one-line addition to it costs a full rebuild.
+void attach_inkjet_texture_source(Model &model);
 namespace GUI {
 
 // A textured mesh is only worth routing through the import dialog when it actually carries
@@ -328,6 +338,37 @@ static bool has_importable_texture(const Slic3r::TexturedMesh& textured_mesh)
 
     return std::any_of(textured_mesh.textures.begin(), textured_mesh.textures.end(),
         [](const Slic3r::TextureImage& texture) { return !texture.data.empty(); });
+}
+
+// Hands the texture the file shipped with to the volumes that came from it, so the 3D editor can
+// draw them as the file looks instead of with the printable colours the import derives. Display
+// only: the mesh, the extruder assignment and everything the slicer reads stay untouched. The
+// layout is indexed by triangle, so it is only attached where the volume still holds the very mesh
+// the texture was measured on.
+static void attach_display_texture(Slic3r::Model& model)
+{
+    if (!model.texture_mesh)
+        return;
+
+    auto display = std::make_shared<Slic3r::TextureDisplayData>();
+    if (!Slic3r::build_texture_display_data(*model.texture_mesh, *display) || display->empty()) {
+        BOOST_LOG_TRIVIAL(warning) << "texture display: nothing drawable in the imported texture, keeping the filament colours";
+        return;
+    }
+
+    size_t attached = 0;
+    for (Slic3r::ModelObject* object : model.objects)
+        for (Slic3r::ModelVolume* volume : object->volumes) {
+            if (!volume->is_model_part())
+                continue;
+            if (volume->mesh().its.indices.size() != display->face_uv.size())
+                continue;
+            volume->display_texture = display;
+            ++attached;
+        }
+
+    BOOST_LOG_TRIVIAL(info) << "texture display: " << display->images.size() << " image(s) attached to "
+                            << attached << " volume(s)";
 }
 
 wxDEFINE_EVENT(EVT_SCHEDULE_BACKGROUND_PROCESS,     SimpleEvent);
@@ -7470,6 +7511,9 @@ struct Plater::priv
         std::vector<TextureFilamentEntry>    filament_entries;
         size_t                               existing_filament_count = 0;
         bool                                 skipped = false;
+        // The user asked to keep the file's own texture and draw the model with it, instead of
+        // quantizing it to printable colours; nothing is painted in that case.
+        bool                                 keep_texture = false;
         bool                                 fallback_to_geometry_only = false;
         wxString                             fallback_warning;
     };
@@ -8353,7 +8397,7 @@ Plater::priv::priv(Plater *q, MainFrame *main_frame)
             std::string last_backup = last;
             std::string originfile;
             if (Slic3r::has_restore_data(last_backup, originfile)) {
-                auto result = MessageDialog(this->q, _L("Previously unsaved items have been detected. Do you want to restore them\?"), wxString(SLIC3R_APP_FULL_NAME) + " - " + _L("Restore"), wxYES_NO | wxYES_DEFAULT | wxCENTRE).ShowModal();
+                auto result = MessageDialog(this->q, _L("Previously unsaved items have been detected. Do you want to restore them\?"), wxString("MKPSpectrum") + " - " + _L("Restore"), wxYES_NO | wxYES_DEFAULT | wxCENTRE).ShowModal();
                 if (result == wxID_YES) {
                     this->q->load_project(from_path(last_backup), from_path(originfile));
                     Slic3r::backup_soon();
@@ -9054,6 +9098,7 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
 
     for (size_t i = 0; i < input_files.size(); ++i) {
         int project_filament_count = 1;
+        is_user_cancel = false;
 
 #ifdef _WIN32
         auto path = input_files[i];
@@ -9831,7 +9876,55 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                             is_user_cancel = true;
                             return -1;
                         }, linear, angle, split_compound);
-                }else {
+                } else if (boost::iends_with(path.string(), ".glb")) {
+                    // Keep the modal progress UI responsive while parsing and baking. The
+                    // worker owns the temporary model; only the GUI asks for the face budget
+                    // and inserts the completed model into the plate.
+                    std::atomic<size_t> requested_faces{0};
+                    std::future<Model> import;
+                    std::promise<size_t> selected_faces;
+                    auto selection = selected_faces.get_future();
+                    import = std::async(std::launch::async,
+                        [file = path.string(), strategy, &requested_faces, selection = std::move(selection)]() mutable {
+                            return Model::read_from_file(file, nullptr, nullptr, strategy,
+                                nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 0,
+                                [&](size_t original_faces) {
+                                    requested_faces.store(original_faces);
+                                    return selection.get();
+                                });
+                        });
+                    const auto message = wxString::Format(_L("Loading file: %s"), from_path(real_filename));
+                    bool answered = false;
+                    while (import.wait_for(std::chrono::milliseconds(40)) != std::future_status::ready) {
+                        if (!dlg.Pulse(message))
+                            is_user_cancel = true;
+                        if (!answered) {
+                            const size_t original_faces = requested_faces.load();
+                            if (original_faces != 0 || is_user_cancel) {
+                                size_t target = 0;
+                                if (!is_user_cancel) {
+                                    wxNumberEntryDialog dialog(&dlg,
+                                        wxString::Format(_L("Original triangle count: %s"),
+                                            wxString::FromUTF8(std::to_string(original_faces))) + "\n" +
+                                        _L("Choose the total triangle count for this model. Higher counts preserve more detail but take longer to import and slice."),
+                                        _L("Target triangle count"), _L("Simplify model"),
+                                        10000, 1, static_cast<long>(std::min<size_t>(original_faces, LONG_MAX)));
+                                    wxGetApp().UpdateDlgDarkUI(&dialog);
+                                    if (dialog.ShowModal() == wxID_OK)
+                                        target = static_cast<size_t>(dialog.GetValue());
+                                    else
+                                        is_user_cancel = true;
+                                }
+                                selected_faces.set_value(target);
+                                answered = true;
+                            }
+                        }
+                    }
+                    Model imported = import.get();
+                    if (is_user_cancel)
+                        continue;
+                    model = std::move(imported);
+                } else {
                     model = Slic3r::Model:: read_from_file(
                     path.string(), nullptr, nullptr, strategy, &plate_data, &project_presets, &is_xxx, &file_version, nullptr,
                     [&dlg, real_filename, &progress_percent, INPUT_FILES_RATIO, total_files, i, &designer_model_id, &designer_country_code](int current, int total, bool &cancel, std::string &mode_id, std::string &code)
@@ -9846,8 +9939,7 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                             wxString msg  = wxString::Format(_L("Loading file: %s"), from_path(real_filename));
                             cont          = dlg.Update(progress_percent, msg);
                             cancel        = !cont;
-                    },
-                    nullptr, 0);
+                    });
                 }
 
                 if (designer_model_id.empty() && boost::algorithm::iends_with(path.string(), ".stl")) {
@@ -10019,36 +10111,13 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                 q->model().load_from(model);
                 load_auxiliary_files();
             }
-            // Texture-to-color: a mesh that arrived with UVs and a decoded texture gets its
-            // faces clustered into printable colours and matched against the filament list,
-            // before the objects are handed to the plater. Inert for every other model.
+            // A mesh that arrived with UVs and a decoded picture is drawn with that picture: the
+            // texture is handed to the volumes and no colour-matching dialog is shown, so nothing is
+            // quantized into the filament palette on the way in. Inert for every other model.
             if (model.texture_mesh && has_importable_texture(*model.texture_mesh)) {
-                TextureImportResult texture_import_result;
-                auto cancel_cb   = [&dlg, &dlg_cont]() { return !dlg_cont || dlg.WasCancelled(); };
-                auto progress_cb = [&dlg, &dlg_cont, &progress_percent](int percent) {
-                    progress_percent = std::clamp(percent, 0, 100);
-                    dlg_cont = dlg.Update(progress_percent, _L("Matching textures to filaments"));
-                    return dlg_cont;
-                };
-                if (!run_textured_mesh_import_dialog(model, texture_import_result, cancel_cb, progress_cb)) {
-                    q->skip_thumbnail_invalid = false;
-                    return empty_result;
-                }
-                if (texture_import_result.fallback_to_geometry_only && !texture_import_result.fallback_warning.empty()) {
-                    MessageDialog(q, texture_import_result.fallback_warning,
-                                  _L("Texture Import Warning"),
-                                  wxOK | wxICON_WARNING).ShowModal();
-                }
-                if (!texture_import_result.painted.face_colors.empty()) {
-                    std::vector<size_t> texture_object_idxs(model.objects.size());
-                    std::iota(texture_object_idxs.begin(), texture_object_idxs.end(), 0);
-                    auto apply_progress_cb = [&dlg](int percent, const wxString& msg) {
-                        dlg.Update(std::clamp(percent, 0, 100), msg);
-                        return true;
-                    };
-                    apply_textured_mesh_import_result(model, texture_object_idxs, texture_import_result,
-                                                      apply_progress_cb, false);
-                }
+                attach_display_texture(model);
+                attach_inkjet_texture_source(model);
+                model.texture_mesh.reset();
             }
 
             BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ":" << __LINE__ << boost::format(", before load_model_objects, count %1%")%model.objects.size();
@@ -15807,6 +15876,9 @@ bool Plater::priv::run_textured_mesh_import_dialog(Slic3r::Model& loaded_model, 
         if (dlg.was_skipped()) {
             BOOST_LOG_TRIVIAL(info) << "handle_textured_mesh_import: user skipped texture matching";
             result.skipped = true;
+            // Skipping the match still leaves the picture attached, so the model is drawn as the file
+            // looks while it prints in whatever single filament it is assigned to.
+            attach_display_texture(loaded_model);
             loaded_model.texture_mesh.reset();
             return true;
         }
@@ -15820,6 +15892,14 @@ bool Plater::priv::run_textured_mesh_import_dialog(Slic3r::Model& loaded_model, 
         BOOST_LOG_TRIVIAL(info) << "handle_textured_mesh_import: user cancelled";
         loaded_model.texture_mesh.reset();
         return false;
+    }
+
+    if (dlg.keeps_texture()) {
+        BOOST_LOG_TRIVIAL(info) << "handle_textured_mesh_import: keeping the file's own texture";
+        result.keep_texture = true;
+        attach_display_texture(loaded_model);
+        loaded_model.texture_mesh.reset();
+        return true;
     }
 
     auto painted = dlg.get_painted_mesh();
@@ -16046,6 +16126,18 @@ void Plater::priv::apply_textured_mesh_import_result(Slic3r::Model& loaded_model
 void Plater::priv::handle_textured_mesh_import(Slic3r::Model& loaded_model, const std::vector<size_t>& obj_idxs,
                                                std::function<bool()> cancel_callback)
 {
+    // A file that ships its own picture is drawn with that picture: no colour-matching dialog is
+    // shown, and nothing is quantized into the filament palette on the way in. The volume keeps the
+    // extruder it was imported with, so slicing still works, but what the viewport shows is the
+    // image from the file.
+    if (loaded_model.texture_mesh && has_importable_texture(*loaded_model.texture_mesh)) {
+        BOOST_LOG_TRIVIAL(info) << "handle_textured_mesh_import: file carries its own texture, keeping it as-is";
+        attach_display_texture(loaded_model);
+        attach_inkjet_texture_source(loaded_model);
+        loaded_model.texture_mesh.reset();
+        return;
+    }
+
     TextureImportResult result;
     if (!run_textured_mesh_import_dialog(loaded_model, result, std::move(cancel_callback)))
         return;
@@ -16232,6 +16324,17 @@ void Plater::load_project(wxString const& filename2,
     bool loaded_published   = false;
     std::vector<size_t> res = load_files(input_paths, strategy, false, &loaded_published);
 
+    // MKP: a project file carries its own settings, so a preset that differs from the one it is named after
+    // is not an edit the user just made, it is how the project was saved. The close path
+    // (GUI_App::check_and_save_current_preset_changes) compares the edited preset with the
+    // selected one, so without this every project closed asked whether to keep preset changes
+    // nobody made - and answering yes rewrote the named preset. Re-baseline the selected
+    // presets to what the project brought in: only a real edit from here on counts as a change.
+    for (Tab *tab : wxGetApp().tabs_list)
+        if (PresetCollection *collection = tab->get_presets(); collection != nullptr) {
+            collection->get_selected_preset().config = collection->get_edited_preset().config;
+            collection->update_saved_preset_from_current_preset();
+        }
     reset_project_dirty_initial_presets();
     update_project_dirty_from_presets();
     wxGetApp().preset_bundle->export_selections(*wxGetApp().app_config);
@@ -19217,7 +19320,7 @@ int GUI::Plater::close_with_confirm(std::function<bool(bool)> second_check)
     }
 
     MessageDialog dlg(static_cast<wxWindow*>(this), _L("The current project has unsaved changes. Would you like to save before continuing\?"),
-        wxString(SLIC3R_APP_FULL_NAME) + " - " + _L("Save"), wxYES_NO | wxCANCEL | wxYES_DEFAULT | wxCENTRE);
+        wxString("MKPSpectrum") + " - " + _L("Save"), wxYES_NO | wxCANCEL | wxYES_DEFAULT | wxCENTRE);
     dlg.show_dsa_button(_L("Remember my choice."));
     auto choise = wxGetApp().app_config->get("save_project_choise");
     auto result = choise.empty() ? dlg.ShowModal() : choise == "yes" ? wxID_YES : wxID_NO;
@@ -19501,6 +19604,17 @@ void Plater::apply_cut_object_to_model(size_t obj_idx, const ModelObjectPtrs& ne
     // UIThreadWorker w;
     // arrange(w, true);
     // w.wait_for_idle();
+}
+
+void Plater::export_gcode_to_path(const std::string &path)
+{
+    if (path.empty() || p->model.objects.empty())
+        return;
+    if (p->process_completed_with_error == p->partplate_list.get_curr_plate_index())
+        return;
+    // 走和「导出 G-code」完全相同的后台流程：切片 -> 写 m_temp_output_path ->
+    // run_post_process_scripts()（post_process 在这里执行）-> 复制到 path。
+    p->export_gcode(fs::path(path), false);
 }
 
 void Plater::export_gcode(bool prefer_removable)
