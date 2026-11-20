@@ -1990,8 +1990,27 @@ std::vector<bool> apply_lscm_uv_overrides(PatchUnwrap &unwrap, const std::vector
     return edited;
 }
 
+static std::vector<Vec2f> anchored_lscm_corner_uvs(const indexed_triangle_set &patch,
+                                                       const TextureDisplacementLayer &layer);
+
 std::vector<Vec2f> compute_lscm_uvs(const indexed_triangle_set &patch, const TextureDisplacementLayer &layer)
 {
+    if (layer.projection_anchor && layer.projection_anchor->reference &&
+        !layer.projection_anchor->reference->corner_uv.empty()) {
+        const auto corner = anchored_lscm_corner_uvs(patch, layer);
+        std::vector<Vec2f> uv(patch.vertices.size(), Vec2f::Zero());
+        std::vector<bool> assigned(patch.vertices.size(), false);
+        for (size_t f = 0; f < patch.indices.size(); ++f)
+            for (int k = 0; k < 3; ++k) {
+                const size_t v = size_t(patch.indices[f][k]);
+                if (!assigned[v]) {
+                    uv[v] = corner[f * 3 + size_t(k)];
+                    assigned[v] = true;
+                }
+            }
+        return uv;
+    }
+
     // Padding disabled (0), matching the UV editor: the packed islands the editor shows and the ones the
     // bake/preview samples must be laid out identically, or a hand placement made in the editor would
     // land somewhere else in the baked result.
@@ -2023,6 +2042,10 @@ std::vector<Vec2f> compute_lscm_uvs(const indexed_triangle_set &patch, const Tex
 
 std::vector<Vec2f> compute_lscm_corner_uvs(const indexed_triangle_set &patch, const TextureDisplacementLayer &layer)
 {
+    if (layer.projection_anchor && layer.projection_anchor->reference &&
+        !layer.projection_anchor->reference->corner_uv.empty())
+        return anchored_lscm_corner_uvs(patch, layer);
+
     // Padding 0 and the layer's own seam angle/edges, exactly as compute_lscm_uvs() does - the two must
     // unwrap identically or a hand placement would land in one place on screen and another in the bake.
     const PatchUnwrap unwrap = compute_patch_unwrap(patch, layer.lscm_seam_angle_deg, 0.f, layer.lscm_seam_edges);
@@ -2071,6 +2094,128 @@ static void barycentric_weights(const Vec3f &a, const Vec3f &b, const Vec3f &c, 
     }
     w1 = (d11 * dp0 - d01 * dp1) / den;
     w2 = (d00 * dp1 - d01 * dp0) / den;
+}
+
+Transform3d texture_projection_transform(const TextureDisplacementLayer &layer)
+{
+    Transform3d transform = Transform3d::Identity();
+    if (layer.projection_anchor)
+        for (int r = 0; r < 3; ++r)
+            for (int c = 0; c < 4; ++c)
+                transform.matrix()(r, c) = layer.projection_anchor->position[size_t(r * 4 + c)];
+    return transform;
+}
+
+void transform_texture_projection(TextureDisplacementLayer &layer, const Transform3d &target_to_source)
+{
+    if (!layer.projection_anchor)
+        return;
+    auto anchor = std::make_shared<TextureProjectionAnchor>(*layer.projection_anchor);
+    const Transform3d transform = texture_projection_transform(layer) * target_to_source;
+    const Matrix3d normal = transform.linear().inverse().transpose();
+    for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 4; ++c)
+            anchor->position[size_t(r * 4 + c)] = transform.matrix()(r, c);
+        for (int c = 0; c < 3; ++c)
+            anchor->normal[size_t(r * 3 + c)] = normal(r, c);
+    }
+    layer.projection_anchor = std::move(anchor);
+}
+
+std::vector<TextureDisplacementLayer> texture_layers_in_frame(
+    const std::vector<TextureDisplacementLayer> &layers, const Transform3d &local_to_frame)
+{
+    auto result = layers;
+    const Transform3d inverse = local_to_frame.inverse();
+    for (auto &layer : result) {
+        // A projector captured from the camera already maps mesh-local points.
+        // Its temporary bake copy must undo the bake frame before evaluating it.
+        if (!layer.projection_anchor && layer.projection_method == TextureProjectionMethod::ViewProjected) {
+            layer.projection_anchor = std::make_shared<TextureProjectionAnchor>();
+            layer.projection_anchor->reference = std::make_shared<TextureProjectionReference>();
+        }
+        transform_texture_projection(layer, inverse);
+    }
+    return result;
+}
+
+// Choose the source triangle once per target face. Looking up each corner separately
+// can select the other side of an unwrap seam at a shared edge.
+static std::vector<Vec2f> anchored_lscm_corner_uvs(const indexed_triangle_set &patch,
+                                                const TextureDisplacementLayer &layer)
+{
+    const auto &reference = *layer.projection_anchor->reference;
+    const auto tree = AABBTreeIndirect::build_aabb_tree_over_indexed_triangle_set(reference.vertices, reference.triangles);
+    const Transform3d transform = texture_projection_transform(layer);
+    std::vector<Vec2f> result(patch.indices.size() * 3, Vec2f::Zero());
+    for (size_t f = 0; f < patch.indices.size(); ++f) {
+        std::array<Vec3f, 3> p;
+        for (int k = 0; k < 3; ++k)
+            p[size_t(k)] = (transform * patch.vertices[size_t(patch.indices[f][k])].cast<double>()).cast<float>();
+        const Vec3f center = (p[0] + p[1] + p[2]) / 3.f;
+        size_t hit = 0;
+        Vec3f foot;
+        const float distance = AABBTreeIndirect::squared_distance_to_indexed_triangle_set(
+            reference.vertices, reference.triangles, tree, center, hit, foot);
+        if (distance < 0.f || hit >= reference.triangles.size())
+            continue;
+        const auto &t = reference.triangles[hit];
+        for (int k = 0; k < 3; ++k) {
+            float b, c;
+            barycentric_weights(reference.vertices[size_t(t[0])], reference.vertices[size_t(t[1])],
+                                reference.vertices[size_t(t[2])], p[size_t(k)], b, c);
+            result[f * 3 + size_t(k)] = (1.f - b - c) * reference.corner_uv[hit * 3] +
+                b * reference.corner_uv[hit * 3 + 1] + c * reference.corner_uv[hit * 3 + 2];
+        }
+    }
+    return result;
+}
+
+void freeze_texture_projections(ModelVolume &volume)
+{
+    if (std::none_of(volume.texture_displacement_layers.begin(), volume.texture_displacement_layers.end(),
+        [&volume](const TextureDisplacementLayer &layer) {
+            return !layer.projection_anchor && layer.projection_method != TextureProjectionMethod::ViewProjected &&
+                !(layer.projection_method == TextureProjectionMethod::ModelUV && volume.has_texture_uv()) &&
+                layer.slot >= 0 && layer.slot < int(TEXTURE_DISPLACEMENT_MAX_LAYERS) &&
+                !volume.texture_displacement_facet(layer.slot).empty();
+        }))
+        return;
+
+    const Transform3d frame = texture_displacement_bake_frame(texture_displacement_volume_to_world(volume));
+    indexed_triangle_set mesh = volume.mesh().its;
+    for (auto &p : mesh.vertices)
+        p = (frame * p.cast<double>()).cast<float>();
+    const auto normals = texture_displacement_vertex_normals(mesh);
+    for (auto &layer : volume.texture_displacement_layers) {
+        if (layer.projection_anchor || layer.projection_method == TextureProjectionMethod::ViewProjected ||
+            (layer.projection_method == TextureProjectionMethod::ModelUV && volume.has_texture_uv()) ||
+            layer.slot < 0 || layer.slot >= int(TEXTURE_DISPLACEMENT_MAX_LAYERS))
+            continue;
+        const auto &facets = volume.texture_displacement_facet(layer.slot);
+        if (facets.empty())
+            continue;
+        TriangleSelector selector(volume.mesh());
+        selector.deserialize(facets.get_data(), false);
+        auto patch = selector.get_facets_strict(EnforcerBlockerType::ENFORCER);
+        if (patch.indices.empty())
+            continue;
+        for (auto &p : patch.vertices)
+            p = (frame * p.cast<double>()).cast<float>();
+        auto reference = std::make_shared<TextureProjectionReference>();
+        Vec3f average_normal;
+        texture_displacement_patch_frame(patch, normals, reference->center, reference->axis, average_normal);
+        if (layer.projection_method == TextureProjectionMethod::LSCM) {
+            reference->corner_uv = compute_lscm_corner_uvs(patch, layer);
+            if (!reference->corner_uv.empty()) {
+                reference->vertices = std::move(patch.vertices);
+                reference->triangles = std::move(patch.indices);
+            }
+        }
+        layer.projection_anchor = std::make_shared<TextureProjectionAnchor>();
+        layer.projection_anchor->reference = std::move(reference);
+        transform_texture_projection(layer, frame);
+    }
 }
 
 std::vector<Vec2f> compute_model_corner_uvs(const indexed_triangle_set &base_mesh,
@@ -2272,9 +2417,26 @@ bool project_uv_projective(const std::array<float, 12> &m, const Vec3f &position
 }
 
 float sample_layer_height(const DecodedHeightTexture &texture, const TextureDisplacementLayer &layer,
-                          const Vec3f &position, const Vec3f &normal,
-                          const Vec3f &patch_center, const Vec3f &patch_axis, const Vec2f *lscm_uv)
+                          const Vec3f &input_position, const Vec3f &input_normal,
+                          const Vec3f &input_center, const Vec3f &input_axis, const Vec2f *lscm_uv)
 {
+    Vec3f position = input_position, normal = input_normal;
+    Vec3f patch_center = input_center, patch_axis = input_axis;
+    if (layer.projection_anchor && layer.projection_anchor->reference) {
+        const auto &a = *layer.projection_anchor;
+        const auto &m = a.position;
+        position = Vec3f(float(m[0]*input_position.x()+m[1]*input_position.y()+m[2]*input_position.z()+m[3]),
+                         float(m[4]*input_position.x()+m[5]*input_position.y()+m[6]*input_position.z()+m[7]),
+                         float(m[8]*input_position.x()+m[9]*input_position.y()+m[10]*input_position.z()+m[11]));
+        const auto &n = a.normal;
+        normal = Vec3f(float(n[0]*input_normal.x()+n[1]*input_normal.y()+n[2]*input_normal.z()),
+                       float(n[3]*input_normal.x()+n[4]*input_normal.y()+n[5]*input_normal.z()),
+                       float(n[6]*input_normal.x()+n[7]*input_normal.y()+n[8]*input_normal.z()));
+        if (normal.squaredNorm() > 1e-16f) normal.normalize();
+        patch_center = a.reference->center;
+        patch_axis = a.reference->axis;
+    }
+
     if (texture.empty())
         return 0.f;
 
@@ -2347,9 +2509,26 @@ float sample_layer_height(const DecodedHeightTexture &texture, const TextureDisp
 }
 
 bool sample_layer_color(const DecodedHeightTexture &texture, const TextureDisplacementLayer &layer,
-                        const Vec3f &position, const Vec3f &normal, Vec3f &out, const Vec3f &patch_center,
-                        const Vec3f &patch_axis, const Vec2f *lscm_uv)
+                        const Vec3f &input_position, const Vec3f &input_normal, Vec3f &out, const Vec3f &input_center,
+                        const Vec3f &input_axis, const Vec2f *lscm_uv)
 {
+    Vec3f position = input_position, normal = input_normal;
+    Vec3f patch_center = input_center, patch_axis = input_axis;
+    if (layer.projection_anchor && layer.projection_anchor->reference) {
+        const auto &a = *layer.projection_anchor;
+        const auto &m = a.position;
+        position = Vec3f(float(m[0]*input_position.x()+m[1]*input_position.y()+m[2]*input_position.z()+m[3]),
+                         float(m[4]*input_position.x()+m[5]*input_position.y()+m[6]*input_position.z()+m[7]),
+                         float(m[8]*input_position.x()+m[9]*input_position.y()+m[10]*input_position.z()+m[11]));
+        const auto &n = a.normal;
+        normal = Vec3f(float(n[0]*input_normal.x()+n[1]*input_normal.y()+n[2]*input_normal.z()),
+                       float(n[3]*input_normal.x()+n[4]*input_normal.y()+n[5]*input_normal.z()),
+                       float(n[6]*input_normal.x()+n[7]*input_normal.y()+n[8]*input_normal.z()));
+        if (normal.squaredNorm() > 1e-16f) normal.normalize();
+        patch_center = a.reference->center;
+        patch_axis = a.reference->axis;
+    }
+
     if (!texture.has_color())
         return false;
 
@@ -3530,7 +3709,7 @@ indexed_triangle_set build_texture_displacement(const indexed_triangle_set      
     const size_t         debug_mark = (debug != nullptr) ? debug->mark() : 0;
     // The UV channel rides along untouched: a uv is a coordinate in the texture, not on the model, so
     // the frame the mesh is measured in does not reach it.
-    indexed_triangle_set out = build_texture_displacement_in_place(world, layers, facets_data, options, progress,
+    indexed_triangle_set out = build_texture_displacement_in_place(world, texture_layers_in_frame(layers, frame), facets_data, options, progress,
                                                                    color, mirrored, debug, stats, model_uv, resting_drop);
     // Everything the bake recorded is in world millimetres, like `out` itself. The debug view draws in
     // the volume's local frame, so the stages are brought back the same way the result is.
@@ -3734,6 +3913,7 @@ struct PreparedLayer {
     // The painted patch of a layer without an unwrap lookup (the unwrap's own lookup already stops at its patch).
     // Null when the paint covers the whole mesh, where every point is on it.
     std::shared_ptr<const PatchRegion> region;
+    Transform3f lscm_frame = Transform3f::Identity();
 
     // The uv to hand sample_layer_height()/sample_layer_color(): nullptr for every analytic projection
     // (they project `pos` themselves). False means `pos` is off this layer's paint and the layer must be
@@ -3747,7 +3927,7 @@ struct PreparedLayer {
             return false;
         if (!lscm)
             return true;
-        if (!lscm->uv_at(pos, ON_PATCH_TOL, uv))
+        if (!lscm->uv_at(lscm_frame * pos, ON_PATCH_TOL, uv))
             return false;
         out = &uv;
         return true;
@@ -3806,7 +3986,20 @@ std::shared_ptr<std::vector<PreparedLayer>> prepare_sampleable_layers(
         texture_displacement_patch_frame(patch, vertex_normals, centroid, axis, average_normal);
 
         std::shared_ptr<const LscmLookup> lscm;
-        if (model_uv_layer || layer->projection_method == TextureProjectionMethod::LSCM) {
+        const auto &anchor = layer->projection_anchor;
+        const bool anchored_unwrap = layer->projection_method == TextureProjectionMethod::LSCM && anchor &&
+            anchor->reference && !anchor->reference->corner_uv.empty();
+        if (anchored_unwrap) {
+            // Query the original chart directly. Interpolating again on a cut's
+            // tiny/sliver faces loses precision and can select the other UV seam.
+            auto lookup = std::make_shared<LscmLookup>();
+            lookup->patch.vertices = anchor->reference->vertices;
+            lookup->patch.indices = anchor->reference->triangles;
+            lookup->corner = anchor->reference->corner_uv;
+            lookup->tree = AABBTreeIndirect::build_aabb_tree_over_indexed_triangle_set(
+                lookup->patch.vertices, lookup->patch.indices);
+            lscm = std::move(lookup);
+        } else if (model_uv_layer || layer->projection_method == TextureProjectionMethod::LSCM) {
             // Solved on the very patch the classic path and the GUI solve it on (same geometry, seam
             // angle and edges), so it hits the unwrap cache and lands exactly where the UV editor
             // shows it, hand-placed islands and UV edits included. A ModelUV layer needs no solve at
@@ -3824,7 +4017,7 @@ std::shared_ptr<std::vector<PreparedLayer>> prepare_sampleable_layers(
         }
 
         std::shared_ptr<const PatchRegion> region;
-        if (!lscm && area_3d(patch) < 0.9999f * mesh_area) {
+        if (anchored_unwrap || (!lscm && area_3d(patch) < 0.9999f * mesh_area)) {
             auto r   = std::make_shared<PatchRegion>();
             r->patch = patch;
             r->tree  = AABBTreeIndirect::build_aabb_tree_over_indexed_triangle_set(r->patch.vertices, r->patch.indices);
@@ -3832,6 +4025,8 @@ std::shared_ptr<std::vector<PreparedLayer>> prepare_sampleable_layers(
         }
 
         prepared->push_back({ tex, *layer, centroid, axis, std::move(lscm), std::move(region) });
+        if (anchored_unwrap)
+            prepared->back().lscm_frame = texture_projection_transform(*layer).cast<float>();
     }
     return prepared;
 }
@@ -5823,6 +6018,23 @@ std::string texture_displacement_layers_to_json(const std::vector<TextureDisplac
         j["view_project_up"]         = vec3_to_json(l.view_project_up);
         j["view_project_projective"] = l.view_project_projective;
         j["view_project_matrix"]     = l.view_project_matrix;
+        if (l.projection_anchor && l.projection_anchor->reference) {
+            const auto &a = *l.projection_anchor;
+            const auto &ref = *a.reference;
+            auto &janchor = j["projection_anchor"];
+            janchor["position"] = a.position;
+            janchor["center"] = vec3_to_json(ref.center);
+            janchor["axis"] = vec3_to_json(ref.axis);
+            janchor["vertices"] = nlohmann::json::array();
+            janchor["triangles"] = nlohmann::json::array();
+            janchor["corner_uv"] = nlohmann::json::array();
+            for (const auto &v : ref.vertices)
+                janchor["vertices"].push_back(vec3_to_json(v));
+            for (const auto &t : ref.triangles)
+                janchor["triangles"].push_back({t[0], t[1], t[2]});
+            for (const auto &uv : ref.corner_uv)
+                janchor["corner_uv"].push_back(vec2_to_json(uv));
+        }
 
         // Flat pairs rather than nested arrays: shorter, and the reader can simply ignore a trailing
         // odd element instead of having to validate every sub-array.
@@ -5940,6 +6152,55 @@ bool texture_displacement_layers_from_json(const std::string                    
                 if (const auto v = j.find("view_project_matrix"); v != j.end() && v->is_array() && v->size() == 12)
                     for (size_t i = 0; i < 12; ++i)
                         l.view_project_matrix[i] = (*v)[i].get<float>();
+
+                if (const auto v = j.find("projection_anchor"); v != j.end()) {
+                    if (!v->is_object())
+                        return false;
+                    const auto &a = *v;
+                    auto anchor = std::make_shared<TextureProjectionAnchor>();
+                    anchor->reference = std::make_shared<TextureProjectionReference>();
+                    auto &ref = *anchor->reference;
+                    const auto &position = a.at("position");
+                    if (!position.is_array() || position.size() != 12)
+                        return false;
+                    for (size_t i = 0; i < 12; ++i) {
+                        anchor->position[i] = position[i].get<double>();
+                        if (!std::isfinite(anchor->position[i]))
+                            return false;
+                    }
+                    ref.center = vec3_from_json(a.at("center"), ref.center);
+                    ref.axis = vec3_from_json(a.at("axis"), ref.axis);
+                    if (!ref.center.allFinite() || !ref.axis.allFinite())
+                        return false;
+                    for (const auto &vtx : a.at("vertices")) {
+                        if (!vtx.is_array() || vtx.size() != 3)
+                            return false;
+                        const Vec3f point(vtx[0].get<float>(), vtx[1].get<float>(), vtx[2].get<float>());
+                        if (!point.allFinite()) return false;
+                        ref.vertices.push_back(point);
+                    }
+                    for (const auto &tri : a.at("triangles")) {
+                        if (!tri.is_array() || tri.size() != 3)
+                            return false;
+                        const stl_triangle_vertex_indices t(tri[0].get<int>(), tri[1].get<int>(), tri[2].get<int>());
+                        for (int k = 0; k < 3; ++k)
+                            if (t[k] < 0 || size_t(t[k]) >= ref.vertices.size()) return false;
+                        ref.triangles.push_back(t);
+                    }
+                    for (const auto &uv : a.at("corner_uv")) {
+                        if (!uv.is_array() || uv.size() != 2)
+                            return false;
+                        const Vec2f point(uv[0].get<float>(), uv[1].get<float>());
+                        if (!point.allFinite()) return false;
+                        ref.corner_uv.push_back(point);
+                    }
+                    if (ref.corner_uv.size() != ref.triangles.size() * 3)
+                        return false;
+                    l.projection_anchor = std::move(anchor);
+                    if (std::abs(texture_projection_transform(l).linear().determinant()) < 1e-15)
+                        return false;
+                    transform_texture_projection(l, Transform3d::Identity());
+                }
 
                 if (const auto v = j.find("lscm_seam_edges"); v != j.end() && v->is_array())
                     for (size_t i = 0; i + 1 < v->size(); i += 2)

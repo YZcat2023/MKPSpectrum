@@ -22,6 +22,7 @@
 #include "EmbossShape.hpp"
 #include "TriangleSelector.hpp"
 #include "TextureDisplacement.hpp"
+#include "TexturePainting.hpp"
 
 //BBS: add bbs 3mf
 #include "Format/bbs_3mf.hpp"
@@ -1001,9 +1002,8 @@ public:
 
     // The texture the file shipped with, laid out for the 3D editor (see TextureDisplayData): the
     // volume is then drawn the way the file looks, instead of with the printable colours the import
-    // may have derived from the same picture. Display only - nothing here reaches the slicer, and
-    // it is not written into a project - so it lives as long as the session that imported it, and
-    // it is shared between the volumes of one imported object rather than copied per volume.
+    // may have derived from the same picture. Shared immutable data, saved with the project and
+    // the undo history together with the mesh whose face order it uses.
     std::shared_ptr<const TextureDisplayData> display_texture;
     // Save painting data before reset_extra_facets() discards it.
     // Used for replacing mesh without losing painting data.
@@ -1370,6 +1370,12 @@ private:
             mesh_changed |= tf != f.timestamp();
         }
         ar(texture_displacement_layers, texture_displacement_options, texture_uv);
+        bool has_display_texture = false;
+        ar(has_display_texture);
+        if (has_display_texture)
+            ar(display_texture);
+        else
+            display_texture.reset();
         cereal::load_by_value(ar, config);
         cereal::load(ar, text_configuration);
         cereal::load(ar, emboss_shape);
@@ -1394,6 +1400,10 @@ private:
         for (int i = 0; i < int(TEXTURE_DISPLACEMENT_MAX_LAYERS); ++i)
             cereal::save_by_value(ar, texture_displacement_facet(i));
         ar(texture_displacement_layers, texture_displacement_options, texture_uv);
+        const bool has_display_texture = bool(display_texture);
+        ar(has_display_texture);
+        if (has_display_texture)
+            ar(display_texture);
         cereal::save_by_value(ar, config);
         cereal::save(ar, text_configuration);
         cereal::save(ar, emboss_shape);

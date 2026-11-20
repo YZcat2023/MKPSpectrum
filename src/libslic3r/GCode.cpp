@@ -5,6 +5,7 @@
 #include "Config.hpp"
 #include "GCode/GCodeProcessor.hpp"
 #include "Flow.hpp"
+#include "Fill/FillBase.hpp"
 #include "GCode/ThumbnailData.hpp"
 #include "GCode/ToolOrdering.hpp"
 #include "GCode/SpiralVase.hpp"
@@ -7062,6 +7063,71 @@ ExPolygons mkp_top_bottom_surfaces(const Layer &layer)
     return out;
 }
 
+// The same exposed-top classification used by native ironing, including the
+// perimeter area. Internal solid infill and bottom faces are not exposed tops.
+std::vector<ExtrusionPath> mkp_ink_seal_paths(const Layer &layer, const PrintConfig &config)
+{
+    std::vector<ExtrusionPath> paths;
+    if (!config.mkp_ink_seal_enabled.value || config.mkp_ink_seal_height.value <= 0. ||
+        config.mkp_ink_seal_flow.value <= 0. || config.mkp_ink_seal_width.value <= 0.)
+        return paths;
+
+    const double height = config.mkp_ink_seal_height.value;
+    Polygons covered;
+    // Do not put the extra material into the volume occupied by subsequent
+    // normal layers, even when the sealing thickness spans several thin layers.
+    for (const Layer *upper = layer.upper_layer; upper && upper->bottom_z() < layer.print_z + height;
+         upper = upper->upper_layer)
+        polygons_append(covered, upper->lslices);
+    for (const LayerRegion *region : layer.regions()) {
+        if (region->region().config().top_shell_layers.value <= 0)
+            continue;
+        Polygons tops;
+        for (const Surface &surface : region->slices.surfaces)
+            if (surface.surface_type == stTop)
+                polygons_append(tops, surface.expolygon);
+        if (tops.empty())
+            continue;
+        const Flow top_flow = region->region().flow(*layer.object(), frTopSolidInfill, layer.height, false);
+        const Flow flow(float(top_flow.width() * config.mkp_ink_seal_width.value / 100.),
+                        float(height), top_flow.nozzle_diameter());
+        ExPolygons areas = covered.empty() ? union_ex(tops) : diff_ex(tops, covered);
+        // Fill::fill_surface already insets by half its spacing. Add only the
+        // remaining half-width so the deposited bead reaches, but does not cross, the edge.
+        areas = offset_ex(areas, -scale_(0.5 * (flow.width() - flow.spacing())));
+        std::unique_ptr<Fill> fill(Fill::new_from_type(config.mkp_ink_seal_pattern.value));
+        fill->set_bounding_box(layer.object()->bounding_box());
+        fill->layer_id = layer.id();
+        fill->z = layer.print_z;
+        fill->spacing = flow.spacing();
+        fill->overlap = 0.;
+        const PrintRegionConfig &region_config = region->region().config();
+        fill->angle = float(Geometry::deg2rad(region_config.top_layer_direction.value >= 0. ?
+            region_config.top_layer_direction.value : region_config.solid_infill_direction.value));
+        fill->fixed_angle = true;
+        fill->link_max_length = scale_(3. * fill->spacing);
+        fill->loop_clipping = scale_(0.15 * flow.nozzle_diameter());
+        FillParams params;
+        params.density = 1.;
+        params.monotonic = true;
+        params.flow = flow;
+        params.layer_height = height;
+        params.extrusion_role = erMkpInkSeal;
+        for (ExPolygon &area : areas) {
+            if (layer.object()->print()->canceled())
+                throw CanceledException();
+            Surface surface(stTop, std::move(area));
+            for (Polyline &line : fill->fill_surface(&surface, params)) {
+                ExtrusionPath path(erMkpInkSeal, flow.mm3_per_mm() * config.mkp_ink_seal_flow.value / 100.,
+                                   flow.width(), float(height));
+                path.polyline = Polyline3(line);
+                paths.emplace_back(std::move(path));
+            }
+        }
+    }
+    return paths;
+}
+
 // Emit the strokes as non-extruding moves at the surface-treatment speed. dE is zero on purpose: the
 // inkjet head only has to follow the path, and the brush does not deposit filament.
 // work_z is where the tool reaches the surface, safe_z is where it may travel: hopping between two
@@ -8995,6 +9061,12 @@ LayerResult GCode::process_layer(
         m_config.mkp_surface_line_spacing.value > 0.) {
         const Vec2d saved_origin = m_origin;
         std::string surface_gcode;
+        struct InkSealTask {
+            const Layer *layer;
+            Vec2d origin;
+            std::vector<ExtrusionPath> paths;
+        };
+        std::vector<InkSealTask> seal_tasks;
         for (const LayerToPrint &ltp : layers) {
             const Layer       *ltp_layer = ltp.object_layer;
             if (ltp_layer == nullptr || ltp_layer->lslices.empty())
@@ -9050,6 +9122,9 @@ LayerResult GCode::process_layer(
                     surface_gcode += block;
                     m_wipe.reset_path();
                     this->set_last_pos(this->gcode_to_point(m_writer.get_position().head<2>()));
+                    auto paths = mkp_ink_seal_paths(*ltp_layer, m_config);
+                    if (!paths.empty())
+                        seal_tasks.push_back({ltp_layer, m_origin, std::move(paths)});
                 }
             }
         }
@@ -9059,11 +9134,38 @@ LayerResult GCode::process_layer(
                 gcode += '\n';
             gcode += wrap_custom_gcode_for_fan_mover(m_config, surface_gcode);
             if (m_wipe_tower) {
-                if (!last_layer && wipe_tower_type() == WipeTowerType::Type2 && m_config.mkp_full_height_prime_tower.value) {
+                if (seal_tasks.empty() && !last_layer && wipe_tower_type() == WipeTowerType::Type2 && m_config.mkp_full_height_prime_tower.value) {
                     m_mkp_recovery_travel_z = m_writer.get_position().z();
                     m_mkp_tower_recovery_pending = true;
                 } else
                     gcode += m_wipe_tower->recover_after_inkjet(*this);
+            }
+            const Layer *saved_layer = m_layer;
+            const double saved_z = m_nominal_z;
+            // These are extra paths of the existing layer, not change_layer():
+            // no layer counter, Z tag, layer-change macro or extra tower layer.
+            m_mkp_sealing = true;
+            for (const InkSealTask &task : seal_tasks) {
+                this->set_origin(task.origin);
+                m_layer = task.layer;
+                m_avoid_crossing_perimeters.init_layer(*m_layer);
+                m_nominal_z = saved_z + m_config.mkp_ink_seal_height.value;
+                m_max_layer_z = std::max(m_max_layer_z, float(m_nominal_z));
+                m_need_change_layer_lift_z = true;
+                gcode += ";MKP_INK_SEAL_START\n";
+                for (const ExtrusionPath &path : task.paths)
+                    gcode += this->extrude_path(path, "ink seal", m_config.mkp_ink_seal_speed.value);
+                gcode += ";MKP_INK_SEAL_END\n";
+            }
+            m_mkp_sealing = false;
+            m_layer = saved_layer;
+            m_nominal_z = saved_z;
+            if (!seal_tasks.empty()) {
+                // Leave the actual writer position at the sealing height; the next
+                // native layer move must plan from there, not from an invented Z.
+                m_need_change_layer_lift_z = true;
+                if (m_layer)
+                    m_avoid_crossing_perimeters.init_layer(*m_layer);
             }
         }
         this->set_origin(saved_origin);
@@ -10408,7 +10510,7 @@ std::string GCode::_extrude_piece(const ExtrusionPath &path, const std::string &
     auto _mm3_per_mm = path.mm3_per_mm * this->config().print_flow_ratio;
     _mm3_per_mm *= filament_flow_ratio;
 
-    if (path.role() == erTopSolidInfill) {
+    if (path.role() == erTopSolidInfill && !m_mkp_sealing) {
         _mm3_per_mm *= NOZZLE_CONFIG(top_solid_infill_flow_ratio);
     } else if (path.role() == erBottomSurface) {
         _mm3_per_mm *= m_config.bottom_solid_infill_flow_ratio;
@@ -10440,7 +10542,7 @@ std::string GCode::_extrude_piece(const ExtrusionPath &path, const std::string &
         }
 
         // Additionally, adjust the value if we are on the first layer (except for brims and skirts)
-        if (path_on_first_layer && (path.role() != erBrim && path.role() != erSkirt)) {
+        if (path_on_first_layer && !m_mkp_sealing && (path.role() != erBrim && path.role() != erSkirt)) {
             _mm3_per_mm *= m_config.first_layer_flow_ratio;
         }
     }
@@ -10480,6 +10582,8 @@ std::string GCode::_extrude_piece(const ExtrusionPath &path, const std::string &
             speed = NOZZLE_CONFIG(internal_solid_infill_speed);
         } else if (path.role() == erTopSolidInfill) {
             speed = NOZZLE_CONFIG(top_surface_speed);
+        } else if (path.role() == erMkpInkSeal) {
+            speed = m_config.mkp_ink_seal_speed.value;
         } else if (path.role() == erIroning) {
             const size_t filament_idx = get_filament_config_index(m_writer.filament()->id());
             speed = m_config.filament_ironing_speed.is_nil(filament_idx)
@@ -10526,7 +10630,7 @@ std::string GCode::_extrude_piece(const ExtrusionPath &path, const std::string &
             m_belt_in_band = in_band;
         }
     };
-    if (path_on_first_layer || object_layer_over_raft()) {
+    if (!m_mkp_sealing && (path_on_first_layer || object_layer_over_raft())) {
         //BBS: for solid infill of first layer, speed can be higher as long as
         //wall lines have be attached
         if (path.role() != erBottomSurface) {
@@ -10534,7 +10638,7 @@ std::string GCode::_extrude_piece(const ExtrusionPath &path, const std::string &
             speed = use_first_layer_speed ? NOZZLE_CONFIG(initial_layer_speed) :
                                             NOZZLE_CONFIG(initial_layer_infill_speed);
         }
-    } else if (m_config.slow_down_layers > 1 && m_config.raft_layers == 0) {
+    } else if (!m_mkp_sealing && m_config.slow_down_layers > 1 && m_config.raft_layers == 0) {
         if (_layer > 0 && _layer < m_config.slow_down_layers) {
             const auto first_layer_speed =
                 is_perimeter(path.role())
@@ -10547,7 +10651,7 @@ std::string GCode::_extrude_piece(const ExtrusionPath &path, const std::string &
                                 (double) (_layer) / m_config.slow_down_layers));
             }
         }
-    } else if (m_config.slow_down_layers > 1 && m_config.raft_layers > 0 ) {
+    } else if (!m_mkp_sealing && m_config.slow_down_layers > 1 && m_config.raft_layers > 0 ) {
         
         if (_layer > m_config.raft_layers && (_layer - m_config.raft_layers) < m_config.slow_down_layers) {
             const auto first_layer_speed 
@@ -11337,6 +11441,7 @@ std::string GCode::extrusion_role_to_string_for_parser(const ExtrusionRole & rol
         case erInternalInfill: return "InternalInfill";
         case erSolidInfill: return "SolidInfill";
         case erTopSolidInfill: return "TopSolidInfill";
+        case erMkpInkSeal: return "InkSeal";
         case erBottomSurface: return "BottomSurface";
         case erBridgeInfill:
         case erInternalBridgeInfill: return "BridgeInfill";

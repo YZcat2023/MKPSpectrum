@@ -954,6 +954,7 @@ protected:
     // single object, "obj<N>/" when several share one file, because layer_NNNN would otherwise clash.
     std::map<const PrintObject *, std::string> m_mkp_ink_prefix;
     bool   m_mkp_inkjet_started = false;
+    bool   m_mkp_sealing = false;
     bool   m_mkp_tower_recovery_pending = false;
     std::optional<Vec2f> m_mkp_last_grid_refill;
     double m_mkp_recovery_travel_z = 0.;

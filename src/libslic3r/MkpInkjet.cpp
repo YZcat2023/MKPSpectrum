@@ -10,8 +10,13 @@
 #include <fstream>
 #include <limits>
 #include <map>
+#include <mutex>
+#include <numeric>
+#include <set>
 #include <utility>
 #include <vector>
+
+#include <tbb/parallel_for.h>
 
 #include <boost/filesystem.hpp>
 #include <boost/log/trivial.hpp>
@@ -116,6 +121,8 @@ struct PaintedSurface
     // True when this surface is read through the model's own uv layout rather than a projection, so
     // shading interpolates the corner uvs instead of trusting the 3D position.
     bool  use_model_uv = false;
+    bool  use_lscm_uv = false;
+    float uv_cos = 1.f, uv_sin = 0.f;
     float z_min = 0.f, z_max = 0.f;
     // The triangles above live in the print frame the layers were sliced in, but every projection
     // method takes its input in the volume's own space - that is the frame the bake and the GUI
@@ -123,6 +130,7 @@ struct PaintedSurface
     // sitting 135 mm off the origin reads a different part of the tile, which is exactly how a
     // picture ends up in the wrong corner of the plate.
     Transform3d world_to_local = Transform3d::Identity();
+    Matrix3d world_to_local_normal = Matrix3d::Identity();
     // The patch frame Cylindrical/Spherical wrap around, in the same local space.
     Vec3f patch_center = Vec3f::Zero();
     Vec3f patch_axis   = Vec3f::UnitZ();
@@ -191,11 +199,23 @@ void shade_pixel(Raster &raster, const int x, const int y, const Vec3f &position
     // The pixel's point is in the print frame; every projection reads the volume's own space, so it
     // is carried back through the object's matrix first. A model-uv surface is sampled at the uv the
     // model gives the point instead, which that matrix does not affect.
-    const Vec3f local_pos = (surface.world_to_local * position.cast<double>()).cast<float>();
-    const Vec3f local_nrm = (surface.world_to_local.linear() * normal.cast<double>()).cast<float>();
-    const bool sampled = sample_layer_color(surface.texture, *surface.layer, local_pos, local_nrm, color,
-                                            surface.patch_center, surface.patch_axis,
-                                            surface.use_model_uv ? model_uv : nullptr);
+    bool sampled;
+    if (surface.use_model_uv && model_uv != nullptr) {
+        // ModelUV ignores position, normal, millimetre tiling and image aspect.
+        // Keep sample_layer_color's arithmetic, but prepare the rotation once per surface.
+        const Vec2f uv = Vec2f(model_uv->x() * surface.uv_cos - model_uv->y() * surface.uv_sin,
+                              model_uv->x() * surface.uv_sin + model_uv->y() * surface.uv_cos) +
+                         surface.layer->offset;
+        sampled = surface.layer->tile_enabled ||
+            (uv.x() >= 0.f && uv.x() < 1.f && uv.y() >= 0.f && uv.y() < 1.f);
+        if (sampled)
+            color = surface.texture.sample_color(uv, surface.layer->tile_enabled, surface.layer->tile_method);
+    } else {
+        const Vec3f local_pos = (surface.world_to_local * position.cast<double>()).cast<float>();
+        const Vec3f local_nrm = (surface.world_to_local_normal * normal.cast<double>()).cast<float>();
+        sampled = sample_layer_color(surface.texture, *surface.layer, local_pos, local_nrm, color,
+                                     surface.patch_center, surface.patch_axis, surface.use_lscm_uv ? model_uv : nullptr);
+    }
     if (! sampled)
         return;
     // Composite sampled RGB, including white, before deciding which pixels carry ink.
@@ -237,11 +257,38 @@ void rasterize_triangle(Raster &raster, const Vec3f &a, const Vec3f &b, const Ve
     const double sample_dy = sample_segment == nullptr ? 0. :
         double((*sample_segment)[1].pos.y()) - double((*sample_segment)[0].pos.y());
     const double sample_length2 = sample_dx * sample_dx + sample_dy * sample_dy;
+    const double first_x = double(raster.origin.x()) + (x0 + 0.5) * MM_PER_PX;
+    const double dw0 = (double(b.y()) - double(c.y())) * MM_PER_PX / area2;
+    const double dw1 = (double(c.y()) - double(a.y())) * MM_PER_PX / area2;
 
     for (int py = y0; py <= y1; ++py) {
         raster.check_cancel();
         const double y = double(raster.origin.y()) + (py + 0.5) * MM_PER_PX;
-        for (int px = x0; px <= x1; ++px) {
+        // A diagonal wall's bounding rectangle is mostly empty. Intersect this
+        // scanline with its three barycentric half-planes before visiting pixels.
+        // Keep a two-pixel guard and the original per-pixel test/arithmetic so
+        // coverage and UV interpolation remain identical at shared edges.
+        const double row_w0 = (double(b.x() - first_x) * double(c.y() - y) -
+                               double(b.y() - y) * double(c.x() - first_x)) / area2;
+        const double row_w1 = (double(c.x() - first_x) * double(a.y() - y) -
+                               double(c.y() - y) * double(a.x() - first_x)) / area2;
+        double begin = 0., end = double(x1 - x0);
+        auto clip_row = [&](double weight, double slope) {
+            if (slope > 0.)
+                begin = std::max(begin, (-1e-9 - weight) / slope);
+            else if (slope < 0.)
+                end = std::min(end, (-1e-9 - weight) / slope);
+            else if (weight < -1e-9)
+                end = -3.;
+        };
+        clip_row(row_w0, dw0);
+        clip_row(row_w1, dw1);
+        clip_row(1. - row_w0 - row_w1, -dw0 - dw1);
+        if (begin > end + 4.)
+            continue;
+        const int row_x0 = x0 + int(std::max(0., std::floor(begin) - 2.));
+        const int row_x1 = x0 + int(std::min(double(x1 - x0), std::ceil(end) + 2.));
+        for (int px = row_x0; px <= row_x1; ++px) {
             if (area_mask != nullptr && !(*area_mask)[size_t(py) * size_t(raster.width) + size_t(px)])
                 continue;
             const double x  = double(raster.origin.x()) + (px + 0.5) * MM_PER_PX;
@@ -360,7 +407,13 @@ void collect_wall_segment(std::vector<WallSegment> &segments, const std::vector<
         z_lo = std::min(z_lo, v.pos.z());
         z_hi = std::max(z_hi, v.pos.z());
     }
-    const float z_cut = z_hi - std::min(1e-4f, (z_hi - z_lo) * 0.05f);
+    // A coplanar horizontal face has area, not a wall intersection. Treating its
+    // vertices as a row strokes an internal triangulation edge across the top.
+    // Its colour is still composited by rasterize_polygon() after the walls.
+    if (z_hi == z_lo)
+        return;
+    const float z_cut = std::min(z_hi - std::min(1e-4f, (z_hi - z_lo) * 0.05f),
+                                 std::nextafter(z_hi, z_lo));
 
     std::vector<PolyVertex> row;
     row.reserve(4);
@@ -370,11 +423,12 @@ void collect_wall_segment(std::vector<WallSegment> &segments, const std::vector<
         const PolyVertex &q  = poly[(i + 1) % n];
         const float       dp = p.pos.z() - z_cut;
         const float       dq = q.pos.z() - z_cut;
-        if (dp * dq < 0.f) {
+        // Half-open crossings include a vertex once. An absolute Z tolerance
+        // would mistake every vertex of a nearly horizontal face for the row.
+        if ((dp > 0.f) != (dq > 0.f)) {
             const float t = dp / (dp - dq);
             row.push_back(PolyVertex{ p.pos + (q.pos - p.pos) * t, p.uv + (q.uv - p.uv) * t });
-        } else if (std::abs(dp) <= 1e-6f)
-            row.push_back(p);
+        }
     }
     if (row.size() < 2)
         return;
@@ -595,7 +649,7 @@ std::vector<MmBand> bands_from_raster(const Raster &raster)
 // The strip the head downloads for one block: 684 rows over the bar's 14.29 mm, as many columns as
 // the pass is long, white wherever the layer has nothing. Encoded and appended to the archive.
 bool write_strip(Zipper &zip, const std::string &entry, const Raster &raster, const MmBand &band,
-                 const InkjetParams &params)
+                 const InkjetParams &params, std::mutex *zip_mutex = nullptr)
 {
     const double half = HEAD_WIDTH_MM * 0.5;
     const int    cols = std::max(1, int(std::lround((band.x1 - band.x0) / MM_PER_PX)));
@@ -603,15 +657,24 @@ bool write_strip(Zipper &zip, const std::string &entry, const Raster &raster, co
     // Row 0 of the strip is its top, the way the old pipeline handed over a screen-order image: the
     // packer walks the strip bottom-up, which is the order the head lays the lines down.
     const double y_top = band.y_center + half;
+    const int shear_px = int(std::lround(params.shear_mm / MM_PER_PX));
+    std::vector<int> source_columns(size_t(cols), -1);
+    for (int col = 0; col < cols; ++col) {
+        const double x_mm = band.x0 + (col + 0.5) * MM_PER_PX;
+        source_columns[size_t(col)] = int(std::floor((x_mm - double(raster.origin.x())) / MM_PER_PX));
+    }
     for (int row = 0; row < MBD_STRIP_ROWS; ++row) {
         raster.check_cancel();
         const double y_mm = y_top - (row + 0.5) * MM_PER_PX;
         const int    py   = int(std::floor((y_mm - double(raster.origin.y())) / MM_PER_PX));
         if (py < 0 || py >= raster.height)
             continue;
+        const int shift = (shear_px == 0 || MBD_STRIP_ROWS < 2)
+                              ? 0
+                              : int(std::lround(double(shear_px) *
+                                                (1. - double(row) / double(MBD_STRIP_ROWS - 1))));
         for (int col = 0; col < cols; ++col) {
-            const double x_mm = band.x0 + (col + 0.5) * MM_PER_PX;
-            const int    px   = int(std::floor((x_mm - double(raster.origin.x())) / MM_PER_PX));
+            const int px = source_columns[size_t(col)];
             if (px < 0 || px >= raster.width)
                 continue;
             const size_t src = size_t(py) * size_t(raster.width) + size_t(px);
@@ -621,11 +684,6 @@ bool write_strip(Zipper &zip, const std::string &entry, const Raster &raster, co
             // out as a parallelogram - the top of the strip is shifted along the pass, the bottom is
             // not, and what the shift uncovers stays white (no ink there). This is exactly the
             // per-row shift the post-processor's apply_shear() made on the strip image.
-            const int shear_px = int(std::lround(params.shear_mm / MM_PER_PX));
-            const int shift = (shear_px == 0 || MBD_STRIP_ROWS < 2)
-                                  ? 0
-                                  : int(std::lround(double(shear_px) *
-                                                    (1. - double(row) / double(MBD_STRIP_ROWS - 1))));
             const int dst_col = col + shift;
             if (dst_col < 0 || dst_col >= cols)
                 continue;
@@ -642,7 +700,11 @@ bool write_strip(Zipper &zip, const std::string &entry, const Raster &raster, co
         BOOST_LOG_TRIVIAL(warning) << "MKP: strip encoding failed at y=" << band.y_center;
         return false;
     }
-    zip.add_entry(entry, mbd.data(), mbd.size());
+    if (zip_mutex != nullptr) {
+        const std::lock_guard<std::mutex> lock(*zip_mutex);
+        zip.add_entry(entry, mbd.data(), mbd.size());
+    } else
+        zip.add_entry(entry, mbd.data(), mbd.size());
     return true;
 }
 
@@ -684,13 +746,14 @@ std::map<const Layer *, InkLayer> build_inkjet_layers(const PrintObject &object,
         // print z. Clipping painted faces by print_z in model space cut them on the wrong axis and
         // left two of a box's four walls (and most of each face) out of the picture.
         const Transform3d trafo = object.trafo_centered() * volume->get_matrix();
-        const size_t       slots = std::min(volume->texture_displacement_layers.size(), TEXTURE_DISPLACEMENT_MAX_LAYERS);
-        for (size_t slot = 0; slot < slots; ++slot) {
+        for (const auto &texture_layer : volume->texture_displacement_layers) {
             if (object.print()->canceled()) throw CanceledException();
-            const FacetsAnnotation &facets = volume->texture_displacement_facet(int(slot));
+            const int slot = texture_layer.slot;
+            if (slot < 0 || slot >= int(TEXTURE_DISPLACEMENT_MAX_LAYERS))
+                continue;
+            const FacetsAnnotation &facets = volume->texture_displacement_facet(slot);
             if (facets.empty())
                 continue;
-            const TextureDisplacementLayer &texture_layer = volume->texture_displacement_layers[slot];
             DecodedHeightTexture            texture       = decode_height_texture(texture_layer);
             // A grayscale height map has no colour to give: it displaces, it does not print.
             if (! texture.has_color())
@@ -716,7 +779,24 @@ std::map<const Layer *, InkLayer> build_inkjet_layers(const PrintObject &object,
             std::vector<Vec2f> corner_uv;
             if (volume->has_texture_uv())
                 corner_uv = compute_model_corner_uvs(volume->mesh().its, volume->texture_uv, patch, patch_source);
-            const bool have_uv = corner_uv.size() == patch.indices.size() * 3;
+            // Analytic/unwrap projections use the bake frame in the editor. A cut
+            // layer already carries its original frame, so it still takes local points.
+            const Transform3d sample_frame = !texture_layer.projection_anchor &&
+                texture_layer.projection_method != TextureProjectionMethod::ViewProjected ?
+                texture_displacement_bake_frame(texture_displacement_volume_to_world(*volume)) :
+                Transform3d::Identity();
+            indexed_triangle_set framed_patch;
+            if (corner_uv.empty() && !sample_frame.matrix().isApprox(Transform3d::Identity().matrix())) {
+                framed_patch = patch;
+                for (auto &p : framed_patch.vertices)
+                    p = (sample_frame * p.cast<double>()).cast<float>();
+            }
+            const auto &sampling_patch = framed_patch.indices.empty() ? patch : framed_patch;
+            const bool lscm = corner_uv.empty() && texture_layer.projection_method == TextureProjectionMethod::LSCM;
+            if (lscm)
+                corner_uv = compute_lscm_corner_uvs(sampling_patch, texture_layer);
+            const bool have_uv = !lscm && corner_uv.size() == patch.indices.size() * 3;
+            const bool have_corner_uv = corner_uv.size() == patch.indices.size() * 3;
             PaintedSurface surface;
             surface.layer       = &texture_layer;
             if (have_uv && texture_layer.projection_method != TextureProjectionMethod::ModelUV) {
@@ -728,13 +808,18 @@ std::map<const Layer *, InkLayer> build_inkjet_layers(const PrintObject &object,
             }
             surface.texture     = std::move(texture);
             surface.use_model_uv = have_uv;
-            surface.world_to_local = trafo.inverse();
-            {
+            surface.use_lscm_uv = lscm && have_corner_uv;
+            const float uv_angle = surface.layer->rotation_deg * float(M_PI) / 180.f;
+            surface.uv_cos = std::cos(uv_angle);
+            surface.uv_sin = std::sin(uv_angle);
+            surface.world_to_local = sample_frame * trafo.inverse();
+            surface.world_to_local_normal = surface.world_to_local.linear().inverse().transpose();
+            if (!surface.use_model_uv && !surface.use_lscm_uv) {
                 // The library's own patch frame, so the Cylindrical/Spherical wrap and the tri-planar
                 // blend match the bake the GUI previews: same centroid, same least-aligned axis.
-                const std::vector<Vec3f> vertex_normals = texture_displacement_vertex_normals(patch);
+                const std::vector<Vec3f> vertex_normals = texture_displacement_vertex_normals(sampling_patch);
                 Vec3f center, axis, average_normal;
-                texture_displacement_patch_frame(patch, vertex_normals, center, axis, average_normal);
+                texture_displacement_patch_frame(sampling_patch, vertex_normals, center, axis, average_normal);
                 surface.patch_center = center;
                 surface.patch_axis   = axis;
             }
@@ -749,7 +834,7 @@ std::map<const Layer *, InkLayer> build_inkjet_layers(const PrintObject &object,
                 triangle.a = (trafo * patch.vertices[index[0]].cast<double>()).cast<float>();
                 triangle.b = (trafo * patch.vertices[index[1]].cast<double>()).cast<float>();
                 triangle.c = (trafo * patch.vertices[index[2]].cast<double>()).cast<float>();
-                if (have_uv)
+                if (have_corner_uv)
                     for (int k = 0; k < 3; ++k)
                         triangle.uv[k] = corner_uv[ti * 3 + size_t(k)];
                 triangle.normal = (triangle.b - triangle.a).cross(triangle.c - triangle.a);
@@ -772,12 +857,23 @@ std::map<const Layer *, InkLayer> build_inkjet_layers(const PrintObject &object,
     if (surfaces.empty() || ! bounds.defined)
         return layers;
 
-
-    Raster      raster;
-    raster.print = object.print();
-    std::vector<PolyVertex> poly;
-    poly.reserve(8);
-
+    struct TriangleRef {
+        const PaintedSurface* surface;
+        const PaintedTriangle* triangle;
+    };
+    std::vector<TriangleRef> triangles;
+    for (const PaintedSurface& surface : surfaces)
+        for (const PaintedTriangle& triangle : surface.triangles)
+            triangles.push_back({&surface, &triangle});
+    std::vector<size_t> starts(triangles.size()), ends(triangles.size());
+    std::iota(starts.begin(), starts.end(), size_t(0));
+    std::iota(ends.begin(), ends.end(), size_t(0));
+    std::sort(starts.begin(), starts.end(), [&](size_t a, size_t b) {
+        return triangles[a].triangle->z_min < triangles[b].triangle->z_min;
+    });
+    std::sort(ends.begin(), ends.end(), [&](size_t a, size_t b) {
+        return triangles[a].triangle->z_max < triangles[b].triangle->z_max;
+    });
     // Review dump framing: one canvas for every layer, sized to the whole painted footprint and not
     // to the plate. Framing each layer on its own slab would make the UI's layer slider jump about;
     // framing on the plate would bury a 20 mm part in empty margin, which is the picture nobody can
@@ -787,7 +883,6 @@ std::map<const Layer *, InkLayer> build_inkjet_layers(const PrintObject &object,
     const float          half_band     = float(0.5 * std::max(0.05, params.wall_band_mm));
     const double         PREVIEW_PAD_MM = double(half_band) + 2. * MM_PER_PX;
     int                  preview_x0 = 0, preview_y0 = 0, preview_w = 0, preview_h = 0, preview_step = 1;
-    std::vector<uint8_t> preview_px;
     // Where each written picture belongs in Z, so the 3D preview can lay the cross-section on
     // the model at the height it was cut at instead of guessing.
     std::vector<std::pair<size_t, double>> preview_layers;
@@ -809,67 +904,143 @@ std::map<const Layer *, InkLayer> build_inkjet_layers(const PrintObject &object,
                                        << "x, this part is too large for a 1:1 review picture";
         preview_w    = (preview_w + preview_step - 1) / preview_step;
         preview_h    = (preview_h + preview_step - 1) / preview_step;
-        preview_px.assign(size_t(preview_w) * size_t(preview_h) * 4, uint8_t(0));
     }
-    size_t written = 0;
-    size_t layer_index = 0;
-    for (const Layer *layer : object.layers()) {
-        if (progress)
-            progress(0.05 + 0.9 * double(layer_index) / std::max<size_t>(1, object.layers().size()),
-                     "纹理切片：第 " + std::to_string(layer_index + 1) + "/" +
-                     std::to_string(object.layers().size()) + " 层");
-        ++layer_index;
-        raster.check_cancel();
-        // Layer::print_z is the TOP of the layer, not its bottom: the writer brings the nozzle to
-        // print_z after the layer is done. Using it as the bottom shifted every ink layer up by one
-        // slab - the top picture of a 100 layer part ended up describing layer 99 while layer 99's
-        // own slab lay above the part and got no ink at all, so the real top face was never sprayed.
-        const float z_top    = float(layer->print_z);
-        const float z_bottom = float(layer->print_z - layer->height);
-
-        // Size the raster to what this layer's slab actually covers, not to the whole object: a
-        // 270 mm-wide model at 0.02 mm per pixel would be 13000 px across for nothing.
-        BoundingBoxf slab;
-        for (const PaintedSurface &surface : surfaces) {
-            if (surface.z_max < z_bottom || surface.z_min > z_top)
+    const size_t layer_count = object.layers().size();
+    preview_layers.resize(layer_count, {std::numeric_limits<size_t>::max(), 0.});
+    preview_ink_px.resize(layer_count, 0);
+    // The PNG writer retains one row and its coordinate maps, not a full
+    // preview. PNG and MBD scratch do not overlap in lifetime.
+    std::vector<BoundingBoxf> layer_bounds;
+    double full_width = std::ceil((bounds.max.x() - bounds.min.x() + 2. * half_band) / MM_PER_PX) + 4.;
+    double full_height = std::ceil((bounds.max.y() - bounds.min.y() + 2. * half_band) / MM_PER_PX) + 4.;
+    double max_pixels = std::min(double(MAX_RASTER_PIXELS), full_width * full_height);
+    const auto working_bytes = [&](double pixels, double width) {
+        const double preview_bytes = double(preview_w) * 4. + double(preview_h) * sizeof(std::pair<int, int>) +
+            width * sizeof(int);
+        return pixels * 5. + std::max(preview_bytes, width * MBD_STRIP_ROWS * 12. + 2. * 1024. * 1024.);
+    };
+    // Small parts already reach the concurrency cap. An extrema sweep cannot
+    // improve their allocation, so keep their existing per-layer bounds scan.
+    if (working_bytes(max_pixels, full_width) * std::min<size_t>(8, layer_count) >
+        384. * 1024. * 1024.) {
+        layer_bounds.resize(layer_count);
+        max_pixels = full_width = full_height = 0.;
+        // Keep only four sorted extrema per active triangle, rather than retaining
+        // every layer's triangle list. This also avoids scanning all active
+        // vertices again just to determine the canvas bounds in each worker.
+        std::array<std::multiset<float>, 4> extrema;
+        auto update = [&](size_t ti, bool add) {
+            const auto& t = *triangles[ti].triangle;
+            const std::array<float, 4> values = {
+                std::min({t.a.x(), t.b.x(), t.c.x()}), std::max({t.a.x(), t.b.x(), t.c.x()}),
+                std::min({t.a.y(), t.b.y(), t.c.y()}), std::max({t.a.y(), t.b.y(), t.c.y()})};
+            for (size_t k = 0; k < values.size(); ++k)
+                if (add)
+                    extrema[k].insert(values[k]);
+                else
+                    extrema[k].erase(extrema[k].find(values[k]));
+        };
+        size_t next_start = 0, next_end = 0;
+        for (size_t li = 0; li < layer_count; ++li) {
+            if (object.print()->canceled())
+                throw CanceledException();
+            const Layer* layer = object.layers()[li];
+            const float top = float(layer->print_z), bottom = float(layer->print_z - layer->height);
+            while (next_start < starts.size() && triangles[starts[next_start]].triangle->z_min <= top)
+                update(starts[next_start++], true);
+            while (next_end < ends.size() && triangles[ends[next_end]].triangle->z_max < bottom)
+                update(ends[next_end++], false);
+            if (extrema[0].empty())
                 continue;
-            for (const PaintedTriangle &triangle : surface.triangles) {
-                raster.check_cancel();
-                if (triangle.z_max < z_bottom || triangle.z_min > z_top)
-                    continue;
-                for (const Vec3f &vertex : { triangle.a, triangle.b, triangle.c })
-                    slab.merge(Vec2d(double(vertex.x()), double(vertex.y())));
+            auto& slab = layer_bounds[li];
+            slab = BoundingBoxf(Vec2d(*extrema[0].begin(), *extrema[2].begin()),
+                                Vec2d(*extrema[1].rbegin(), *extrema[3].rbegin()));
+            const Vec2f origin(float(slab.min.x()) - half_band - float(MM_PER_PX),
+                               float(slab.min.y()) - half_band - float(MM_PER_PX));
+            const double width = std::max(1., std::ceil((slab.max.x() + half_band - double(origin.x())) / MM_PER_PX) + 2.);
+            const double height = std::max(1., std::ceil((slab.max.y() + half_band - double(origin.y())) / MM_PER_PX) + 2.);
+            if (width * height <= MAX_RASTER_PIXELS) {
+                max_pixels = std::max(max_pixels, width * height);
+                full_width = std::max(full_width, width);
+                full_height = std::max(full_height, height);
             }
         }
-        if (! slab.defined)
-            continue;
+    }
+    const double worker_bytes = working_bytes(max_pixels, full_width);
+    const size_t workers = std::min(layer_count, size_t(std::max(1., std::min(8.,
+        std::floor((384. * 1024. * 1024.) / std::max(1., worker_bytes))))));
+    size_t written = 0, reported_layers = 0;
+    std::mutex zip_mutex, result_mutex, progress_mutex;
+    tbb::parallel_for(size_t(0), workers, [&](size_t worker) {
+        Raster raster;
+        raster.print = object.print();
+        std::vector<PolyVertex> poly;
+        poly.reserve(8);
+        // Preserve source order while sweeping only triangles intersecting this slab.
+        std::set<size_t> active;
+        size_t next_start = 0, next_end = 0;
+        size_t worker_written = 0;
+        const size_t first_layer = layer_count * worker / workers;
+        const size_t last_layer = layer_count * (worker + 1) / workers;
+        for (size_t li = first_layer; li < last_layer; ++li) {
+            const Layer* layer = object.layers()[li];
+            if (progress) {
+                const std::lock_guard<std::mutex> lock(progress_mutex);
+                ++reported_layers;
+                progress(0.05 + 0.9 * double(reported_layers - 1) / std::max<size_t>(1, layer_count),
+                         "纹理切片：第 " + std::to_string(reported_layers) + "/" +
+                         std::to_string(layer_count) + " 层");
+            }
+            raster.check_cancel();
+            // Layer::print_z is the TOP of the layer, not its bottom: the writer brings the nozzle to
+            // print_z after the layer is done. Using it as the bottom shifted every ink layer up by one
+            // slab - the top picture of a 100 layer part ended up describing layer 99 while layer 99's
+            // own slab lay above the part and got no ink at all, so the real top face was never sprayed.
+            const float z_top    = float(layer->print_z);
+            const float z_bottom = float(layer->print_z - layer->height);
+            while (next_start < starts.size() && triangles[starts[next_start]].triangle->z_min <= z_top)
+                active.insert(starts[next_start++]);
+            while (next_end < ends.size() && triangles[ends[next_end]].triangle->z_max < z_bottom)
+                active.erase(ends[next_end++]);
 
-        raster.origin = Vec2f(float(slab.min.x()) - half_band - float(MM_PER_PX),
-                             float(slab.min.y()) - half_band - float(MM_PER_PX));
-        raster.width  = std::max(1, int(std::ceil((slab.max.x() + half_band - double(raster.origin.x())) / MM_PER_PX)) + 2);
-        raster.height = std::max(1, int(std::ceil((slab.max.y() + half_band - double(raster.origin.y())) / MM_PER_PX)) + 2);
-        if (size_t(raster.width) * size_t(raster.height) > MAX_RASTER_PIXELS) {
-            BOOST_LOG_TRIVIAL(warning) << "MKP: layer " << layer->id() << " is too large to spray, skipped";
-            continue;
-        }
-        raster.hit.assign(size_t(raster.width) * size_t(raster.height), 0);
-        raster.rgb.assign(size_t(raster.width) * size_t(raster.height) * 3, uint8_t(255));
-
-        struct AreaFill
-        {
-            std::vector<PolyVertex> polygon;
-            const PaintedTriangle *triangle;
-            const PaintedSurface *surface;
-        };
-        std::vector<WallSegment> wall_segments;
-        std::vector<AreaFill> area_fills;
-        for (const PaintedSurface &surface : surfaces) {
-            if (surface.z_max < z_bottom || surface.z_min > z_top)
+            // Size the raster to what this layer's slab actually covers, not to the whole object: a
+            // 270 mm-wide model at 0.02 mm per pixel would be 13000 px across for nothing.
+            BoundingBoxf slab;
+            if (!layer_bounds.empty())
+                slab = layer_bounds[li];
+            else
+                for (size_t ti : active) {
+                    const PaintedTriangle& triangle = *triangles[ti].triangle;
+                    raster.check_cancel();
+                    for (const Vec3f& vertex : {triangle.a, triangle.b, triangle.c})
+                        slab.merge(Vec2d(double(vertex.x()), double(vertex.y())));
+                }
+            if (! slab.defined)
                 continue;
-            for (const PaintedTriangle &triangle : surface.triangles) {
+
+            raster.origin = Vec2f(float(slab.min.x()) - half_band - float(MM_PER_PX),
+                                 float(slab.min.y()) - half_band - float(MM_PER_PX));
+            raster.width  = std::max(1, int(std::ceil((slab.max.x() + half_band - double(raster.origin.x())) / MM_PER_PX)) + 2);
+            raster.height = std::max(1, int(std::ceil((slab.max.y() + half_band - double(raster.origin.y())) / MM_PER_PX)) + 2);
+            if (size_t(raster.width) * size_t(raster.height) > MAX_RASTER_PIXELS) {
+                BOOST_LOG_TRIVIAL(warning) << "MKP: layer " << layer->id() << " is too large to spray, skipped";
+                continue;
+            }
+            raster.hit.assign(size_t(raster.width) * size_t(raster.height), 0);
+            raster.rgb.assign(size_t(raster.width) * size_t(raster.height) * 3, uint8_t(255));
+
+            struct AreaFill
+            {
+                std::vector<PolyVertex> polygon;
+                const PaintedTriangle *triangle;
+                const PaintedSurface *surface;
+            };
+            std::vector<WallSegment> wall_segments;
+            std::vector<AreaFill> area_fills;
+            for (size_t ti : active) {
+                const PaintedSurface& surface = *triangles[ti].surface;
+                const PaintedTriangle& triangle = *triangles[ti].triangle;
                 raster.check_cancel();
-                if (triangle.z_max < z_bottom || triangle.z_min > z_top)
-                    continue;
                 poly.clear();
                 poly.push_back(PolyVertex{ triangle.a, triangle.uv[0] });
                 poly.push_back(PolyVertex{ triangle.b, triangle.uv[1] });
@@ -895,144 +1066,180 @@ std::map<const Layer *, InkLayer> build_inkjet_layers(const PrintObject &object,
                         area_fills.push_back(AreaFill{ poly, &triangle, &surface });
                 }
             }
-        }
 
-        rasterize_wall_segments(raster, wall_segments, half_band);
-        if (!area_fills.empty()) {
-            const std::vector<uint8_t> area_mask = external_surface_mask(*layer, raster);
-            for (const AreaFill &fill : area_fills)
-                rasterize_polygon(raster, fill.polygon, fill.triangle->normal, *fill.surface, area_mask);
-        }
-
-        // The colour knobs act on the ink of this layer once, on the raster. Both the strips and
-        // the review picture are taken from here, so what the preview shows is what the head gets.
-        // A pixel the adjustment pushes into "no colour" stops being ink, which is what the old
-        // pipeline's find_non_white_blocks() did after apply_cmy_adjustment().
-        {
-            for (size_t i = 0; i < raster.hit.size(); ++i) {
-                if ((i & 65535) == 0)
-                    raster.check_cancel();
-                if (! raster.hit[i])
-                    continue;
-                uint8_t &r = raster.rgb[i * 3];
-                uint8_t &g = raster.rgb[i * 3 + 1];
-                uint8_t &b = raster.rgb[i * 3 + 2];
-                adjust_ink_color(params, r, g, b);
-                if (float(r) >= WHITE_LEVEL * 255.f && float(g) >= WHITE_LEVEL * 255.f &&
-                    float(b) >= WHITE_LEVEL * 255.f)
-                    raster.hit[i] = 0;
+            rasterize_wall_segments(raster, wall_segments, half_band);
+            if (!area_fills.empty()) {
+                const std::vector<uint8_t> area_mask = external_surface_mask(*layer, raster);
+                for (const AreaFill &fill : area_fills)
+                    rasterize_polygon(raster, fill.polygon, fill.triangle->normal, *fill.surface, area_mask);
             }
-        }
 
-        // Review dump: this layer's ink, drawn into the shared model-framed canvas. Nothing where
-        // there is no ink, the ink itself everywhere else, on a transparent background - the same
-        // shape the flat-print side's layer PNGs have, so the preview page can show either.
-        if (! preview_px.empty()) {
-            for (int r = 0; r < raster.height; ++r) {
-                raster.check_cancel();
-                const int cy = int(std::floor((double(raster.origin.y()) + double(r) * MM_PER_PX) / MM_PER_PX)) - preview_y0;
-                if (cy < 0)
-                    continue;
-                const int cy_scaled = cy / preview_step;
-                if (cy_scaled >= preview_h)
-                    continue;
-                const size_t dst_row = size_t(preview_h - 1 - cy_scaled);
-                const size_t src_row = size_t(r);
+            // The colour knobs act on the ink of this layer once, on the raster. Both the strips and
+            // the review picture are taken from here, so what the preview shows is what the head gets.
+            // A pixel the adjustment pushes into "no colour" stops being ink, which is what the old
+            // pipeline's find_non_white_blocks() did after apply_cmy_adjustment().
+            {
+                for (size_t i = 0; i < raster.hit.size(); ++i) {
+                    if ((i & 65535) == 0)
+                        raster.check_cancel();
+                    if (! raster.hit[i])
+                        continue;
+                    uint8_t &r = raster.rgb[i * 3];
+                    uint8_t &g = raster.rgb[i * 3 + 1];
+                    uint8_t &b = raster.rgb[i * 3 + 2];
+                    adjust_ink_color(params, r, g, b);
+                    if (float(r) >= WHITE_LEVEL * 255.f && float(g) >= WHITE_LEVEL * 255.f &&
+                        float(b) >= WHITE_LEVEL * 255.f)
+                        raster.hit[i] = 0;
+                }
+            }
+
+            // Review dump: this layer's ink, drawn into the shared model-framed canvas. Nothing where
+            // there is no ink, the ink itself everywhere else, on a transparent background - the same
+            // shape the flat-print side's layer PNGs have, so the preview page can show either.
+            if (preview_w > 0 && preview_h > 0) {
+                std::vector<std::pair<int, int>> source_rows(size_t(preview_h), {-1, -1});
+                for (int r = 0; r < raster.height; ++r) {
+                    raster.check_cancel();
+                    const int cy = int(std::floor((double(raster.origin.y()) + double(r) * MM_PER_PX) / MM_PER_PX)) - preview_y0;
+                    if (cy >= 0 && cy / preview_step < preview_h) {
+                        auto& range = source_rows[size_t(preview_h - 1 - cy / preview_step)];
+                        if (range.first < 0)
+                            range.first = r;
+                        range.second = r + 1;
+                    }
+                }
+                std::vector<int> destination_columns(size_t(raster.width), -1);
                 for (int c = 0; c < raster.width; ++c) {
-                    const size_t src = src_row * size_t(raster.width) + size_t(c);
-                    if (! raster.hit[src])
-                        continue;
                     const int cx = int(std::floor((double(raster.origin.x()) + double(c) * MM_PER_PX) / MM_PER_PX)) - preview_x0;
-                    if (cx < 0)
-                        continue;
-                    const int cx_scaled = cx / preview_step;
-                    if (cx_scaled >= preview_w)
-                        continue;
-                    uint8_t *dst = &preview_px[(dst_row * size_t(preview_w) + size_t(cx_scaled)) * 4];
-                    // Review picture only - the strips above already carry the colour the head will
-                    // print, untouched. Everything paler than white is drawn as the same hue at full
-                    // strength with the paleness moved into the alpha, so a light pink reads as the
-                    // semi-transparent red it is and a near-white pixel all but disappears. Without
-                    // it the pale fringe around every glyph came out as opaque white blocks sitting
-                    // on the model.
-                    const int r8 = raster.rgb[src * 3];
-                    const int g8 = raster.rgb[src * 3 + 1];
-                    const int b8 = raster.rgb[src * 3 + 2];
-                    // Un-premultiplied against white, not normalised to full saturation: the
-                    // colour the picture shows, laid over white at this alpha, must compose back to
-                    // exactly the pixel the head will print. Dividing by (hi - lo) instead stretched
-                    // every hue to the edge of the gamut, which turned the seal's dark teal (29,74,79)
-                    // into neon cyan - the ink looked like one wrong colour.
-                    const int lo = std::min({ r8, g8, b8 });
-                    dst[3] = uint8_t(255 - lo);
-                    if (lo >= 255) {
-                        dst[0] = dst[1] = dst[2] = 0;   // white: nothing to see
-                    } else {
-                        const float lift = 255.f / float(255 - lo);
-                        dst[0] = uint8_t(std::min(255, int(float(r8 - lo) * lift + 0.5f)));
-                        dst[1] = uint8_t(std::min(255, int(float(g8 - lo) * lift + 0.5f)));
-                        dst[2] = uint8_t(std::min(255, int(float(b8 - lo) * lift + 0.5f)));
+                    if (cx >= 0 && cx / preview_step < preview_w)
+                        destination_columns[size_t(c)] = cx / preview_step;
+                }
+                char name[64];
+                std::snprintf(name, sizeof(name), "layer_%04zu.png", layer->id());
+                size_t inked = 0;
+                Slic3r::png::write_rgba_rows_to_file((boost::filesystem::path(preview_dir) / name).string(),
+                    size_t(preview_w), size_t(preview_h), [&](size_t y, uint8_t* row) {
+                    raster.check_cancel();
+                    std::fill_n(row, size_t(preview_w) * 4, uint8_t(0));
+                    // Preserve ascending source order when several pixels land on
+                    // one preview pixel, including downscaled large canvases.
+                    for (int r = source_rows[y].first; r < source_rows[y].second; ++r)
+                        for (int c = 0; c < raster.width; ++c) {
+                            const size_t src = size_t(r) * size_t(raster.width) + size_t(c);
+                            const int column = destination_columns[size_t(c)];
+                            if (!raster.hit[src] || column < 0)
+                                continue;
+                            uint8_t* dst = row + size_t(column) * 4;
+                            // Review picture only - the strips above already carry the colour the head will
+                            // print, untouched. Everything paler than white is drawn as the same hue at full
+                            // strength with the paleness moved into the alpha, so a light pink reads as the
+                            // semi-transparent red it is and a near-white pixel all but disappears. Without
+                            // it the pale fringe around every glyph came out as opaque white blocks sitting
+                            // on the model.
+                            const int r8 = raster.rgb[src * 3];
+                            const int g8 = raster.rgb[src * 3 + 1];
+                            const int b8 = raster.rgb[src * 3 + 2];
+                            // Un-premultiplied against white, not normalised to full saturation: the
+                            // colour the picture shows, laid over white at this alpha, must compose back to
+                            // exactly the pixel the head will print. Dividing by (hi - lo) instead stretched
+                            // every hue to the edge of the gamut, which turned the seal's dark teal (29,74,79)
+                            // into neon cyan - the ink looked like one wrong colour.
+                            const int lo = std::min({ r8, g8, b8 });
+                            dst[3] = uint8_t(255 - lo);
+                            if (lo >= 255) {
+                                dst[0] = dst[1] = dst[2] = 0;   // white: nothing to see
+                            } else {
+                                const float lift = 255.f / float(255 - lo);
+                                dst[0] = uint8_t(std::min(255, int(float(r8 - lo) * lift + 0.5f)));
+                                dst[1] = uint8_t(std::min(255, int(float(g8 - lo) * lift + 0.5f)));
+                                dst[2] = uint8_t(std::min(255, int(float(b8 - lo) * lift + 0.5f)));
+                            }
+
+                        }
+                    for (size_t x = 0; x < size_t(preview_w); ++x)
+                        inked += row[x * 4 + 3] != 0;
+                });
+                preview_layers[li] = {layer->id(), double(layer->print_z)};
+                preview_ink_px[li] = inked;
+            }
+
+            const std::vector<MmBand> bands = bands_from_raster(raster);
+            if (bands.empty())
+                continue;
+
+            InkLayer ink;
+            if (params.surface_tone) {
+                auto &tone = ink.tone;
+                tone.origin = raster.origin.cast<double>();
+                tone.width = int(std::ceil(raster.width * MM_PER_PX / SurfaceTone::cell_mm));
+                tone.height = int(std::ceil(raster.height * MM_PER_PX / SurfaceTone::cell_mm));
+                tone.darkness.resize(size_t(tone.width) * tone.height, 0);
+                for (int y = 0; y < raster.height; ++y) {
+                    raster.check_cancel();
+                    const size_t row = size_t((y + 0.5) * MM_PER_PX / SurfaceTone::cell_mm) * tone.width;
+                    for (int x = 0; x < raster.width; ++x) {
+                        const size_t i = size_t(y) * raster.width + x;
+                        if (!raster.hit[i])
+                            continue;
+                        const auto *rgb = raster.rgb.data() + i * 3;
+                        const int luma = (2126 * rgb[0] + 7152 * rgb[1] + 722 * rgb[2] + 5000) / 10000;
+                        auto &cell = tone.darkness[row + size_t((x + 0.5) * MM_PER_PX / SurfaceTone::cell_mm)];
+                        // Keep narrow dark contours from disappearing when reducing raster resolution.
+                        cell = std::max(cell, uint8_t(255 - luma));
                     }
                 }
             }
-            char name[64];
-            std::snprintf(name, sizeof(name), "layer_%04zu.png", layer->id());
-            size_t inked = 0;
-            for (size_t i = 3; i < preview_px.size(); i += 4)
-                if (preview_px[i])
-                    ++inked;
-            Slic3r::png::write_rgba_to_file((boost::filesystem::path(preview_dir) / name).string(),
-                                            size_t(preview_w), size_t(preview_h), preview_px);
-            preview_layers.emplace_back(layer->id(), double(layer->print_z));
-            preview_ink_px.push_back(inked);
-            std::fill(preview_px.begin(), preview_px.end(), uint8_t(0));
-        }
-
-        const std::vector<MmBand> bands = bands_from_raster(raster);
-        if (bands.empty())
-            continue;
-
-        InkLayer ink;
-        if (params.surface_tone) {
-            auto &tone = ink.tone;
-            tone.origin = raster.origin.cast<double>();
-            tone.width = int(std::ceil(raster.width * MM_PER_PX / SurfaceTone::cell_mm));
-            tone.height = int(std::ceil(raster.height * MM_PER_PX / SurfaceTone::cell_mm));
-            tone.darkness.resize(size_t(tone.width) * tone.height, 0);
-            for (int y = 0; y < raster.height; ++y) {
-                raster.check_cancel();
-                const size_t row = size_t((y + 0.5) * MM_PER_PX / SurfaceTone::cell_mm) * tone.width;
-                for (int x = 0; x < raster.width; ++x) {
-                    const size_t i = size_t(y) * raster.width + x;
-                    if (!raster.hit[i])
-                        continue;
-                    const auto *rgb = raster.rgb.data() + i * 3;
-                    const int luma = (2126 * rgb[0] + 7152 * rgb[1] + 722 * rgb[2] + 5000) / 10000;
-                    auto &cell = tone.darkness[row + size_t((x + 0.5) * MM_PER_PX / SurfaceTone::cell_mm)];
-                    // Keep narrow dark contours from disappearing when reducing raster resolution.
-                    cell = std::max(cell, uint8_t(255 - luma));
-                }
+            char     dir[64];
+            std::snprintf(dir, sizeof(dir), "layer_%04zu", layer->id());
+            std::vector<uint8_t> encoded(bands.size(), 1);
+            if (params.encode_strips) {
+                // A large layer may consume the layer-worker budget by itself. Its strips still
+                // encode independently: only insertion into the ZIP needs the shared lock.
+                // The strip, Q16 RGB, classes, row errors and packed output fit in 12 bytes per
+                // source pixel plus fixed scratch. Raster/preview buffers stay read-only here.
+                double max_strip_pixels = 0.;
+                for (const MmBand& band : bands)
+                    max_strip_pixels = std::max(max_strip_pixels,
+                        std::max(1., std::round((band.x1 - band.x0) / MM_PER_PX)) * MBD_STRIP_ROWS);
+                const double strip_bytes = 12. * max_strip_pixels + 2. * 1024. * 1024.;
+                const double resident_bytes = double(raster.hit.capacity()) + double(raster.rgb.capacity());
+                const double available_bytes = 384. * 1024. * 1024. / workers - resident_bytes;
+                const size_t strip_workers = std::min(bands.size(), size_t(std::max(1., std::min(8.,
+                    std::floor(available_bytes / strip_bytes)))));
+                tbb::parallel_for(size_t(0), strip_workers, [&](size_t strip_worker) {
+                    for (size_t block = bands.size() * strip_worker / strip_workers;
+                         block < bands.size() * (strip_worker + 1) / strip_workers; ++block) {
+                        char entry[160];
+                        std::snprintf(entry, sizeof(entry), "%s%s/%05zu.mbd", prefix.c_str(), dir, block);
+                        encoded[block] = uint8_t(write_strip(zip, entry, raster, bands[block], params, &zip_mutex));
+                    }
+                });
+            }
+            for (size_t block = 0; block < bands.size(); ++block) {
+                if (!encoded[block])
+                    continue;
+                worker_written += size_t(params.encode_strips);
+                ink.bands.push_back(InkBand{ scaled<coordf_t>(bands[block].y_center), scaled<coordf_t>(bands[block].x0),
+                                       scaled<coordf_t>(bands[block].x1) });
+            }
+            if (! ink.empty()) {
+                const std::lock_guard<std::mutex> lock(result_mutex);
+                layers.emplace(layer, std::move(ink));
             }
         }
-        char     dir[64];
-        std::snprintf(dir, sizeof(dir), "layer_%04zu", layer->id());
-        for (size_t block = 0; block < bands.size(); ++block) {
-            if (progress)
-                progress(0.05 + 0.9 * (layer_index - 1 + 0.75 + 0.25 * double(block) / bands.size()) /
-                                      std::max<size_t>(1, object.layers().size()),
-                         "纹理切片：第 " + std::to_string(layer_index) + "/" + std::to_string(object.layers().size()) + " 层");
-            char entry[160];
-            std::snprintf(entry, sizeof(entry), "%s%s/%05zu.mbd", prefix.c_str(), dir, block);
-            if (params.encode_strips && ! write_strip(zip, entry, raster, bands[block], params))
-                continue;
-            if (params.encode_strips)
-                ++written;
-            ink.bands.push_back(InkBand{ scaled<coordf_t>(bands[block].y_center), scaled<coordf_t>(bands[block].x0),
-                                   scaled<coordf_t>(bands[block].x1) });
-        }
-        if (! ink.empty())
-            layers.emplace(layer, std::move(ink));
+        const std::lock_guard<std::mutex> lock(result_mutex);
+        written += worker_written;
+    });
+    size_t valid_previews = 0;
+    for (size_t i = 0; i < preview_layers.size(); ++i) {
+        if (preview_layers[i].first == std::numeric_limits<size_t>::max())
+            continue;
+        preview_layers[valid_previews] = preview_layers[i];
+        preview_ink_px[valid_previews++] = preview_ink_px[i];
     }
+    preview_layers.resize(valid_previews);
+    preview_ink_px.resize(valid_previews);
     if (progress)
         progress(0.95, "纹理切片：第 " + std::to_string(object.layers().size()) + "/" + std::to_string(object.layers().size()) + " 层");
     if (written > 0)

@@ -119,6 +119,7 @@ Slic3r::ExtrusionRole convert(EGCodeExtrusionRole role)
     case EGCodeExtrusionRole::Custom:                   { return Slic3r::ExtrusionRole::erCustom; }
     case EGCodeExtrusionRole::InkjetPath:               { return Slic3r::ExtrusionRole::erMkpInkjetPath; }
     case EGCodeExtrusionRole::SurfacePath:              { return Slic3r::ExtrusionRole::erMkpSurfacePath; }
+    case EGCodeExtrusionRole::InkSeal:                  { return Slic3r::ExtrusionRole::erMkpInkSeal; }
     // ORCA
     case EGCodeExtrusionRole::BottomSurface:            { return Slic3r::ExtrusionRole::erBottomSurface; }
     case EGCodeExtrusionRole::InternalBridgeInfill:     { return Slic3r::ExtrusionRole::erInternalBridgeInfill; }
@@ -150,6 +151,7 @@ EGCodeExtrusionRole convert(Slic3r::ExtrusionRole role)
     case Slic3r::ExtrusionRole::erCustom:                      { return EGCodeExtrusionRole::Custom; }
     case Slic3r::ExtrusionRole::erMkpInkjetPath:               { return EGCodeExtrusionRole::InkjetPath; }
     case Slic3r::ExtrusionRole::erMkpSurfacePath:              { return EGCodeExtrusionRole::SurfacePath; }
+    case Slic3r::ExtrusionRole::erMkpInkSeal:                  { return EGCodeExtrusionRole::InkSeal; }
     // ORCA
     case Slic3r::ExtrusionRole::erBottomSurface:               { return EGCodeExtrusionRole::BottomSurface; }
     case Slic3r::ExtrusionRole::erInternalBridgeInfill:        { return EGCodeExtrusionRole::InternalBridgeInfill; }

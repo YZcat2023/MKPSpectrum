@@ -25,6 +25,10 @@ uniform vec4 uniform_color;
 // match has to be perceptual - the same reason the CPU side uses CIEDE2000 - and converting the
 // palette once on the CPU is what lets the fragment shader match with a plain squared distance.
 // Count 0 means nothing is colouring, and every fragment falls back to uniform_color as before.
+uniform bool projection_frame_enabled;
+uniform mat4 projection_frame;
+uniform mat3 projection_normal;
+uniform mat3 projection_gradient;
 uniform vec3      palette_lab[64];
 uniform vec3      palette_rgb[64];
 uniform int       palette_count;
@@ -92,6 +96,11 @@ float box_face_sign(float n) { return n >= 0.0 ? 1.0 : -1.0; }
 // project_cylindrical() and project_spherical(). `n` is read by the planar mode only.
 vec2 projection_raw(vec3 p, vec3 n)
 {
+    if (projection_frame_enabled) {
+        p = (projection_frame * vec4(p, 1.0)).xyz;
+        n = normalize(projection_normal * n);
+    }
+
     if (projection_mode == 1) {                 // Cylindrical: (arc length around, distance along)
         vec3  up, right, fwd;
         cylinder_frame(up, right, fwd);
@@ -126,7 +135,7 @@ vec2 projection_raw(vec3 p, vec3 n)
 // Cylindrical and Spherical are arc-length parametrized, so it is 1 there too, except for the
 // spherical longitude, whose circle shrinks by cos(latitude) toward the poles. Exact where the surface
 // really is the cylinder/sphere the projection assumes - the same assumption libslic3r makes.
-void projection_axes(vec3 p, vec3 n, out vec3 t, out vec3 b, out vec2 units_per_mm)
+void source_projection_axes(vec3 p, vec3 n, out vec3 t, out vec3 b, out vec2 units_per_mm)
 {
     units_per_mm = vec2(1.0, 1.0);
     if (projection_mode == 1) {
@@ -159,6 +168,18 @@ void projection_axes(vec3 p, vec3 n, out vec3 t, out vec3 b, out vec2 units_per_
     } else {                                   // planar = (+-x, -y)
         t = vec3(box_face_sign(n.z), 0.0, 0.0);
         b = vec3(0.0, -1.0, 0.0);
+    }
+}
+
+void projection_axes(vec3 p, vec3 n, out vec3 t, out vec3 b, out vec2 units_per_mm)
+{
+    if (projection_frame_enabled) {
+        source_projection_axes((projection_frame * vec4(p, 1.0)).xyz,
+                               normalize(projection_normal * n), t, b, units_per_mm);
+        t = projection_gradient * t;
+        b = projection_gradient * b;
+    } else {
+        source_projection_axes(p, n, t, b, units_per_mm);
     }
 }
 

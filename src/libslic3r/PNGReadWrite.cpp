@@ -245,7 +245,8 @@ bool is_decodable_8bit_png(const ReadBuf &pngbuf)
 // Based on https://www.lemoda.net/c/write-png/
 // png_color_type is PNG_COLOR_TYPE_RGB or PNG_COLOR_TYPE_GRAY
 //FIXME maybe better to use tdefl_write_image_to_png_file_in_memory() instead?
-static bool write_rgb_or_gray_to_file(const char *file_name_utf8, size_t width, size_t height, int png_color_type, const uint8_t *data)
+static bool write_rgb_or_gray_to_file(const char *file_name_utf8, size_t width, size_t height, int png_color_type,
+                                     const uint8_t *data, bool fast_rgba = false)
 {
     bool         result       = false;
 
@@ -288,6 +289,22 @@ static bool write_rgb_or_gray_to_file(const char *file_name_utf8, size_t width, 
         PNG_INTERLACE_NONE,
         PNG_COMPRESSION_TYPE_DEFAULT,
         PNG_FILTER_TYPE_DEFAULT);
+
+    if (fast_rgba) {
+        // Texture review overlays are large, mostly transparent canvases. Trying every PNG
+        // filter and copying the entire image costs more than rasterising the texture.
+        // Stream the unchanged RGBA rows with fast lossless compression instead; the file
+        // can be larger, but decoded colours, alpha and dimensions are identical.
+        png_set_filter(png_ptr, PNG_FILTER_TYPE_BASE, PNG_FILTER_NONE);
+        png_set_compression_level(png_ptr, 1);
+        png_init_io(png_ptr, fp);
+        png_write_info(png_ptr, info_ptr);
+        for (size_t y = 0; y < height; ++y)
+            png_write_row(png_ptr, data + width * 4 * y);
+        png_write_end(png_ptr, info_ptr);
+        result = true;
+        goto png_failure;
+    }
 
     // Initialize rows of PNG.
     row_pointers = reinterpret_cast<png_byte**>(::png_malloc(png_ptr, height * sizeof(png_byte*)));
@@ -347,7 +364,7 @@ bool write_gray_to_file(const char *file_name_utf8, size_t width, size_t height,
 
 bool write_rgba_to_file(const char *file_name_utf8, size_t width, size_t height, const uint8_t *data_rgba)
 {
-    return write_rgb_or_gray_to_file(file_name_utf8, width, height, PNG_COLOR_TYPE_RGBA, data_rgba);
+    return write_rgb_or_gray_to_file(file_name_utf8, width, height, PNG_COLOR_TYPE_RGBA, data_rgba, true);
 }
 
 bool write_rgba_to_file(const std::string &file_name_utf8, size_t width, size_t height, const uint8_t *data_rgba)
@@ -359,6 +376,46 @@ bool write_rgba_to_file(const std::string &file_name_utf8, size_t width, size_t 
 {
     assert(width * height * 4 == data_rgba.size());
     return write_rgba_to_file(file_name_utf8.c_str(), width, height, data_rgba.data());
+}
+
+bool write_rgba_rows_to_file(const std::string &file_name_utf8, size_t width, size_t height,
+                            const std::function<void(size_t, uint8_t*)> &render_row)
+{
+    struct Writer {
+        FILE* file = nullptr;
+        png_structp png = nullptr;
+        png_infop info = nullptr;
+        ~Writer() {
+            if (png)
+                png_destroy_write_struct(&png, &info);
+            if (file)
+                fclose(file);
+        }
+    } writer;
+    std::vector<uint8_t> row(width * 4);
+    writer.file = boost::nowide::fopen(file_name_utf8.c_str(), "wb");
+    if (!writer.file)
+        return false;
+    writer.png = png_create_write_struct(PNG_LIBPNG_VER_STRING, nullptr, nullptr, nullptr);
+    if (!writer.png)
+        return false;
+    writer.info = png_create_info_struct(writer.png);
+    if (!writer.info)
+        return false;
+    if (setjmp(png_jmpbuf(writer.png)))
+        return false;
+    png_set_IHDR(writer.png, writer.info, png_uint_32(width), png_uint_32(height), 8,
+        PNG_COLOR_TYPE_RGBA, PNG_INTERLACE_NONE, PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
+    png_set_filter(writer.png, PNG_FILTER_TYPE_BASE, PNG_FILTER_NONE);
+    png_set_compression_level(writer.png, 1);
+    png_init_io(writer.png, writer.file);
+    png_write_info(writer.png, writer.info);
+    for (size_t y = 0; y < height; ++y) {
+        render_row(y, row.data());
+        png_write_row(writer.png, row.data());
+    }
+    png_write_end(writer.png, writer.info);
+    return true;
 }
 
 bool write_gray_to_file(const std::string &file_name_utf8, size_t width, size_t height, const uint8_t *data_gray)

@@ -13,6 +13,7 @@
 
 #include <cereal/cereal.hpp>
 #include <cereal/types/array.hpp> // view_project_matrix is a std::array<float, 12>
+#include <cereal/types/memory.hpp>
 #include <cereal/types/string.hpp>
 #include <cereal/types/vector.hpp>
 
@@ -206,6 +207,32 @@ struct TextureAdjustments
 // onto overlapping areas of the same volume: their displacements are combined per vertex, in slot
 // order, each layer folding into the total via its own TextureBlendMode (see
 // build_texture_displacement()). This is what "layered/blended" texture displacement means here.
+// A cut keeps sampling in the original projection frame. The source patch is
+// needed only for an unwrap; analytic projections retain just their patch frame.
+// Sharing it keeps repeated cuts from duplicating the original unwrap mesh.
+struct TextureProjectionReference
+{
+    Vec3f center = Vec3f::Zero();
+    Vec3f axis = Vec3f::UnitZ();
+    std::vector<Vec3f> vertices;
+    std::vector<stl_triangle_vertex_indices> triangles;
+    std::vector<Vec2f> corner_uv;
+
+    template<class Archive> void serialize(Archive &ar)
+    {
+        ar(center, axis, vertices, triangles, corner_uv);
+    }
+};
+
+struct TextureProjectionAnchor
+{
+    std::shared_ptr<TextureProjectionReference> reference;
+    std::array<double, 12> position{1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0.};
+    std::array<double, 9> normal{1., 0., 0., 0., 1., 0., 0., 0., 1.};
+
+    template<class Archive> void serialize(Archive &ar) { ar(reference, position, normal); }
+};
+
 struct TextureDisplacementLayer
 {
     // Index into ModelVolume::texture_displacement_facets, assigned once when the layer is
@@ -353,6 +380,8 @@ struct TextureDisplacementLayer
     // for the boundary to be drawn on.
     bool color_enabled = false;
 
+    std::shared_ptr<TextureProjectionAnchor> projection_anchor;
+
     bool empty() const { return !image_data || image_data->empty(); }
 
     template<class Archive> void save(Archive &ar) const
@@ -362,7 +391,7 @@ struct TextureDisplacementLayer
            static_cast<int>(tile_method), static_cast<int>(projection_method), lscm_seam_angle_deg, islands,
            static_cast<int>(blend_mode), midlevel, island_padding_mm, lscm_seam_edges, view_project_right,
            view_project_up, smoothing, edge_smoothing, edge_smoothing_amount, auto_connect_islands, island_groups,
-           lscm_uv_overrides, view_project_projective, view_project_matrix, color_enabled);
+           lscm_uv_overrides, view_project_projective, view_project_matrix, color_enabled, projection_anchor);
     }
     template<class Archive> void load(Archive &ar)
     {
@@ -374,13 +403,20 @@ struct TextureDisplacementLayer
            tile_method_int, projection_method_int, lscm_seam_angle_deg, islands, blend_mode_int, midlevel,
            island_padding_mm, lscm_seam_edges, view_project_right, view_project_up, smoothing, edge_smoothing,
            edge_smoothing_amount, auto_connect_islands, island_groups, lscm_uv_overrides, view_project_projective,
-           view_project_matrix, color_enabled);
+           view_project_matrix, color_enabled, projection_anchor);
         image_data        = blob.empty() ? nullptr : std::make_shared<std::vector<unsigned char>>(blob.begin(), blob.end());
         tile_method       = static_cast<TextureTileMethod>(tile_method_int);
         projection_method = static_cast<TextureProjectionMethod>(projection_method_int);
         blend_mode        = static_cast<TextureBlendMode>(blend_mode_int);
     }
 };
+
+// target_to_source maps new mesh coordinates into the old mesh's coordinates.
+Transform3d texture_projection_transform(const TextureDisplacementLayer &layer);
+void transform_texture_projection(TextureDisplacementLayer &layer, const Transform3d &target_to_source);
+std::vector<TextureDisplacementLayer> texture_layers_in_frame(
+    const std::vector<TextureDisplacementLayer> &layers, const Transform3d &local_to_frame);
+void freeze_texture_projections(ModelVolume &volume);
 
 
 // Settings that apply to the whole layer stack rather than to one layer, held per ModelVolume next

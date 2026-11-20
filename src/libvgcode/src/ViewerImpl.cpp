@@ -337,6 +337,7 @@ static const std::array<Color, size_t(EGCodeExtrusionRole::COUNT)> DEFAULT_EXTRU
     // MKPSpectrum
     {   0, 188, 212 }, // InkjetPath
     { 233,  30,  99 }, // SurfacePath
+    { 156, 108, 230 }, // InkSeal
 } };
 
 static const std::array<Color, size_t(EOptionType::COUNT)> DEFAULT_OPTIONS_COLORS{ {

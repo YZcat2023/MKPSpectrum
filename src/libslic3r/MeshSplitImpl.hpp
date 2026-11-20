@@ -140,7 +140,7 @@ struct SplitOutputFn {
 
 // Splits a mesh into multiple meshes when possible.
 template<class Its, class OutputIt>
-void its_split(const Its &m, OutputIt out_it)
+void its_split(const Its &m, OutputIt out_it, std::vector<std::vector<int>>* source_faces = nullptr)
 {
     using namespace meshsplit_detail;
 
@@ -161,6 +161,8 @@ void its_split(const Its &m, OutputIt out_it)
         visitor.visit([&facets](size_t idx) { facets.emplace_back(idx); return true; });
         if (facets.empty())
             break;
+        if (source_faces)
+            source_faces->emplace_back(facets.begin(), facets.end());
 
         // Create a new mesh for the part that was just split off.
         indexed_triangle_set mesh;

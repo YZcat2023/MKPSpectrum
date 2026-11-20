@@ -8540,6 +8540,51 @@ void PrintConfigDef::init_fff_params()
     def->min = 0.05;
     def->max = 10.0;
     def->set_default_value(new ConfigOptionFloat(0.62675));
+    def = this->add("mkp_ink_seal_enabled", coBool);
+    def->label = L("喷墨后封墨");
+    def->tooltip = L("仅在实际喷墨后覆盖该层全部外露顶面，上方还要继续打印的区域不覆盖。封墨是当前层的附加挤出路径，不新增打印层，也不改变后续层高。");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionBool(true));
+
+    def = this->add("mkp_ink_seal_height", coFloat);
+    def->label = L("封墨厚度");
+    def->sidetext = L("mm");
+    def->tooltip = L("在外露顶面上额外打印的厚度，用于计算封墨高度和挤出量。");
+    def->min = 0.001;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(0.06));
+
+    def = this->add("mkp_ink_seal_speed", coFloat);
+    def->label = L("封墨速度");
+    def->sidetext = L("mm/s");
+    def->min = 1.;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(45.));
+
+    def = this->add("mkp_ink_seal_flow", coPercent);
+    def->label = L("封墨流量");
+    def->sidetext = "%";
+    def->tooltip = L("相对于封墨厚度和线宽所需的正常挤出量；100% 为完整打印流量，不使用熨烫的低流量。");
+    def->min = 0.;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionPercent(100.));
+
+    def = this->add("mkp_ink_seal_width", coPercent);
+    def->label = L("封墨线宽");
+    def->sidetext = "%";
+    def->tooltip = L("相对于当前区域的顶层线宽；100% 使用相同线宽。");
+    def->min = 1.;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionPercent(100.));
+
+    def = this->add("mkp_ink_seal_pattern", coEnum);
+    def->label = L("封墨图案");
+    def->tooltip = L("使用与原生熨烫相同的直线或同心图案生成封墨走线。");
+    def->enum_keys_map = &ConfigOptionEnum<InfillPattern>::get_enum_values();
+    def->enum_values = {"rectilinear", "concentric"};
+    def->enum_labels = {L("直线"), L("同心")};
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionEnum<InfillPattern>(ipRectilinear));
     // ================= MKP inkjet device (machine) =================
     def = this->add("mkp_inkjet_device", coEnum);
     def->label = L("喷墨设备");
@@ -13104,7 +13149,7 @@ std::map<std::string, std::string> validate(const FullPrintConfig &cfg, bool und
 #define PRINT_CONFIG_CACHE_ELEMENT_INITIALIZATION(r, data, CLASS_NAME) Slic3r::CLASS_NAME::initialize_cache();
 #define PRINT_CONFIG_CACHE_INITIALIZE(CLASSES_SEQ)     BOOST_PP_SEQ_FOR_EACH(PRINT_CONFIG_CACHE_ELEMENT_DEFINITION, _, BOOST_PP_TUPLE_TO_SEQ(CLASSES_SEQ))     int print_config_static_initializer() {         /* For some reason it's important this function doesn't get optimized out, so this should work. */         static volatile int ret = 1;         BOOST_PP_SEQ_FOR_EACH(PRINT_CONFIG_CACHE_ELEMENT_INITIALIZATION, _, BOOST_PP_TUPLE_TO_SEQ(CLASSES_SEQ))         return ret;     }
 PRINT_CONFIG_CACHE_INITIALIZE((
-    PrintObjectConfig, PrintRegionConfig, MachineEnvelopeConfig, GCodeConfig, PrintConfig, FullPrintConfig,
+    PrintObjectConfig, PrintRegionConfig, MachineEnvelopeConfig, GCodeConfig, InkSealConfig, PrintConfig, FullPrintConfig,
     SLAMaterialConfig, SLAPrintConfig, SLAPrintObjectConfig, SLAPrinterConfig, SLAFullPrintConfig))
 static int print_config_static_initialized = print_config_static_initializer();
 
@@ -13120,7 +13165,7 @@ static int print_config_static_initialized = print_config_static_initializer();
         return true; \
     }
 BOOST_PP_SEQ_FOR_EACH(PRINT_CONFIG_APPLY_TO_DEFINITION, _, (PrintObjectConfig)(PrintRegionConfig)(MachineEnvelopeConfig)(GCodeConfig)
-    (SLAMaterialConfig)(SLAPrintConfig)(SLAPrintObjectConfig)(SLAPrinterConfig))
+    (InkSealConfig)(SLAMaterialConfig)(SLAPrintConfig)(SLAPrintObjectConfig)(SLAPrinterConfig))
 #undef PRINT_CONFIG_APPLY_TO_DEFINITION
 
 //BBS: remove unused command currently

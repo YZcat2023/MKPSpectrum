@@ -12,6 +12,14 @@ namespace Slic3r {
 
 using ModelObjectPtrs = std::vector<ModelObject*>;
 
+// Carries source-face texture attributes across a topology change with known provenance.
+// Both mesh frames are related by source_to_mesh; -1 source faces remain untextured.
+void transfer_cut_texture(ModelVolume& volume, const ModelVolume& source, const TriangleMesh& mesh,
+                          const std::vector<int>& face_sources, const Transform3d& source_to_mesh);
+std::vector<indexed_triangle_set> split_mesh_with_source_faces(
+    const indexed_triangle_set& mesh, std::vector<std::vector<int>>& source_faces);
+bool has_cut_texture_layers(const ModelVolume& volume);
+
 // A connector hole reaches this far out of the cut face, so the face is open instead of covered by a coplanar skin.
 inline constexpr double CONNECTOR_HOLE_OVERLAP = 0.05;
 

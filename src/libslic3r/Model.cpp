@@ -1,4 +1,5 @@
 #include "Model.hpp"
+#include "CutUtils.hpp"
 #include "calib.hpp"
 #include "Format/STEP.hpp"
 #include "TriangleMesh.hpp"
@@ -47,6 +48,7 @@
 
 #include <Eigen/Core>
 #include <algorithm>
+#include <numeric>
 #include <cstddef>
 #include <cassert>
 #include <cstdlib>
@@ -361,6 +363,8 @@ void attach_inkjet_texture_source(Model &model)
     if (! model.texture_mesh || model.texture_mesh->textures.empty())
         return;
     const TexturedMesh &textured = *model.texture_mesh;
+    std::shared_ptr<TextureDisplayData> display;
+    bool display_attempted = false;
     size_t attached = 0;
     for (ModelObject *object : model.objects)
         for (ModelVolume *volume : object->volumes) {
@@ -369,6 +373,19 @@ void attach_inkjet_texture_source(Model &model)
             // Only where the volume still holds the very mesh the layout was measured on.
             if (volume->mesh().its.indices.size() != textured.indices.size())
                 continue;
+            // Project saving stores the image and UV layout on the volume, not on the transient
+            // import mesh. Attach it here too: native/CLI imports must survive a cut and reload
+            // without relying on Plater's display-only setup having run first.
+            if (!volume->display_texture || volume->display_texture->empty()) {
+                if (!display_attempted) {
+                    display_attempted = true;
+                    auto candidate = std::make_shared<TextureDisplayData>();
+                    if (build_texture_display_data(textured, *candidate) && !candidate->empty())
+                        display = std::move(candidate);
+                }
+                if (display)
+                    volume->display_texture = display;
+            }
             if (! volume->texture_displacement_layers.empty())
                 continue;
             int texture_index = -1;
@@ -2345,6 +2362,7 @@ static void invalidate_translations(ModelObject* object, const ModelInstance* sr
 void ModelObject::split(ModelObjectPtrs* new_objects, const bool remap_paint)
 {
     std::vector<TriangleMesh> all_meshes;
+    std::vector<std::vector<int>> all_source_faces;
     std::vector<Transform3d> all_transfos;
     std::vector<std::pair<int, int>> volume_mesh_counts;
     all_meshes.reserve(this->volumes.size() * 5);
@@ -2366,13 +2384,24 @@ void ModelObject::split(ModelObjectPtrs* new_objects, const bool remap_paint)
                 saved_painting = volume->save_painting();
             }
             //BBS: not multi volume object, then split mesh.
-            std::vector<TriangleMesh> volume_meshes = volume->mesh().split();
+            std::vector<std::vector<int>> source_faces;
+            std::vector<TriangleMesh> volume_meshes;
+            freeze_texture_projections(*volume);
+            const bool textured = volume->has_texture_uv() || bool(volume->display_texture) ||
+                has_cut_texture_layers(*volume);
+            if (textured) {
+                for (auto& its : split_mesh_with_source_faces(volume->mesh().its, source_faces))
+                    volume_meshes.emplace_back(std::move(its));
+            } else
+                volume_meshes = volume->mesh().split();
             int mesh_count = 0;
-            for (TriangleMesh& mesh : volume_meshes) {
+            for (size_t mi = 0; mi < volume_meshes.size(); ++mi) {
+                TriangleMesh& mesh = volume_meshes[mi];
                 if (mesh.facets_count() < 3)
                     continue;
 
                 all_meshes.emplace_back(std::move(mesh));
+                all_source_faces.emplace_back(textured ? std::move(source_faces[mi]) : std::vector<int>{});
                 all_transfos.emplace_back(volume->get_matrix());
                 mesh_count++;
             }
@@ -2381,6 +2410,13 @@ void ModelObject::split(ModelObjectPtrs* new_objects, const bool remap_paint)
             //BBS: multi volume object, then only split to volume
             if (volume->mesh().facets_count() >= 3) {
                 all_meshes.emplace_back(std::move(volume->mesh()));
+                // Retain the source geometry until its texture attributes have been copied.
+                all_source_faces.emplace_back();
+                if (volume->has_texture_uv() || volume->display_texture) {
+                    auto& faces = all_source_faces.back();
+                    faces.resize(volume->mesh().facets_count());
+                    std::iota(faces.begin(), faces.end(), 0);
+                }
                 all_transfos.emplace_back(volume->get_matrix());
                 volume_mesh_counts.push_back({ volume_idx, 1 });
             }
@@ -2396,6 +2432,7 @@ void ModelObject::split(ModelObjectPtrs* new_objects, const bool remap_paint)
         ModelVolume* volume = this->volumes[mesh_info.first];
 
         std::vector<TriangleMesh> meshes;
+        const int source_faces_begin = volume_mesh_begin;
         for (int mesh_idx = volume_mesh_begin; mesh_idx < volume_mesh_begin + mesh_info.second; mesh_idx++) {
             meshes.emplace_back(std::move(all_meshes[mesh_idx]));
         }
@@ -2429,6 +2466,7 @@ void ModelObject::split(ModelObjectPtrs* new_objects, const bool remap_paint)
             new_object->instances.reserve(this->instances.size());
             for (const ModelInstance* model_instance : this->instances)
                 new_object->add_instance(*model_instance);
+            const Vec3d recenter_shift = mesh.bounding_box().center();
             ModelVolume* new_vol = new_object->add_volume(*volume, std::move(mesh));
 
             if (is_multi_volume_object) {
@@ -2443,6 +2481,11 @@ void ModelObject::split(ModelObjectPtrs* new_objects, const bool remap_paint)
                 // Geometry changed, attempt to remap them to the new mesh
                 new_vol->restore_painting(saved_painting);
             }
+            const size_t mesh_index = size_t(&mesh - meshes.data());
+            const auto& source_faces = all_source_faces[size_t(source_faces_begin) + mesh_index];
+            if (!source_faces.empty())
+                transfer_cut_texture(*new_vol, *volume, new_vol->mesh(), source_faces,
+                    Geometry::translation_transform(-recenter_shift));
 
             // BBS: clear volume's config, as we already set them into object
             new_vol->config.reset();
@@ -3089,9 +3132,17 @@ std::string ModelVolume::type_to_string(const ModelVolumeType t)
 // This is useful to assign different materials to different volumes of an object.
 size_t ModelVolume::split(unsigned int max_extruders, bool remap_paint)
 {
-    std::vector<TriangleMesh> meshes = this->mesh().split();
+    const bool textured = has_texture_uv() || bool(display_texture) || has_cut_texture_layers(*this);
+    std::vector<std::vector<int>> source_faces;
+    std::vector<TriangleMesh> meshes;
+    if (textured) {
+        for (auto& its : split_mesh_with_source_faces(this->mesh().its, source_faces))
+            meshes.emplace_back(std::move(its));
+    } else
+        meshes = this->mesh().split();
     if (meshes.size() <= 1)
         return 1;
+    freeze_texture_projections(*this);
 
     // splited volume should not be text object
     if (text_configuration.has_value())
@@ -3099,13 +3150,18 @@ size_t ModelVolume::split(unsigned int max_extruders, bool remap_paint)
 
     // Parts without a convex hull enclose no volume; drop them here, as deleting volumes later could delete this one.
     std::vector<std::unique_ptr<ModelVolume>> parts;
-    for (TriangleMesh &mesh : meshes)
+    for (size_t mi = 0; mi < meshes.size(); ++mi) {
+        TriangleMesh& mesh = meshes[mi];
         if (!mesh.empty()) {
             std::unique_ptr<ModelVolume> part(new ModelVolume(object, *this, std::move(mesh)));
             if (const std::shared_ptr<const TriangleMesh> &hull = part->get_convex_hull_shared_ptr();
-                hull != nullptr && !hull->its.vertices.empty() && !hull->its.indices.empty())
+                hull != nullptr && !hull->its.vertices.empty() && !hull->its.indices.empty()) {
+                if (textured)
+                    transfer_cut_texture(*part, *this, part->mesh(), source_faces[mi], Transform3d::Identity());
                 parts.emplace_back(std::move(part));
+            }
         }
+    }
     if (parts.empty())
         return 1;
 
@@ -3129,6 +3185,16 @@ size_t ModelVolume::split(unsigned int max_extruders, bool remap_paint)
 
             // BBS: reset facet annotations
             this->reset_extra_facets();
+            if (textured) {
+                texture_uv = part->texture_uv;
+                display_texture = part->display_texture;
+                texture_displacement_layers = part->texture_displacement_layers;
+                texture_displacement_options = part->texture_displacement_options;
+                for (size_t slot = 0; slot < TEXTURE_DISPLACEMENT_MAX_LAYERS; ++slot) {
+                    auto data = part->texture_displacement_facet(int(slot)).get_data();
+                    texture_displacement_facet(int(slot)).set_data(std::move(data));
+                }
+            }
         }
         else
             this->object->volumes.insert(this->object->volumes.begin() + (++ivolume), part.release());
@@ -3137,13 +3203,28 @@ size_t ModelVolume::split(unsigned int max_extruders, bool remap_paint)
         this->object->volumes[ivolume]->source = ModelVolume::Source();
         this->object->volumes[ivolume]->set_offset(Vec3d::Zero());
         this->object->volumes[ivolume]->center_geometry_after_creation();
+        if (textured) {
+            // UVs are per corner and survive translation. View projectors map
+            // positions, so compose the local recentering into their constant.
+            auto* centered = this->object->volumes[ivolume];
+            const Vec3f shift = centered->mesh().get_init_shift().cast<float>();
+            for (auto &layer : centered->texture_displacement_layers)
+                transform_texture_projection(layer, Transform3d(Eigen::Translation3d(shift.cast<double>())));
+
+            for (auto& layer : centered->texture_displacement_layers)
+                if (layer.projection_method == TextureProjectionMethod::ViewProjected && layer.view_project_projective)
+                    for (size_t row = 0; row < 3; ++row)
+                        for (size_t column = 0; column < 3; ++column)
+                            layer.view_project_matrix[row * 4 + 3] +=
+                                layer.view_project_matrix[row * 4 + column] * shift[int(column)];
+        }
         this->object->volumes[ivolume]->translate(offset);
         this->object->volumes[ivolume]->name = name + "_" + std::to_string(idx + 1);
         //BBS: always set the extruder id the same as original
         this->object->volumes[ivolume]->config.set("extruder", this->extruder_id());
         //this->object->volumes[ivolume]->config.set("extruder", auto_extruder_id(max_extruders, extruder_counter));
         this->object->volumes[ivolume]->m_is_splittable = 0;
-        this->object->volumes[ivolume]->restore_painting(saved_painting);
+        this->object->volumes[ivolume]->restore_painting(saved_painting, textured);
 
         ++ idx;
     }

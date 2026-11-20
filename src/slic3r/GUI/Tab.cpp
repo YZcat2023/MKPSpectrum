@@ -3458,6 +3458,14 @@ void TabPrint::build()
         optgroup->append_single_option_line("mkp_inkjet_dry_time");
         optgroup->append_single_option_line("mkp_inkjet_wall_band");
 
+        optgroup = page->new_optgroup(from_u8("封墨"), L"param_special");
+        optgroup->append_single_option_line("mkp_ink_seal_enabled");
+        optgroup->append_single_option_line("mkp_ink_seal_height");
+        optgroup->append_single_option_line("mkp_ink_seal_speed");
+        optgroup->append_single_option_line("mkp_ink_seal_flow");
+        optgroup->append_single_option_line("mkp_ink_seal_width");
+        optgroup->append_single_option_line("mkp_ink_seal_pattern");
+
         optgroup = page->new_optgroup(from_u8("色调调节"), L"param_special");
         optgroup->append_single_option_line("mkp_inkjet_c");
         optgroup->append_single_option_line("mkp_inkjet_m");
@@ -3617,6 +3625,12 @@ void TabPrint::toggle_options()
         toggle_line("mkp_outer_wall_speed_min", m_config->opt_bool("mkp_outer_wall_linear_speed"));
         if (m_active_page->get_line("mkp_outer_wall_speed_min"))
             m_active_page->update_visibility(m_mode, true);
+    }
+    if (m_config->has("mkp_ink_seal_enabled")) {
+        const bool seal = m_config->opt_bool("mkp_ink_seal_enabled");
+        for (const char *key : {"mkp_ink_seal_height", "mkp_ink_seal_speed", "mkp_ink_seal_flow",
+                                "mkp_ink_seal_width", "mkp_ink_seal_pattern"})
+            toggle_option(key, seal);
     }
     if (m_config->has("mkp_surface_linear_speed")) {
         const bool linear = m_config->opt_bool("mkp_surface_linear_speed");

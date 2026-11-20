@@ -166,6 +166,7 @@ enum class EGCodeExtrusionRole : uint8_t
       // MKPSpectrum
       InkjetPath,
       SurfacePath,
+      InkSeal,
     COUNT
 };
 

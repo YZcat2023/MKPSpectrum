@@ -283,6 +283,12 @@ bool Print::invalidate_state_by_config_options(const ConfigOptionResolver & /* n
         "mkp_inkjet_recovery_length",
         "mkp_inkjet_flush_mode",
         "mkp_inkjet_flush_interval",
+        "mkp_ink_seal_enabled",
+        "mkp_ink_seal_height",
+        "mkp_ink_seal_speed",
+        "mkp_ink_seal_flow",
+        "mkp_ink_seal_width",
+        "mkp_ink_seal_pattern",
         // Belt printer G-code axis remap (only affects G-code output, not slicing).
         "gcode_remap_x",
         "gcode_remap_y",

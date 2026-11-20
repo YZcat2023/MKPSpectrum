@@ -47,6 +47,7 @@ enum ExtrusionRole : uint8_t {
     erMkpSurfacePath,
     // Extrusion role for a collection with multiple extrusion roles.
     erMixed,
+    erMkpInkSeal,
     erCount
 };
 
@@ -85,13 +86,14 @@ inline bool is_infill(ExtrusionRole role)
         || role == erInternalInfill
         || role == erSolidInfill
         || role == erTopSolidInfill
+        || role == erMkpInkSeal
         || role == erBottomSurface
         || role == erIroning;
 }
 
 inline bool is_top_surface(ExtrusionRole role)
 {
-    return role == erTopSolidInfill;
+    return role == erTopSolidInfill || role == erMkpInkSeal;
 }
 
 inline bool is_solid_infill(ExtrusionRole role)
@@ -100,6 +102,7 @@ inline bool is_solid_infill(ExtrusionRole role)
         || role == erInternalBridgeInfill
         || role == erSolidInfill
         || role == erTopSolidInfill
+        || role == erMkpInkSeal
         || role == erBottomSurface
         || role == erIroning;
 }

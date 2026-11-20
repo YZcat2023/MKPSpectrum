@@ -1,7 +1,9 @@
 #include "MkpMbd.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstddef>
 #include <cstring>
 
 namespace Slic3r {
@@ -71,33 +73,47 @@ std::vector<int> resize_halve(const uint8_t *src, int W, int H, int &W2,
     const double support = scale * 3.0;
     const double s       = 1.0 / scale;
 
-    std::vector<int>    idx(size_t(W2) * 16, 0);
-    std::vector<double> wt(size_t(W2) * 16, 0.);
-    std::vector<int>    cnt(size_t(W2), 0);
-    for (int x = 0; x < W2; ++x) {
-        const double bisect = (x + 0.5) / xf + EPS;
-        const int    start  = int(std::max(std::trunc(bisect - support + 0.5), 0.0));
-        const int    stop   = int(std::min(std::trunc(bisect + support + 0.5), double(W)));
-        const int    n      = stop - start;
-        const size_t base   = size_t(x) * 16;
-        double       d      = 0.;
-        for (int k = 0; k < n && k < 16; ++k) {
-            const double w    = lanczos3(s * ((start + k) - bisect + 0.5));
-            idx[base + size_t(k)] = start + k;
-            wt[base + size_t(k)]  = w;
-            d += w;
+    // Adjacent layers commonly emit strips of identical width. Keep one plan per
+    // worker so reuse is bounded and never needs a lock between layer workers.
+    struct ResizePlan {
+        int width = 0;
+        std::vector<int> idx, cnt;
+        std::vector<double> wt;
+    };
+    thread_local ResizePlan plan;
+    if (plan.width != W) {
+        plan.width = 0;
+        plan.idx.assign(size_t(W2) * 16, 0);
+        plan.wt.assign(size_t(W2) * 16, 0.);
+        plan.cnt.assign(size_t(W2), 0);
+        auto &idx = plan.idx;
+        auto &wt = plan.wt;
+        auto &cnt = plan.cnt;
+        for (int x = 0; x < W2; ++x) {
+            const double bisect = (x + 0.5) / xf + EPS;
+            const int    start  = int(std::max(std::trunc(bisect - support + 0.5), 0.0));
+            const int    stop   = int(std::min(std::trunc(bisect + support + 0.5), double(W)));
+            const int    n      = stop - start;
+            const size_t base   = size_t(x) * 16;
+            double       d      = 0.;
+            for (int k = 0; k < n && k < 16; ++k) {
+                const double w    = lanczos3(s * ((start + k) - bisect + 0.5));
+                idx[base + size_t(k)] = start + k;
+                wt[base + size_t(k)]  = w;
+                d += w;
+            }
+            if (d != 0. && d != 1.) {
+                d = 1. / d;
+                for (int k = 0; k < n && k < 16; ++k)
+                    wt[base + size_t(k)] *= d;
+            }
+            cnt[size_t(x)] = n;
         }
-        if (d != 0. && d != 1.) {
-            d = 1. / d;
-            for (int k = 0; k < n && k < 16; ++k)
-                wt[base + size_t(k)] *= d;
-        }
-        cnt[size_t(x)] = n;
+        plan.width = W;
     }
-
-    std::vector<int> qsrc(size_t(W) * size_t(H) * 3);
-    for (size_t i = 0, n = qsrc.size(); i < n; ++i)
-        qsrc[i] = int(src[i]) * 257;
+    const auto &idx = plan.idx;
+    const auto &wt = plan.wt;
+    const auto &cnt = plan.cnt;
 
     std::vector<int> out(size_t(H) * size_t(W2) * 3);
     for (int y = 0; y < H; ++y) {
@@ -111,9 +127,11 @@ std::vector<int> resize_halve(const uint8_t *src, int W, int H, int &W2,
             for (int k = 0; k < n; ++k) {
                 const double w = wt[base + size_t(k)];
                 const size_t p = ro + size_t(idx[base + size_t(k)]) * 3;
-                r += w * double(qsrc[p]);
-                g += w * double(qsrc[p + 1]);
-                b += w * double(qsrc[p + 2]);
+                // The integer expansion is exact; read it on demand instead of keeping
+                // a second full RGB strip at four bytes per channel.
+                r += w * double(int(src[p]) * 257);
+                g += w * double(int(src[p + 1]) * 257);
+                b += w * double(int(src[p + 2]) * 257);
             }
             out[oo + size_t(x) * 3]     = clamp_to_quantum(r);
             out[oo + size_t(x) * 3 + 1] = clamp_to_quantum(g);
@@ -126,11 +144,23 @@ std::vector<int> resize_halve(const uint8_t *src, int W, int H, int &W2,
 // ImageMagick's -colorize: pull every channel straight towards white by `blend` percent.
 void colorize(std::vector<int> &img, int blend, const std::function<void()> &throw_if_canceled)
 {
-    const double b = double(blend);
+    struct BlendTable {
+        int blend = 0;
+        bool ready = false;
+        std::array<int, 65536> values;
+    };
+    thread_local BlendTable table;
+    if (!table.ready || table.blend != blend) {
+        const double b = double(blend);
+        for (size_t i = 0; i < table.values.size(); ++i)
+            table.values[i] = clamp_to_quantum((double(i) * (100.0 - b) + QMAX * b) / 100.0);
+        table.blend = blend;
+        table.ready = true;
+    }
     size_t processed = 0;
     for (int &v : img) {
         if ((processed++ & 65535) == 0 && throw_if_canceled) throw_if_canceled();
-        v = clamp_to_quantum((double(v) * (100.0 - b) + QMAX * b) / 100.0);
+        v = table.values[size_t(v)];
     }
 }
 
@@ -319,35 +349,20 @@ const int HALF1[12][4] = { { 2, 1, 0, 1 }, { 2, 2, 0, 2 }, { 2, 1, 1, 1 }, { 2, 
 std::vector<uint8_t> pack_classes(const std::vector<uint8_t> &cls, int N, int H, int dpi, int pad, int invert,
                                   const std::function<void()> &throw_if_canceled)
 {
-    const size_t pbits_size = size_t(3) * 4 * size_t(N) * 180;
-    std::vector<uint8_t> pbits(pbits_size, 0);
-    for (int y = 0; y < H; ++y) {
-        if (throw_if_canceled) throw_if_canceled();
-        const int    ph   = y & 3;
-        const size_t slot = size_t(4 + (y >> 2));
-        const size_t cy   = size_t(H - 1 - y) * size_t(N);
-        for (int x = 0; x < N; ++x) {
-            const uint8_t c   = cls[cy + size_t(x)];
-            const int    *pal = PALETTE[c & 7];
-            // Channel 0, 1, 2 live in three consecutive blocks of 4*N*180 bytes; inside a block the
-            // phase is the outer index and x the inner one.
-            for (int ch = 0; ch < 3; ++ch) {
-                const size_t pb = (size_t(ch * 4 + ph) * size_t(N) + size_t(x)) * 180 + slot;
-                pbits[pb]       = pal[ch] < 128 ? 1 : 0;
-            }
-        }
-    }
-
     std::vector<uint8_t> arr(size_t(3) * 4 * size_t(N) * 36, 0);
     for (int c = 0; c < 4; ++c)
         for (int ch = 0; ch < 3; ++ch) {
             const int   sel  = SEL[c][ch];
             const int  *offs = TB[sel];
-            const size_t pbase = (size_t(ch) * 4 + size_t(c)) * size_t(N) * 180;
             const size_t abase = (size_t(ch) * 4 + size_t(c)) * size_t(N) * 36;
+            std::ptrdiff_t source_rows[36][5];
+            for (int si = 0; si < 36; ++si)
+                for (int j = 0; j < 5; ++j) {
+                    const int y = (9 * GROUPS[si / 9][j] + offs[si % 9] - 4) * 4 + c;
+                    source_rows[si][j] = y >= 0 && y < H ? std::ptrdiff_t(H - 1 - y) * N : -1;
+                }
             for (int x = 0; x < N; ++x) {
                 if ((x & 255) == 0 && throw_if_canceled) throw_if_canceled();
-                const size_t po = pbase + size_t(x) * 180;
                 const size_t ao = abase + size_t(x) * 36;
                 for (int si = 0; si < 36; ++si) {
                     // Slots are generated q-major then k, and written at k*4+q.
@@ -355,8 +370,15 @@ std::vector<uint8_t> pack_classes(const std::vector<uint8_t> &cls, int N, int H,
                     const int k        = si % 9;
                     const int slot_out = k * 4 + q;
                     int       v        = 0;
-                    for (int j = 0; j < 5; ++j)
-                        v |= pbits[po + size_t(9 * GROUPS[q][j]) + size_t(offs[k])] << j;
+                    for (int j = 0; j < 5; ++j) {
+                        // Invert the original phase/slot layout directly; slots
+                        // outside the image were zero in the expanded bit array.
+                        const auto source_row = source_rows[si][j];
+                        if (source_row >= 0) {
+                            const uint8_t ink = cls[size_t(source_row) + size_t(x)];
+                            v |= int(PALETTE[ink & 7][ch] < 128) << j;
+                        }
+                    }
                     arr[ao + size_t(slot_out)] = uint8_t(v);
                 }
             }

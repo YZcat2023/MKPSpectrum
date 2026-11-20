@@ -63,6 +63,8 @@ struct TextureDisplayData
         int                        height = 0;
         // width * height * 3, RGB, row 0 at v = 0 (any flip is already folded into face_uv).
         std::vector<unsigned char> rgb;
+
+        template<class Archive> void serialize(Archive &ar) { ar(width, height, rgb); }
     };
 
     // The three uvs of every face, corner for corner.
@@ -74,6 +76,18 @@ struct TextureDisplayData
     std::vector<Image>               images;
 
     bool empty() const { return face_uv.empty(); }
+
+    template<class Archive> void serialize(Archive &ar) { ar(face_uv, face_image, face_rgb, images); }
+
+    size_t memsize() const {
+        size_t bytes = sizeof(*this) + face_uv.capacity() * sizeof(face_uv[0]) +
+            face_image.capacity() * sizeof(face_image[0]) + face_rgb.capacity() * sizeof(face_rgb[0]) +
+            images.capacity() * sizeof(Image);
+        for (const auto &image : images) bytes += image.rgb.capacity();
+        return bytes;
+    }
+    size_t release_optional() { return 0; }
+    void restore_optional() {}
 };
 
 // Decode `mesh`'s images and lay its per-face uvs out for TextureDisplayData. False when the mesh

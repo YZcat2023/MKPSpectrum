@@ -80,6 +80,7 @@ struct Settings
 		        // MKPSpectrum
 		        false, // InkjetPath
 		        false, // SurfacePath
+		        true, // InkSeal
 		};
 };
 

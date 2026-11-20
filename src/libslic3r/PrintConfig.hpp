@@ -1982,10 +1982,22 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionFloats,   filament_dev_drying_cooling_temperature))
 )
 
+// Keep the G-code-only sealing controls in their own option sequence: the main
+// PrintConfig sequence is already at the MSVC preprocessor's expansion limit.
+PRINT_CONFIG_CLASS_DEFINE(
+    InkSealConfig,
+    ((ConfigOptionBool,               mkp_ink_seal_enabled))
+    ((ConfigOptionFloat,              mkp_ink_seal_height))
+    ((ConfigOptionFloat,              mkp_ink_seal_speed))
+    ((ConfigOptionPercent,            mkp_ink_seal_flow))
+    ((ConfigOptionPercent,            mkp_ink_seal_width))
+    ((ConfigOptionEnum<InfillPattern>, mkp_ink_seal_pattern))
+)
+
 // This object is mapped to Perl as Slic3r::Config::Print.
 PRINT_CONFIG_CLASS_DERIVED_DEFINE(
     PrintConfig,
-    (MachineEnvelopeConfig, GCodeConfig),
+    (MachineEnvelopeConfig, GCodeConfig, InkSealConfig),
 
     // Build plate tilt for off-axis gravity support generation (printer-level setting).
     ((ConfigOptionFloat,               build_plate_tilt_x))

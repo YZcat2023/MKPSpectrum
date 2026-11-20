@@ -7,6 +7,7 @@
 #include <vector>
 #include <string>
 #include <istream>
+#include <functional>
 
 namespace Slic3r { namespace png {
 
@@ -101,6 +102,10 @@ bool write_gray_to_file(const std::string &file_name_utf8, size_t width, size_t 
 bool write_rgba_to_file(const char *file_name_utf8, size_t width, size_t height, const uint8_t *data_rgba);
 bool write_rgba_to_file(const std::string &file_name_utf8, size_t width, size_t height, const uint8_t *data_rgba);
 bool write_rgba_to_file(const std::string &file_name_utf8, size_t width, size_t height, const std::vector<uint8_t> &data_rgba);
+// Calls render_row in top-to-bottom order with width * 4 writable bytes.
+// Only one row is retained; callback exceptions (including cancellation) propagate.
+bool write_rgba_rows_to_file(const std::string &file_name_utf8, size_t width, size_t height,
+                            const std::function<void(size_t, uint8_t*)> &render_row);
 
 // Scaled variants are mostly useful for debugging purposes, for example to export images of low resolution distance fileds.
 // Scaling is done by multiplying rows and columns without any smoothing to emphasise the original pixels.

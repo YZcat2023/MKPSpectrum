@@ -350,6 +350,18 @@ static void attach_display_texture(Slic3r::Model& model)
     if (!model.texture_mesh)
         return;
 
+    const size_t face_count = model.texture_mesh->indices.size();
+    const bool missing_display = std::any_of(model.objects.begin(), model.objects.end(),
+        [face_count](const Slic3r::ModelObject* object) {
+            return std::any_of(object->volumes.begin(), object->volumes.end(),
+                [face_count](const Slic3r::ModelVolume* volume) {
+                    return volume->is_model_part() && volume->mesh().its.indices.size() == face_count &&
+                        (!volume->display_texture || volume->display_texture->empty());
+                });
+        });
+    if (!missing_display)
+        return;
+
     auto display = std::make_shared<Slic3r::TextureDisplayData>();
     if (!Slic3r::build_texture_display_data(*model.texture_mesh, *display) || display->empty()) {
         BOOST_LOG_TRIVIAL(warning) << "texture display: nothing drawable in the imported texture, keeping the filament colours";
@@ -15626,7 +15638,22 @@ void Plater::priv::update_after_undo_redo(const UndoRedo::Snapshot& snapshot, bo
 {
     get_current_canvas3D()->get_canvas_type() == GLCanvas3D::CanvasAssembleView ? assemble_view->get_canvas3d()->get_selection().clear() : this->view3D->get_canvas3d()->get_selection().clear();
     // Update volumes from the deserializd model, always stop / update the background processing (for both the SLA and FFF technologies).
-    this->update((unsigned int)UpdateParams::FORCE_BACKGROUND_PROCESSING_UPDATE | (unsigned int)UpdateParams::POSTPONE_VALIDATION_ERROR_MESSAGE);
+    // Textured draw buffers also contain positions and per-face UVs. A restored volume may
+    // reuse its ObjectID while its mesh/layout has changed, so the ID alone cannot validate them.
+    const auto has_textured_buffers = [](const GLCanvas3D *canvas) {
+        const auto &volumes = canvas->get_volumes().volumes;
+        return std::any_of(volumes.begin(), volumes.end(),
+                           [](const GLVolume *volume) { return volume->has_texture_display(); });
+    };
+    const bool textured = has_textured_buffers(view3D->get_canvas3d()) ||
+        has_textured_buffers(assemble_view->get_canvas3d()) ||
+        std::any_of(model.objects.begin(), model.objects.end(), [](const ModelObject *object) {
+        return std::any_of(object->volumes.begin(), object->volumes.end(),
+                           [](const ModelVolume *volume) { return bool(volume->display_texture); });
+    });
+    this->update((unsigned int)UpdateParams::FORCE_BACKGROUND_PROCESSING_UPDATE |
+                 (unsigned int)UpdateParams::POSTPONE_VALIDATION_ERROR_MESSAGE |
+                 (textured ? (unsigned int)UpdateParams::FORCE_FULL_SCREEN_REFRESH : 0u));
     // Release old snapshots if the memory allocated is excessive. This may remove the top most snapshot if jumping to the very first snapshot.
     //if (temp_snapshot_was_taken)
     // Release the old snapshots always, as it may have happened, that some of the triangle meshes got deserialized from the snapshot, while some
@@ -16090,8 +16117,11 @@ void Plater::priv::apply_textured_mesh_import_result(Slic3r::Model& loaded_model
                 << "handle_textured_mesh_import: object has " << part_count
                 << " model parts; painting only applied to the first part.";
         }
-        if (Slic3r::apply_painted_mesh_to_volume(painted, remapped_matches, *target)
-            && min_used_filament_1based > 0) {
+        const bool painted_applied = Slic3r::apply_painted_mesh_to_volume(painted, remapped_matches, *target);
+        if (painted_applied)
+            // Filament conversion replaced the mesh; the import display still names its old faces.
+            target->display_texture.reset();
+        if (painted_applied && min_used_filament_1based > 0) {
             target->config.set("extruder", min_used_filament_1based);
             obj->config.set("extruder", min_used_filament_1based);
             if (update_scene) {

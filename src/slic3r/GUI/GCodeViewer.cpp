@@ -421,6 +421,7 @@ static std::string to_string(libvgcode::EGCodeExtrusionRole role)
     // MKPSpectrum
     case libvgcode::EGCodeExtrusionRole::InkjetPath:               { return _u8L("喷墨路径"); }
     case libvgcode::EGCodeExtrusionRole::SurfacePath:              { return _u8L("表面处理"); }
+    case libvgcode::EGCodeExtrusionRole::InkSeal:                  { return _u8L("封墨"); }
     default:                                                       { return _u8L("Unknown"); }
     }
 }

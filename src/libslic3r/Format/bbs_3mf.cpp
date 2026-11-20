@@ -3427,7 +3427,11 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
             add_error("Model texture data does not match the volume's triangles: " + path);
             return;
         }
-        volume.display_texture = display;
+        // UV-only geometry has no display material. Its coordinate channel still
+        // has to survive saving, without introducing a new white material.
+        const bool uv_only = boost::algorithm::iends_with(path, ".uv");
+        if (!uv_only)
+            volume.display_texture = display;
         // The same per-face uv is what an inkjet layer in ModelUV mode places its ink with. Without
         // it the slice falls back to the analytic projections, and a reopened project sprays a tiled
         // picture instead of the one the model was painted with. It is the identical layout, already
@@ -8360,14 +8364,25 @@ static void add_texture_displacement(std::stringstream &stream, const ModelVolum
 static void add_model_texture(std::stringstream &stream, const ModelVolume &volume, mz_zip_archive &archive,
                               const std::string &id)
 {
-    if (!volume.display_texture || volume.display_texture->empty())
+    const bool have_display = volume.display_texture && !volume.display_texture->empty();
+    if (!have_display && !volume.has_texture_uv())
         return;
 
-    const std::vector<unsigned char> blob = texture_display_to_bytes(*volume.display_texture);
+    TextureDisplayData uv_only;
+    if (!have_display) {
+        uv_only.face_uv.resize(volume.mesh().its.indices.size());
+        for (size_t face = 0; face < uv_only.face_uv.size(); ++face)
+            for (size_t k = 0; k < 3; ++k) {
+                const Vec2f& uv = volume.texture_uv[face * 3 + k];
+                uv_only.face_uv[face][k] = {uv.x(), uv.y()};
+            }
+    }
+
+    const std::vector<unsigned char> blob = texture_display_to_bytes(have_display ? *volume.display_texture : uv_only);
     if (blob.empty())
         return;
 
-    const std::string path = std::string(MODEL_TEXTURE_DIR) + id + ".mkt";
+    const std::string path = std::string(MODEL_TEXTURE_DIR) + id + (have_display ? ".mkt" : ".uv");
     // Deflate on top of the PNGs inside: the uvs and the face tables are raw floats and do compress.
     if (!mz_zip_writer_add_mem(&archive, path.c_str(), blob.data(), blob.size(), MZ_DEFAULT_COMPRESSION))
         return;

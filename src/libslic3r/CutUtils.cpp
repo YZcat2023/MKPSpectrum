@@ -7,11 +7,19 @@
 #include "Model.hpp"
 #include "TriangleMeshSlicer.hpp"
 #include "TriangleSelector.hpp"
+#include "TexturePainting.hpp"
+#include "MeshSplitImpl.hpp"
 #include "ObjectID.hpp"
+#include "TextureBake/TextureBakeMesh.hpp"
+#include "TextureBake/TextureBakeRepair.hpp"
 
 #include <algorithm>
+#include <array>
 #include <boost/log/trivial.hpp>
 #include <cassert>
+#include <iterator>
+#include <memory>
+#include <numeric>
 #include <string>
 #include <vector>
 #include <utility>
@@ -24,6 +32,240 @@
 namespace Slic3r {
 
 using namespace Geometry;
+
+static void transfer_cut_texture_impl(ModelVolume& volume, const ModelVolume& source, const TriangleMesh& mesh,
+                                     const std::vector<int>& face_sources, const Transform3d& source_to_mesh,
+                                     bool transfer_paint);
+std::vector<indexed_triangle_set> split_mesh_with_source_faces(
+    const indexed_triangle_set& mesh, std::vector<std::vector<int>>& source_faces)
+{
+    source_faces.clear();
+    std::vector<indexed_triangle_set> result;
+    its_split(mesh, std::back_inserter(result), &source_faces);
+    return result;
+}
+
+class CutPaintSelector : public TriangleSelector
+{
+public:
+    using TriangleSelector::TriangleSelector;
+    std::optional<EnforcerBlockerType> uniform_facet_state(int facet_idx) const
+    {
+        const auto& triangle = m_triangles[size_t(facet_idx)];
+        return triangle.is_split() ? std::nullopt : std::optional<EnforcerBlockerType>(triangle.get_state());
+    }
+};
+
+bool has_cut_texture_layers(const ModelVolume& volume)
+{
+    return !volume.texture_displacement_layers.empty();
+}
+
+namespace {
+
+constexpr size_t CUT_PAINT_CHANNELS = TEXTURE_DISPLACEMENT_MAX_LAYERS + 4;
+
+std::array<FacetsAnnotation*, CUT_PAINT_CHANNELS> cut_paint_channels(ModelVolume& volume)
+{
+    std::array<FacetsAnnotation*, CUT_PAINT_CHANNELS> channels{};
+    for (size_t i = 0; i < TEXTURE_DISPLACEMENT_MAX_LAYERS; ++i)
+        channels[i] = &volume.texture_displacement_facet(int(i));
+    channels[TEXTURE_DISPLACEMENT_MAX_LAYERS] = &volume.supported_facets;
+    channels[TEXTURE_DISPLACEMENT_MAX_LAYERS + 1] = &volume.seam_facets;
+    channels[TEXTURE_DISPLACEMENT_MAX_LAYERS + 2] = &volume.mmu_segmentation_facets;
+    channels[TEXTURE_DISPLACEMENT_MAX_LAYERS + 3] = &volume.fuzzy_skin_facets;
+    return channels;
+}
+
+double cut_cross(const Vec2d& a, const Vec2d& b) { return a.x() * b.y() - a.y() * b.x(); }
+
+// Intersect in the original face's barycentric plane. Adjacent faces, UV islands and
+// thin opposing surfaces can never be confused by a nearest-surface paint lookup.
+std::vector<Vec2d> intersect_cut_paint(std::vector<Vec2d> polygon, std::array<Vec2d, 3> triangle)
+{
+    if (cut_cross(triangle[1] - triangle[0], triangle[2] - triangle[0]) < 0.)
+        std::swap(triangle[1], triangle[2]);
+    for (size_t side = 0; side < 3 && !polygon.empty(); ++side) {
+        const Vec2d a = triangle[side], edge = triangle[(side + 1) % 3] - a;
+        std::vector<Vec2d> clipped;
+        Vec2d previous = polygon.back();
+        double previous_distance = cut_cross(edge, previous - a);
+        for (const Vec2d& current : polygon) {
+            const double distance = cut_cross(edge, current - a);
+            if ((distance >= 0.) != (previous_distance >= 0.))
+                clipped.push_back(previous + (current - previous) *
+                    (previous_distance / (previous_distance - distance)));
+            if (distance >= 0.)
+                clipped.push_back(current);
+            previous = current;
+            previous_distance = distance;
+        }
+        polygon = std::move(clipped);
+    }
+    return polygon;
+}
+
+// Materialise paint boundaries only for textured cuts with split annotations. The common
+// unpainted/whole-face path keeps its original mesh. Overlay every channel, so two texture
+// slots or a support/seam brush on the same face retain their independent boundaries.
+bool materialize_cut_paint(ModelVolume& volume)
+{
+    freeze_texture_projections(volume);
+    const auto channels = cut_paint_channels(volume);
+    std::array<std::unique_ptr<CutPaintSelector>, CUT_PAINT_CHANNELS> selectors;
+    bool partial = false;
+    for (size_t channel = 0; channel < channels.size(); ++channel) {
+        if (channels[channel]->empty())
+            continue;
+        selectors[channel] = std::make_unique<CutPaintSelector>(volume.mesh());
+        selectors[channel]->deserialize(channels[channel]->get_data(), false);
+        for (size_t face = 0; face < volume.mesh().its.indices.size(); ++face)
+            partial |= !selectors[channel]->uniform_facet_state(int(face)).has_value();
+    }
+    if (!partial)
+        return false;
+
+    const indexed_triangle_set original = volume.mesh().its;
+    struct PatchTriangle {
+        std::array<Vec3f, 3> corners;
+        EnforcerBlockerType state;
+    };
+    std::array<std::vector<std::vector<PatchTriangle>>, CUT_PAINT_CHANNELS> patches;
+    for (size_t channel = 0; channel < channels.size(); ++channel) {
+        if (!selectors[channel])
+            continue;
+        patches[channel].resize(original.indices.size());
+        auto states = TriangleSelector::extract_used_facet_states(channels[channel]->get_data());
+        if (std::find(states.begin(), states.end(), EnforcerBlockerType::NONE) == states.end())
+            states.push_back(EnforcerBlockerType::NONE);
+        for (const auto state : states) {
+            std::vector<int> sources;
+            const auto mesh = selectors[channel]->get_facets_strict(state, &sources);
+            for (size_t face = 0; face < mesh.indices.size(); ++face) {
+                const int source = sources[face];
+                if (selectors[channel]->uniform_facet_state(source))
+                    continue;
+                const auto& index = mesh.indices[face];
+                patches[channel][size_t(source)].push_back({
+                    {mesh.vertices[index[0]], mesh.vertices[index[1]], mesh.vertices[index[2]]}, state});
+            }
+        }
+    }
+
+    struct Piece {
+        std::vector<Vec2d> polygon;
+        std::array<EnforcerBlockerType, CUT_PAINT_CHANNELS> states{};
+    };
+    indexed_triangle_set refined;
+    std::vector<int> sources;
+    std::array<std::vector<EnforcerBlockerType>, CUT_PAINT_CHANNELS> states;
+    for (size_t face = 0; face < original.indices.size(); ++face) {
+        const auto& index = original.indices[face];
+        const Vec3d a = original.vertices[index[0]].cast<double>();
+        const Vec3d ab = original.vertices[index[1]].cast<double>() - a;
+        const Vec3d ac = original.vertices[index[2]].cast<double>() - a;
+        const Vec3d normal = ab.cross(ac);
+        const double normal_squared = normal.squaredNorm();
+        if (normal_squared == 0.)
+            continue;
+        std::vector<Piece> pieces{Piece{{Vec2d(0., 0.), Vec2d(1., 0.), Vec2d(0., 1.)}, {}}};
+        for (size_t channel = 0; channel < channels.size(); ++channel) {
+            if (!selectors[channel])
+                continue;
+            if (const auto state = selectors[channel]->uniform_facet_state(int(face))) {
+                for (Piece& piece : pieces)
+                    piece.states[channel] = *state;
+                continue;
+            }
+            std::vector<Piece> overlay;
+            for (const PatchTriangle& patch : patches[channel][face]) {
+                std::array<Vec2d, 3> triangle;
+                for (size_t k = 0; k < 3; ++k) {
+                    const Vec3d p = patch.corners[k].cast<double>() - a;
+                    triangle[k] = Vec2d(p.cross(ac).dot(normal), ab.cross(p).dot(normal)) / normal_squared;
+                }
+                for (const Piece& piece : pieces) {
+                    auto polygon = intersect_cut_paint(piece.polygon, triangle);
+                    if (polygon.size() < 3)
+                        continue;
+                    Piece clipped{std::move(polygon), piece.states};
+                    clipped.states[channel] = patch.state;
+                    overlay.push_back(std::move(clipped));
+                }
+            }
+            pieces = std::move(overlay);
+        }
+        for (const Piece& piece : pieces) {
+            Vec2d center = Vec2d::Zero();
+            for (const Vec2d& point : piece.polygon)
+                center += point;
+            center /= double(piece.polygon.size());
+            // Keep collinear boundary vertices: a fan from a corner would drop them
+            // with a degenerate triangle and leave a T-junction in its neighbour.
+            const bool triangle = piece.polygon.size() == 3;
+            for (size_t k = 0; k < (triangle ? 1 : piece.polygon.size()); ++k) {
+                const Vec2d uv[3] = {triangle ? piece.polygon[0] : center,
+                    piece.polygon[triangle ? 1 : k],
+                    piece.polygon[triangle ? 2 : (k + 1) % piece.polygon.size()]};
+                // Exact shared patch boundaries may acquire roundoff-sized
+                // intersections. Do not turn those zero-area overlaps into
+                // sliver faces when their coordinates are rounded to float.
+                if (cut_cross(uv[1] - uv[0], uv[2] - uv[0]) <= 1e-12)
+                    continue;
+                const int start = int(refined.vertices.size());
+                for (const Vec2d& p : uv)
+                    refined.vertices.push_back((a + p.x() * ab + p.y() * ac).cast<float>());
+                refined.indices.emplace_back(start, start + 1, start + 2);
+                sources.push_back(int(face));
+                for (size_t channel = 0; channel < channels.size(); ++channel)
+                    states[channel].push_back(piece.states[channel]);
+            }
+        }
+    }
+    // Different annotation trees may subdivide the same shared edge at different
+    // positions. Close those T-junctions before cutting, carrying the emitted
+    // face index so both source UVs and every paint channel follow the repair.
+    std::vector<int> repaired_faces(refined.indices.size());
+    std::iota(repaired_faces.begin(), repaired_faces.end(), 0);
+    TextureBake::RepairOptions repair;
+    repair.weld_quant = 1e6;
+    repair.on_seg_tol = 2e-6;
+    auto soup = TextureBake::resolve_t_junctions(TextureBake::to_soup(refined), repair, &repaired_faces);
+    refined.vertices = std::move(soup.pos);
+    refined.indices.clear();
+    std::vector<int> repaired_sources;
+    std::array<std::vector<EnforcerBlockerType>, CUT_PAINT_CHANNELS> repaired_states;
+    for (size_t face = 0; face < repaired_faces.size(); ++face) {
+        refined.indices.emplace_back(int(face * 3), int(face * 3 + 1), int(face * 3 + 2));
+        const size_t original_face = size_t(repaired_faces[face]);
+        repaired_sources.push_back(sources[original_face]);
+        for (size_t channel = 0; channel < channels.size(); ++channel)
+            repaired_states[channel].push_back(states[channel][original_face]);
+    }
+    sources = std::move(repaired_sources);
+    states = std::move(repaired_states);
+    its_merge_vertices(refined);
+    // Keep the original volume's attributes available until interpolation has finished.
+    Model source_model;
+    const auto* source_object = source_model.add_object(*volume.get_object());
+    const auto position = std::find(volume.get_object()->volumes.begin(), volume.get_object()->volumes.end(), &volume);
+    const auto* source = source_object->volumes[size_t(position - volume.get_object()->volumes.begin())];
+    TriangleMesh mesh(std::move(refined));
+    volume.set_mesh(mesh);
+    transfer_cut_texture_impl(volume, *source, mesh, sources, Transform3d::Identity(), false);
+    for (size_t channel = 0; channel < channels.size(); ++channel) {
+        if (!selectors[channel])
+            continue;
+        TriangleSelector selector(volume.mesh());
+        for (size_t face = 0; face < states[channel].size(); ++face)
+            selector.set_facet(int(face), states[channel][face]);
+        channels[channel]->set(selector);
+    }
+    volume.calculate_convex_hull();
+    return true;
+}
+
+} // namespace
 
 static void apply_tolerance(ModelVolume* vol)
 {
@@ -56,7 +298,163 @@ static void apply_tolerance(ModelVolume* vol)
     vol->set_scaling_factor(sf);
 }
 
-static void add_cut_volume(TriangleMesh& mesh, ModelObject* object, const ModelVolume* src_volume, const Transform3d& cut_matrix, const std::string& suffix = {}, ModelVolumeType type = ModelVolumeType::MODEL_PART)
+// Interpolate inside the recorded source face, never across its neighbouring UV islands.
+static void transfer_cut_texture_impl(ModelVolume& volume, const ModelVolume& source, const TriangleMesh& cut_mesh,
+                                const std::vector<int>& face_sources, const Transform3d& source_to_mesh,
+                                bool transfer_paint)
+{
+    const auto& source_mesh = source.mesh().its;
+    const auto& target_mesh = cut_mesh.its;
+    assert(face_sources.size() == target_mesh.indices.size());
+    const Transform3d to_source = source_to_mesh.inverse();
+    const bool have_uv = source.has_texture_uv();
+    const bool have_display = source.display_texture &&
+        source.display_texture->face_uv.size() == source_mesh.indices.size();
+    std::shared_ptr<TextureDisplayData> display;
+    if (have_display) {
+        display = std::make_shared<TextureDisplayData>();
+        display->images = source.display_texture->images;
+        display->face_uv.resize(face_sources.size());
+        display->face_image.assign(face_sources.size(), -1);
+        display->face_rgb.assign(face_sources.size(), {0.8f, 0.8f, 0.8f});
+    }
+    if (have_uv)
+        volume.texture_uv.assign(face_sources.size() * 3, Vec2f::Zero());
+    for (size_t fi = 0; fi < face_sources.size(); ++fi) {
+        const int src = face_sources[fi];
+        if (src < 0)
+            continue; // New cut faces have no source texture.
+        const auto& st = source_mesh.indices[size_t(src)];
+        const Vec3d a = source_mesh.vertices[st[0]].cast<double>();
+        const Vec3d ab = source_mesh.vertices[st[1]].cast<double>() - a;
+        const Vec3d ac = source_mesh.vertices[st[2]].cast<double>() - a;
+        const Vec3d n = ab.cross(ac);
+        const double n2 = n.squaredNorm();
+        if (n2 == 0.)
+            continue;
+        if (display) {
+            display->face_image[fi] = source.display_texture->face_image[size_t(src)];
+            if (size_t(src) < source.display_texture->face_rgb.size())
+                display->face_rgb[fi] = source.display_texture->face_rgb[size_t(src)];
+        }
+        for (size_t k = 0; k < 3; ++k) {
+            const Vec3d p = to_source * target_mesh.vertices[target_mesh.indices[fi][int(k)]].cast<double>() - a;
+            const double b = p.cross(ac).dot(n) / n2;
+            const double c = ab.cross(p).dot(n) / n2;
+            const double w[3] = {1. - b - c, b, c};
+            if (have_uv) {
+                Vec2d uv = Vec2d::Zero();
+                for (size_t j = 0; j < 3; ++j)
+                    uv += w[j] * source.texture_uv[size_t(src) * 3 + j].cast<double>();
+                volume.texture_uv[fi * 3 + k] = uv.cast<float>();
+            }
+            if (display) {
+                Vec2d uv = Vec2d::Zero();
+                for (size_t j = 0; j < 3; ++j) {
+                    const auto& v = source.display_texture->face_uv[size_t(src)][j];
+                    uv += w[j] * Vec2d(v[0], v[1]);
+                }
+                display->face_uv[fi][k] = {float(uv.x()), float(uv.y())};
+            }
+        }
+    }
+    volume.display_texture = std::move(display);
+    // Model-UV layers keep the same image and placement. Remap their paint masks separately;
+    // caps are explicitly unpainted even where a mask touches the cutting plane.
+    if (have_uv || has_cut_texture_layers(source)) {
+        volume.texture_displacement_layers = source.texture_displacement_layers;
+        volume.texture_displacement_options = source.texture_displacement_options;
+        const Transform3d anchor_to_source = !transfer_paint ? Transform3d::Identity() :
+            (&cut_mesh == &volume.mesh() ? to_source : Transform3d(to_source * volume.get_matrix()));
+        for (auto &layer : volume.texture_displacement_layers)
+            transform_texture_projection(layer, anchor_to_source);
+
+        if (std::any_of(volume.texture_displacement_layers.begin(), volume.texture_displacement_layers.end(),
+                [](const TextureDisplacementLayer& layer) {
+                    return layer.projection_method == TextureProjectionMethod::ViewProjected;
+                })) {
+            // A view projector is a 3x4 homogeneous map. Compose the change of mesh
+            // frame into it rather than projecting afresh around each cut part.
+            // Plane cuts pass the pre-centering mesh; splitting passes the
+            // volume's already-local mesh. Its placement matrix is not part of
+            // the coordinate change in the latter case.
+            const Transform3d target_to_source = !transfer_paint ? Transform3d::Identity() :
+                (&cut_mesh == &volume.mesh() ? to_source : Transform3d(to_source * volume.get_matrix()));
+            for (auto& layer : volume.texture_displacement_layers) {
+                if (layer.projection_method != TextureProjectionMethod::ViewProjected)
+                    continue;
+                Eigen::Matrix<double, 3, 4> projector = Eigen::Matrix<double, 3, 4>::Zero();
+                if (layer.view_project_projective) {
+                    for (int row = 0; row < 3; ++row)
+                        for (int column = 0; column < 4; ++column)
+                            projector(row, column) = layer.view_project_matrix[size_t(row * 4 + column)];
+                } else {
+                    const auto texture = decode_height_texture(layer);
+                    const float aspect = texture.height > 0 ? float(texture.width) / float(texture.height) : 1.f;
+                    const Vec2f origin = apply_uv_transform(Vec2f::Zero(), layer, aspect);
+                    for (int column = 0; column < 3; ++column) {
+                        const Vec2f uv = apply_uv_transform(
+                            Vec2f(layer.view_project_right[column], -layer.view_project_up[column]), layer, aspect);
+                        projector(0, column) = double(uv.x()) - origin.x();
+                        projector(1, column) = double(uv.y()) - origin.y();
+                    }
+                    projector(0, 3) = origin.x();
+                    projector(1, 3) = origin.y();
+                    projector(2, 3) = 1.;
+                }
+                projector = (projector * target_to_source.matrix()).eval();
+                for (int row = 0; row < 3; ++row)
+                    for (int column = 0; column < 4; ++column)
+                        layer.view_project_matrix[size_t(row * 4 + column)] = float(projector(row, column));
+                layer.view_project_projective = true;
+            }
+        }
+        if (!transfer_paint)
+            return;
+        for (size_t slot = 0; slot < TEXTURE_DISPLACEMENT_MAX_LAYERS; ++slot) {
+            const auto& facets = source.texture_displacement_facet(int(slot));
+            if (facets.empty())
+                continue;
+            CutPaintSelector source_selector(source.mesh());
+            source_selector.deserialize(facets.get_data(), false);
+            TriangleSelector selector(volume.mesh());
+            const bool has_partial_faces = std::any_of(face_sources.begin(), face_sources.end(), [&](int src) {
+                return src >= 0 && !source_selector.uniform_facet_state(src).has_value();
+            });
+            // Materialize subfaces before a mirrored transform changes corner order.
+            // Transforming the base mesh while retaining its split bitstream would
+            // mirror a partially painted face's mask onto the wrong half.
+            if (has_partial_faces) {
+                TriangleMesh painted(source_selector.get_facets_strict(EnforcerBlockerType::ENFORCER));
+                painted.transform(source_to_mesh, true);
+                TriangleSelector painted_selector(painted);
+                for (size_t fi = 0; fi < painted.its.indices.size(); ++fi)
+                    painted_selector.set_facet(int(fi), EnforcerBlockerType::ENFORCER);
+                auto mapped = TriangleSelector::remap_painting(painted.its, painted_selector.serialize(),
+                    cut_mesh.its, Transform3d::Identity(), {});
+                selector.deserialize(mapped, false);
+            }
+            for (size_t fi = 0; fi < face_sources.size(); ++fi) {
+                if (face_sources[fi] < 0)
+                    selector.set_facet(int(fi), EnforcerBlockerType::NONE);
+                else if (const auto state = source_selector.uniform_facet_state(face_sources[fi]))
+                    selector.set_facet(int(fi), *state);
+            }
+            volume.texture_displacement_facet(int(slot)).set(selector);
+        }
+    }
+}
+
+void transfer_cut_texture(ModelVolume& volume, const ModelVolume& source, const TriangleMesh& mesh,
+                          const std::vector<int>& face_sources, const Transform3d& source_to_mesh)
+{
+    transfer_cut_texture_impl(volume, source, mesh, face_sources, source_to_mesh, true);
+}
+
+static void add_cut_volume(TriangleMesh& mesh, ModelObject* object, const ModelVolume* src_volume, const Transform3d& cut_matrix,
+                           const std::string& suffix = {}, ModelVolumeType type = ModelVolumeType::MODEL_PART,
+                           const std::vector<int>* face_sources = nullptr,
+                           const Transform3d& source_to_mesh = Transform3d::Identity())
 {
     if (mesh.empty())
         return;
@@ -72,12 +470,15 @@ static void add_cut_volume(TriangleMesh& mesh, ModelObject* object, const ModelV
     assert(vol->config.id() != src_volume->config.id());
     vol->set_material(src_volume->material_id(), *src_volume->material());
     vol->cut_info = src_volume->cut_info;
+    if (face_sources)
+        transfer_cut_texture(*vol, *src_volume, mesh, *face_sources, source_to_mesh);
 }
 
 // Cuts the volume at cut_z above the cut plane; the result stays in the cut plane's coordinates.
 static void process_volume_cut( const ModelVolume* volume, const Transform3d& instance_matrix, const Transform3d& cut_matrix,
                                 ModelObjectCutAttributes attributes, TriangleMesh& upper_mesh, TriangleMesh& lower_mesh,
-                                float cut_z = 0.f)
+                                float cut_z = 0.f, std::vector<int>* upper_sources = nullptr,
+                                std::vector<int>* lower_sources = nullptr)
 {
     const auto volume_matrix = volume->get_matrix();
 
@@ -90,7 +491,7 @@ static void process_volume_cut( const ModelVolume* volume, const Transform3d& in
     mesh.transform(invert_cut_matrix * instance_matrix * volume_matrix, true);
 
     indexed_triangle_set upper_its, lower_its;
-    cut_mesh(mesh.its, cut_z, &upper_its, &lower_its);
+    cut_mesh(mesh.its, cut_z, &upper_its, &lower_its, true, upper_sources, lower_sources);
     if (attributes.has(ModelObjectCutAttribute::KeepUpper))
         upper_mesh = TriangleMesh(upper_its);
     if (attributes.has(ModelObjectCutAttribute::KeepLower))
@@ -194,24 +595,34 @@ static void process_solid_part_cut(const ModelVolume* volume, const Transform3d&
 {
     // Perform cut
     TriangleMesh upper_mesh, lower_mesh;
-    process_volume_cut(volume, instance_matrix, cut_matrix, attributes, upper_mesh, lower_mesh);
+    const bool textured = volume->has_texture_uv() || bool(volume->display_texture) ||
+        has_cut_texture_layers(*volume);
+    std::vector<int> upper_sources, lower_sources;
+    process_volume_cut(volume, instance_matrix, cut_matrix, attributes, upper_mesh, lower_mesh, 0.f,
+                       textured ? &upper_sources : nullptr, textured ? &lower_sources : nullptr);
+    const Transform3d source_to_mesh = instance_matrix * volume->get_matrix();
+    auto add_part = [&](TriangleMesh& mesh, ModelObject* object, const std::vector<int>& sources,
+                        const std::string& suffix = std::string{}) {
+        add_cut_volume(mesh, object, volume, cut_matrix, suffix, ModelVolumeType::MODEL_PART,
+                       textured ? &sources : nullptr, source_to_mesh);
+    };
 
     // Add required cut parts to the objects
 
     if (attributes.has(ModelObjectCutAttribute::KeepAsParts)) {
-        add_cut_volume(upper_mesh, upper, volume, cut_matrix, "_A");
+        add_part(upper_mesh, upper, upper_sources, "_A");
         if (!lower_mesh.empty()) {
-            add_cut_volume(lower_mesh, upper, volume, cut_matrix, "_B");
+            add_part(lower_mesh, upper, lower_sources, "_B");
             upper->volumes.back()->cut_info.is_from_upper = false;
         }
         return;
     }
 
     if (attributes.has(ModelObjectCutAttribute::KeepUpper))
-        add_cut_volume(upper_mesh, upper, volume, cut_matrix);
+        add_part(upper_mesh, upper, upper_sources);
 
     if (attributes.has(ModelObjectCutAttribute::KeepLower) && !lower_mesh.empty())
-        add_cut_volume(lower_mesh, lower, volume, cut_matrix);
+        add_part(lower_mesh, lower, lower_sources);
 }
 
 static void reset_instance_transformation(ModelObject* object, size_t src_instance_idx, 
@@ -260,8 +671,12 @@ Cut::Cut(const ModelObject* object, int instance, const Transform3d& cut_matrix,
     : m_instance(instance), m_cut_matrix(cut_matrix), m_attributes(attributes)
 {
     m_model = Model();
-    if (object)
-        m_model.add_object(*object);
+    if (object) {
+        auto *copy = m_model.add_object(*object);
+        for (auto *volume : copy->volumes)
+            if (volume->is_model_part())
+                freeze_texture_projections(*volume);
+    }
 }
 
 void Cut::post_process(ModelObject* object, ModelObjectPtrs& cut_object_ptrs, bool keep, bool place_on_cut, bool flip)
@@ -346,6 +761,9 @@ const ModelObjectPtrs& Cut::perform_with_plane()
 
     std::vector<std::optional<TriangleSelector::SavedPainting>> saved_paintings;
     for (ModelVolume* volume : mo->volumes) {
+        if (volume->is_model_part() &&
+            (volume->has_texture_uv() || volume->display_texture || has_cut_texture_layers(*volume)))
+            materialize_cut_paint(*volume);
         // Save painting data before reset_extra_facets() discards it.
         if (m_attributes.has(ModelObjectCutAttribute::KeepPaint)) {
             saved_paintings.emplace_back(volume->save_painting());
@@ -355,9 +773,8 @@ const ModelObjectPtrs& Cut::perform_with_plane()
             }
         }
 
-        volume->reset_extra_facets();
-
         if (!volume->is_model_part()) {
+            volume->reset_extra_facets();
             if (volume->cut_info.is_processed)
                 process_modifier_cut(volume, instance_matrix, inverse_cut_matrix, m_attributes, upper, lower);
             else
@@ -440,6 +857,14 @@ static void distribute_modifiers_from_object(ModelObject* from_obj, const int in
 static void merge_solid_parts_inside_object(ModelObjectPtrs& objects)
 {
     for (ModelObject* mo : objects) {
+        // Keeping the parts also keeps their separate image/mask slots and UV seams.
+        // The geometry-only merge below cannot represent those attributes.
+        if (std::any_of(mo->volumes.begin(), mo->volumes.end(), [](const ModelVolume* volume) {
+                return volume->is_model_part() &&
+                    (volume->has_texture_uv() || bool(volume->display_texture) ||
+                     has_cut_texture_layers(*volume));
+            }))
+            continue;
         TriangleMesh mesh;
         // Merge all SolidPart but not Connectors
         for (const ModelVolume* mv : mo->volumes) {

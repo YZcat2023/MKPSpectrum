@@ -4,6 +4,8 @@
 #include <fstream>
 #include <iterator>
 #include <vector>
+#include <stdexcept>
+#include "../test_utils.hpp"
 
 #include <boost/filesystem.hpp>
 
@@ -80,4 +82,43 @@ TEST_CASE("A PNG whose body is garbage is refused", "[PNG]") {
 
     png::ImageColorscale colour;
     CHECK_FALSE(png::decode_colored_png(buf_of(bytes, bytes.size()), colour));
+}
+
+TEST_CASE("RGBA rows retain the complete image including transparent pixels", "[PNG]")
+{
+    const size_t width = 37, height = 19;
+    std::vector<uint8_t> pixels(width * height * 4);
+    for (size_t i = 0; i < pixels.size(); ++i)
+        pixels[i] = uint8_t((i * 43 + i / 11) % 256);
+    ScopedTemporaryFile buffered(".png"), streamed(".png");
+    REQUIRE(png::write_rgba_to_file(buffered.string(), width, height, pixels));
+    size_t calls = 0;
+    REQUIRE(png::write_rgba_rows_to_file(streamed.string(), width, height, [&](size_t y, uint8_t* row) {
+        REQUIRE(y == calls++);
+        std::copy_n(pixels.data() + y * width * 4, width * 4, row);
+    }));
+    REQUIRE(calls == height);
+    const auto contents = [](const std::string& path) {
+        std::ifstream input(path, std::ios::binary);
+        return std::vector<char>(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+    };
+    // Both use identical lossless PNG settings, so this also checks alpha and
+    // fully transparent RGB bytes, which a colour-only decoder could discard.
+    CHECK(contents(buffered.string()) == contents(streamed.string()));
+}
+
+TEST_CASE("Cancelling a streamed PNG closes it before another write", "[PNG]")
+{
+    ScopedTemporaryFile file(".png");
+    size_t calls = 0;
+    CHECK_THROWS_AS(png::write_rgba_rows_to_file(file.string(), 31, 17, [&](size_t y, uint8_t* row) {
+        ++calls;
+        if (y == 3)
+            throw std::runtime_error("cancelled");
+        std::fill_n(row, 31 * 4, uint8_t(0));
+    }), std::runtime_error);
+    CHECK(calls == 4);
+    // Windows file deletion fails while the cancelled writer still holds it.
+    CHECK(boost::filesystem::remove(file.string()));
+    REQUIRE(png::write_rgba_to_file(file.string(), 31, 17, std::vector<uint8_t>(31 * 17 * 4, 0)));
 }

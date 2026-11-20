@@ -714,6 +714,7 @@ std::string ExtrusionEntity::role_to_string(ExtrusionRole role)
         case erCustom                       : return L("Custom");
         case erMkpInkjetPath                : return L("喷墨路径");
         case erMkpSurfacePath               : return L("表面处理");
+        case erMkpInkSeal                   : return L("封墨");
         case erMixed                        : return L("Multiple");
         default                             : assert(false);
     }
@@ -762,6 +763,8 @@ ExtrusionRole ExtrusionEntity::string_to_role(const std::string_view role)
         return erMkpInkjetPath;
     else if (role == L("表面处理") || role == "Surface treatment")
         return erMkpSurfacePath;
+    else if (role == L("封墨") || role == "Ink seal")
+        return erMkpInkSeal;
     else if (role == L("Multiple"))
         return erMixed;
     else

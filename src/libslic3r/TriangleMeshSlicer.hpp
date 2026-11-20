@@ -137,6 +137,16 @@ void cut_mesh(
     indexed_triangle_set            *lower,
     bool                             triangulate_caps = true);
 
+void cut_mesh(
+    const indexed_triangle_set      &mesh,
+    float                            z,
+    indexed_triangle_set            *upper,
+    indexed_triangle_set            *lower,
+    bool                             triangulate_caps,
+    // Source face for each output face; -1 denotes a newly triangulated cap.
+    std::vector<int>                 *upper_sources,
+    std::vector<int>                 *lower_sources);
+
 } // namespace Slic3r
 
 #endif // slic3r_TriangleMeshSlicer_hpp_

@@ -445,7 +445,7 @@ public:
         EGCodeExtrusionRole::BottomSurface, EGCodeExtrusionRole::InternalBridgeInfill, EGCodeExtrusionRole::Brim,
         EGCodeExtrusionRole::SupportTransition, EGCodeExtrusionRole::Mixed,
         // MKPSpectrum
-        EGCodeExtrusionRole::InkjetPath, EGCodeExtrusionRole::SurfacePath
+        EGCodeExtrusionRole::InkjetPath, EGCodeExtrusionRole::SurfacePath, EGCodeExtrusionRole::InkSeal
     }) const;
     //
     // Return the size of the used cpu memory, in bytes

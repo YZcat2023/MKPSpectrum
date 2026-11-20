@@ -106,9 +106,19 @@ bool bake_part(const Part &part, const xatlas::Mesh &atlas, cv::Mat &image, cv::
                 if (!(smooth.dot(n) >= .5f)) smooth = n;
                 float best = std::numeric_limits<float>::max();
                 for (const Vec3f &dir : std::array<Vec3f, 4>{smooth, -smooth, n, -n}) {
+                    // score >= abs(t - eps), so a later ray cannot improve the chosen
+                    // texel beyond best + eps. Keep a float ULP for the stored hit.t.
+                    const float max_t = std::min(reach,
+                        std::nextafter(best + eps, std::numeric_limits<float>::infinity()));
                     const Vec3d origin = (p - eps * dir).cast<double>(), direction = dir.cast<double>();
                     igl::Hit<float> hit;
-                    if (!intersect_ray_first_hit(high.vertices, high.indices, tree, origin, direction, hit, 1e-12) || hit.t > reach)
+                    // The old query searched an infinite ray, then discarded every hit beyond
+                    // reach. Bound traversal itself to the same accepted distance instead.
+                    auto ray = detail::RayIntersector<Vec3f, stl_triangle_vertex_indices,
+                        Tree<3, float>, Vec3d>{high.vertices, high.indices, tree, origin,
+                                              direction, Vec3d(direction.cwiseInverse()), 1e-12};
+                    if (!detail::intersect_ray_recursive_first_hit(ray, size_t(0),
+                            std::nextafter(double(max_t), std::numeric_limits<double>::infinity()), hit) || hit.t > reach)
                         continue;
                     const auto &hf = high.indices[hit.id];
                     const Vec3f hn = (high.vertices[hf[1]] - high.vertices[hf[0]])
@@ -143,6 +153,13 @@ bool reduce_glb_native(const std::vector<const aiMesh *> &meshes, const std::vec
 {
     const auto started = std::chrono::steady_clock::now();
     auto atlas = std::unique_ptr<xatlas::Atlas, decltype(&xatlas::Destroy)>(xatlas::Create(), xatlas::Destroy);
+    auto checkpoint = started;
+    const auto stage = [&](const char *name) {
+        const auto now = std::chrono::steady_clock::now();
+        BOOST_LOG_TRIVIAL(info) << "GLB import stage " << name << ": "
+            << std::chrono::duration<double>(now - checkpoint).count() << " s";
+        checkpoint = now;
+    };
     bool has_texture = false;
     std::vector<Part> parts;
     parts.reserve(meshes.size());
@@ -185,7 +202,9 @@ bool reduce_glb_native(const std::vector<const aiMesh *> &meshes, const std::vec
         part.low = high;
         its_merge_vertices(part.low, false);
         its_remove_degenerate_faces(part.low);
+        stage("prepare mesh");
         its_quadric_edge_collapse(part.low, uint32_t(budgets[i]));
+        stage("native simplification");
         if (part.low.indices.empty() || part.low.indices.size() > budgets[i]) {
             error = "Orca could not reach the selected triangle count";
             return false;
@@ -219,11 +238,13 @@ bool reduce_glb_native(const std::vector<const aiMesh *> &meshes, const std::vec
             return false;
         }
     }
+    stage("atlas input");
     xatlas::PackOptions options;
     options.resolution = 2048;
     options.padding = 6;
     options.createImage = true;
     xatlas::Generate(atlas.get(), {}, options);
+    stage("unwrap and pack");
     if (atlas->meshCount != parts.size() || atlas->atlasCount != 1 || !atlas->image || !atlas->width || !atlas->height) {
         error = "Could not pack the simplified GLB texture atlas";
         return false;
@@ -253,6 +274,7 @@ bool reduce_glb_native(const std::vector<const aiMesh *> &meshes, const std::vec
             out.material_ids.push_back(0);
         }
     }
+    stage("texture projection");
     // Expand inside each island's allocated padding without sampling a neighboring island.
     for (int step = 0; step < 6; ++step) {
         cv::Mat next = charts.clone();
@@ -276,11 +298,13 @@ bool reduce_glb_native(const std::vector<const aiMesh *> &meshes, const std::vec
         error = "No GLB texture could be projected onto the simplified mesh";
         return false;
     }
+    stage("atlas padding");
     TextureImage texture;
     if (!cv::imencode(".png", image, texture.data, {cv::IMWRITE_PNG_COMPRESSION, 1})) {
         error = "Could not encode the baked GLB texture";
         return false;
     }
+    stage("PNG encoding");
     texture.width = texture.height = -1;
     texture.channels = 0;
     out.textures = {std::move(texture)};

@@ -1365,7 +1365,8 @@ std::vector<Vec2f> GLGizmoTextureDisplacement::compute_layer_vertex_uvs(const in
     // scaled instance as it does on an untouched one (see build_texture_displacement()). Everything
     // that has to agree with the bake - the fast preview's uvs, the checker/distortion overlays -
     // therefore has to project from the same world positions, not from the volume's own.
-    const indexed_triangle_set patch  = patch_in_world(local_patch);
+    const indexed_triangle_set patch = layer.projection_method == TextureProjectionMethod::ViewProjected ?
+        local_patch : patch_in_world(local_patch);
     const float                aspect = layer_texture_aspect(layer);
     if (layer.projection_method == TextureProjectionMethod::LSCM) {
         // compute_lscm_uvs() returns the unwrap's own (raw, mm) coordinates with the island placement
@@ -1373,7 +1374,7 @@ std::vector<Vec2f> GLGizmoTextureDisplacement::compute_layer_vertex_uvs(const in
         // on top (sample_layer_height()'s lscm branch runs the result through sample_at()), so the
         // shader's precomputed-uv path has to as well, or the fast preview samples millimetre-valued
         // coordinates as if they were uv and shows the texture at a wildly wrong scale.
-        std::vector<Vec2f> uv = compute_lscm_uvs(patch, layer);
+        std::vector<Vec2f> uv = compute_lscm_uvs(layer.projection_anchor ? local_patch : patch, layer);
         for (Vec2f &p : uv)
             p = apply_uv_transform(p, layer, aspect);
         return uv;
@@ -1413,6 +1414,11 @@ int GLGizmoTextureDisplacement::layer_projection_frame(const indexed_triangle_se
     // well: a patch-only average would sometimes quantize to a different world axis and wrap the
     // texture the other way round. Both meshes go through patch_in_world() first, which is the frame
     // the shaders' tex_pos lives in.
+    if (layer.projection_anchor && layer.projection_anchor->reference) {
+        center = layer.projection_anchor->reference->center;
+        axis = layer.projection_anchor->reference->axis;
+        return layer.projection_method == TextureProjectionMethod::Cylindrical ? 1 : 2;
+    }
     Vec3f average_normal;
     texture_displacement_patch_frame(patch_in_world(local_patch),
                                      texture_displacement_vertex_normals(patch_in_world(mv->mesh().its)),
@@ -1429,7 +1435,7 @@ std::vector<Vec2f> GLGizmoTextureDisplacement::compute_layer_corner_uvs(const in
     if (layer.projection_method == TextureProjectionMethod::LSCM) {
         const indexed_triangle_set patch  = patch_in_world(local_patch);
         const float                aspect = layer_texture_aspect(layer);
-        std::vector<Vec2f>         uv     = compute_lscm_corner_uvs(patch, layer);
+        std::vector<Vec2f>         uv     = compute_lscm_corner_uvs(layer.projection_anchor ? local_patch : patch, layer);
         for (Vec2f &p : uv)
             p = apply_uv_transform(p, layer, aspect);
         return uv;
@@ -1640,6 +1646,18 @@ std::vector<int> GLGizmoTextureDisplacement::build_island_move_set(const Texture
     return set;
 }
 
+static void set_projection_frame_uniforms(GLShaderProgram &shader, const TextureDisplacementLayer &layer,
+                                          const Transform3d &volume_to_world)
+{
+    Transform3d transform = Transform3d::Identity();
+    if (layer.projection_anchor)
+        transform = texture_projection_transform(layer) * texture_displacement_bake_frame(volume_to_world).inverse();
+    shader.set_uniform("projection_frame_enabled", bool(layer.projection_anchor));
+    shader.set_uniform("projection_frame", transform);
+    shader.set_uniform("projection_normal", Matrix3d(transform.linear().inverse().transpose()));
+    shader.set_uniform("projection_gradient", Matrix3d(transform.linear().transpose()));
+}
+
 void GLGizmoTextureDisplacement::render_shaded_preview_mesh()
 {
     const ModelObject *mo = m_c->selection_info()->model_object();
@@ -1736,6 +1754,7 @@ void GLGizmoTextureDisplacement::render_shaded_preview_mesh()
     shader->set_uniform("projection_mode", m_shaded_projection_mode);
     shader->set_uniform("patch_center", m_shaded_patch_center);
     shader->set_uniform("patch_axis", m_shaded_patch_axis);
+    set_projection_frame_uniforms(*shader, *layer, trafo_matrix);
 
     // The printable palette, in RGB for display and in Lab for the match. Uploaded rather than matched
     // on the CPU because the quantization is per fragment here. Count 0 means "no layer is colouring",
@@ -2277,6 +2296,7 @@ void GLGizmoTextureDisplacement::render_uvcheck_mesh()
     shader->set_uniform("projection_mode", m_uvcheck_projection_mode);
     shader->set_uniform("patch_center", m_uvcheck_patch_center);
     shader->set_uniform("patch_axis", m_uvcheck_patch_axis);
+    set_projection_frame_uniforms(*shader, *layer, trafo_matrix);
     // Was never uploaded, so the checker disagreed with the bake for any non-square height map.
     shader->set_uniform("tex_aspect", layer_texture_aspect(*layer));
 
@@ -3276,6 +3296,7 @@ int GLGizmoTextureDisplacement::apply_projection_frame()
     Plater::TakeSnapshot snapshot(wxGetApp().plater(), _u8L("Apply texture projection frame"),
                                   UndoRedo::SnapshotType::GizmoAction);
 
+    layer->projection_anchor.reset();
     layer->projection_method       = TextureProjectionMethod::ViewProjected;
     layer->view_project_projective = true;
     layer->view_project_matrix     = m;
@@ -6082,6 +6103,7 @@ TextureDisplacementPrepareResult GLGizmoTextureDisplacement::prepare_mesh(
     // with points and normals mapped across, so the stages below go on measuring the mesh itself.
     const bool           framed = !texture_frame.matrix().isApprox(Transform3d::Identity().matrix());
     const Matrix3d       frame_normal = texture_frame.linear().inverse().transpose();
+    const auto sampled_layers = texture_layers_in_frame(layers, texture_frame);
     indexed_triangle_set framed_mesh;
     const auto           mesh_to_sample = [&](const indexed_triangle_set &its) -> const indexed_triangle_set & {
         if (!framed)
@@ -6178,14 +6200,14 @@ TextureDisplacementPrepareResult GLGizmoTextureDisplacement::prepare_mesh(
             const indexed_triangle_set &sampled = mesh_to_sample(mesh.its);
             HeightFieldSampler sampler;
             if (params.subdiv_feature)
-                sampler = sample_in_frame(make_combined_displacement_sampler(sampled, layers, current, uv_ptr));
+                sampler = sample_in_frame(make_combined_displacement_sampler(sampled, sampled_layers, current, uv_ptr));
             // Colour boundaries need triangles of their own - the chord test cannot see them, since
             // the height field is perfectly smooth across a change of filament.
             ColorFieldSampler color;
             // A flat-colour layer is matched against single filaments only, as the bake does, so its
             // boundaries are refined where the bake will actually change filament.
             if (params.subdiv_color_edge_mm > 0.f && !color_settings.empty())
-                color = sample_in_frame(make_combined_color_sampler(sampled, layers, current,
+                color = sample_in_frame(make_combined_color_sampler(sampled, sampled_layers, current,
                                                                     make_palette_quantizer(color_settings.palette),
                                                                     make_palette_quantizer(color_settings.palette_pure),
                                                                     uv_ptr));
@@ -6249,7 +6271,7 @@ TextureDisplacementPrepareResult GLGizmoTextureDisplacement::prepare_mesh(
                     cut_region[i] = (region[size_t(source[i])] & REFINE_PAINTED) ? 1 : 0;
                 const std::vector<Vec2f> uv_refined = uv_now();
                 const HeightFieldSampler refined_sampler =
-                    sample_in_frame(make_combined_displacement_sampler(mesh_to_sample(mesh.its), layers, current,
+                    sample_in_frame(make_combined_displacement_sampler(mesh_to_sample(mesh.its), sampled_layers, current,
                                                                        uv_refined.empty() ? nullptr : &uv_refined));
                 std::vector<int>     cut_source;
                 size_t               cuts = 0;
@@ -7999,6 +8021,7 @@ void GLGizmoTextureDisplacement::on_render_input_window(float x, float y, float 
                             // sensible immediately rather than projecting from a stale/default direction.
                             if (method == TextureProjectionMethod::ViewProjected)
                                 capture_view_projection(layer);
+                            layer.projection_anchor.reset();
                             layer.projection_method = method;
                             m_preview_params_dirty  = true;
                             // Unwrap and its tools live in the UV editor pane, so picking it opens the pane

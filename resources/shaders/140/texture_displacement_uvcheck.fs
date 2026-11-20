@@ -25,6 +25,10 @@ uniform bool volume_mirrored;
 uniform int   mode;          // 0 checker, 1 distortion
 uniform float checker_freq;  // checker squares per uv unit (one uv unit == one texture tile)
 uniform float tiling_scale;
+uniform bool projection_frame_enabled;
+uniform mat4 projection_frame;
+uniform mat3 projection_normal;
+uniform mat3 projection_gradient;
 uniform vec3  tex_anchor; // the volume's origin in world space
 uniform float rotation_rad;
 uniform vec2  uv_offset;
@@ -64,6 +68,11 @@ float box_face_sign(float n) { return n >= 0.0 ? 1.0 : -1.0; }
 // Term for term libslic3r's project_planar() / project_cylindrical() / project_spherical(), in mm.
 vec2 projection_raw(vec3 p, vec3 n)
 {
+    if (projection_frame_enabled) {
+        p = (projection_frame * vec4(p, 1.0)).xyz;
+        n = normalize(projection_normal * n);
+    }
+
     if (projection_mode == 1) {
         vec3  up, right, fwd;
         cylinder_frame(up, right, fwd);

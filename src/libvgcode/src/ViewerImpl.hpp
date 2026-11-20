@@ -158,7 +158,7 @@ public:
         EGCodeExtrusionRole::BottomSurface, EGCodeExtrusionRole::InternalBridgeInfill, EGCodeExtrusionRole::Brim,
         EGCodeExtrusionRole::SupportTransition, EGCodeExtrusionRole::Mixed,
         // MKPSpectrum
-        EGCodeExtrusionRole::InkjetPath, EGCodeExtrusionRole::SurfacePath
+        EGCodeExtrusionRole::InkjetPath, EGCodeExtrusionRole::SurfacePath, EGCodeExtrusionRole::InkSeal
     }) const;
 
     bool is_option_visible(EOptionType type) const;
