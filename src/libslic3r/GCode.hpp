@@ -144,7 +144,7 @@ public:
 
     std::string prime(GCode &gcodegen);
     void next_layer() { ++ m_layer_idx; m_tool_change_idx = 0; }
-    std::string tool_change(GCode &gcodegen, int extruder_id, bool finish_layer);
+    std::string tool_change(GCode &gcodegen, int extruder_id, bool finish_layer, double layer_z = -1.);
     bool is_empty_wipe_tower_gcode(GCode &gcodegen, int extruder_id, bool finish_layer);
     std::string finalize(GCode &gcodegen);
     std::string recover_after_inkjet(GCode &gcodegen) const;
@@ -950,6 +950,8 @@ protected:
     // MKP: ink coverage of every layer, computed by mkp::build_inkjet_layers() before any G-code is
     // written - it is texture slicing, and it has to happen before the emitter reads it.
     std::map<const PrintObject *, std::map<const Layer *, mkp::InkLayer>> m_mkp_ink;
+    std::map<const Layer *, std::vector<std::pair<unsigned int, std::vector<ExtrusionPath>>>> m_mkp_seals;
+    std::map<const PrintObject *, InkSealTools> m_mkp_seal_tools;
     // Where each object's strips sit inside the archive that travels with the G-code. Empty for a
     // single object, "obj<N>/" when several share one file, because layer_NNNN would otherwise clash.
     std::map<const PrintObject *, std::string> m_mkp_ink_prefix;

@@ -8387,6 +8387,12 @@ void PrintConfigDef::init_fff_params()
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionBool(false));
 
+    def = this->add("mkp_surface_travel_z_hop", coBool);
+    def->label = L("表面处理路径间抬 Z");
+    def->tooltip = L("开启时，笔刷在不同表面处理路径之间抬高后空驶；关闭时，笔刷保持工作高度直接平移。仅影响表面处理路径之间的移动，不改变取放笔刷、取放喷墨头和喷墨阶段的避让高度。");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionBool(true));
+
     def = this->add("mkp_surface_pattern", coEnum);
     def->label = L("走线类型");
     def->tooltip = L("走线类型：直线或网格。");
@@ -8535,11 +8541,31 @@ void PrintConfigDef::init_fff_params()
     def = this->add("mkp_inkjet_wall_band", coFloat);
     def->label = L("喷墨带宽度");
     def->sidetext = L("mm");
-    def->tooltip = L("竖直墙轮廓描边的总带宽，单位 mm。宽度按 684 行 / 14.29 mm 折算成像素：0.627 mm 即 30 像素。轮廓两侧的分配为 35% 朝外、65% 朝内，让喷头偏一点也不会在零件外沿露出白边。");
+    def->tooltip = L("仅用于兼容旧项目。实际喷墨宽度由喷墨内侧带宽和喷墨外侧带宽分别控制。");
     def->mode = comAdvanced;
     def->min = 0.05;
     def->max = 10.0;
     def->set_default_value(new ConfigOptionFloat(0.62675));
+    // Retain the old total-width key for loading existing projects. New widths are
+    // independent: old symmetric bleeding must not override the outward limit.
+    def = this->add("mkp_inkjet_wall_band_inner", coFloat);
+    def->label = L("喷墨内侧带宽");
+    def->sidetext = L("mm");
+    def->tooltip = L("从墙轮廓向模型内部延伸的喷墨宽度，与外侧带宽独立设置。");
+    def->mode = comAdvanced;
+    def->min = 0.0;
+    def->max = 10.0;
+    def->set_default_value(new ConfigOptionFloat(0.6));
+
+    def = this->add("mkp_inkjet_wall_band_outer", coFloat);
+    def->label = L("喷墨外侧带宽");
+    def->sidetext = L("mm");
+    def->tooltip = L("从墙轮廓向模型外部延伸的喷墨宽度。过大会将墨水喷到热床上；设为 0 可关闭向外扩展。");
+    def->mode = comAdvanced;
+    def->min = 0.0;
+    def->max = 10.0;
+    def->set_default_value(new ConfigOptionFloat(0.15));
+
     def = this->add("mkp_ink_seal_enabled", coBool);
     def->label = L("喷墨后封墨");
     def->tooltip = L("仅在实际喷墨后覆盖该层全部外露顶面，上方还要继续打印的区域不覆盖。封墨是当前层的附加挤出路径，不新增打印层，也不改变后续层高。");

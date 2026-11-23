@@ -440,7 +440,18 @@ bool ToolOrdering::insert_wipe_tower_extruder()
     return changed;
 }
 
-void ToolOrdering::sort_and_build_data(const Print& print, unsigned int first_extruder, bool prime_multi_material)
+void ToolOrdering::assign_ink_seal_tools(const InkSealTools &seal_tools)
+{
+    for (LayerTools &lt : m_layer_tools) {
+        lt.ink_seal_extruders.clear();
+        auto it = seal_tools.lower_bound(lt.print_z - EPSILON);
+        if (it != seal_tools.end() && std::abs(it->first - lt.print_z) < EPSILON)
+            lt.ink_seal_extruders = it->second;
+    }
+}
+
+void ToolOrdering::sort_and_build_data(const Print& print, unsigned int first_extruder, bool prime_multi_material,
+                                     const InkSealTools &seal_tools)
 {
     // if first extruder is -1, we can decide the first layer tool order before doing reorder function
     // so we shouldn't reorder first layer in reorder function
@@ -448,6 +459,7 @@ void ToolOrdering::sort_and_build_data(const Print& print, unsigned int first_ex
     this->resolve_mixed_filaments(print.config());
     reorder_extruders_for_minimum_flush_volume(reorder_first_layer);
     this->enforce_mixed_component_order();
+    this->assign_ink_seal_tools(seal_tools);
     m_sorted = true;
 
     double max_layer_height = 0.;
@@ -476,7 +488,8 @@ void ToolOrdering::sort_and_build_data(const Print& print, unsigned int first_ex
     this->collect_extruder_statistics(prime_multi_material);
 }
 
-void ToolOrdering::sort_and_build_data(const PrintObject& object , unsigned int first_extruder, bool prime_multi_material)
+void ToolOrdering::sort_and_build_data(const PrintObject& object , unsigned int first_extruder, bool prime_multi_material,
+                                     const InkSealTools &seal_tools)
 {
     // if first extruder is -1, we can decide the first layer tool order before doing reorder function
     // so we shouldn't reorder first layer in reorder function
@@ -484,6 +497,7 @@ void ToolOrdering::sort_and_build_data(const PrintObject& object , unsigned int 
     this->resolve_mixed_filaments(object.print()->config());
     reorder_extruders_for_minimum_flush_volume(reorder_first_layer);
     this->enforce_mixed_component_order();
+    this->assign_ink_seal_tools(seal_tools);
     m_sorted = true;
 
     double max_layer_height = calc_max_layer_height(object.print()->config(), object.config().layer_height);
@@ -1051,12 +1065,13 @@ void ToolOrdering::fill_wipe_tower_partitions(const PrintConfig &config, coordf_
     // Count the minimum number of tool changes per layer.
     size_t last_extruder = size_t(-1);
     for (LayerTools &lt : m_layer_tools) {
-        lt.wipe_tower_partitions = lt.extruders.size();
-        if (! lt.extruders.empty()) {
-            if (last_extruder == size_t(-1) || last_extruder == lt.extruders.front())
+        const auto sequence = lt.extrusion_sequence();
+        lt.wipe_tower_partitions = sequence.size();
+        if (! sequence.empty()) {
+            if (last_extruder == size_t(-1) || last_extruder == sequence.front())
                 // The first extruder on this layer is equal to the current one, no need to do an initial tool change.
                 -- lt.wipe_tower_partitions;
-            last_extruder = lt.extruders.back();
+            last_extruder = sequence.back();
         }
     }
 
@@ -1265,19 +1280,19 @@ void ToolOrdering::collect_extruder_statistics(bool prime_multi_material)
     m_last_printing_extruder = (unsigned int)-1;
     for (auto lt_it = m_layer_tools.rbegin(); lt_it != m_layer_tools.rend(); ++ lt_it)
         if (! lt_it->extruders.empty()) {
-            m_last_printing_extruder = lt_it->extruders.back();
+            m_last_printing_extruder = lt_it->extrusion_sequence().back();
             break;
         }
 
     m_all_printing_extruders.clear();
     for (const auto &lt : m_layer_tools) {
-        append(m_all_printing_extruders, lt.extruders);
+        append(m_all_printing_extruders, lt.extrusion_sequence());
         sort_remove_duplicates(m_all_printing_extruders);
     }
 
     m_last_layer_per_extruder.clear();
     for (const LayerTools& lt : m_layer_tools) {
-        for (unsigned int ext : lt.extruders) {
+        for (unsigned int ext : lt.extrusion_sequence()) {
             m_last_layer_per_extruder[ext] = lt.print_z;
         }
     }

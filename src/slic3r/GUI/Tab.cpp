@@ -3444,6 +3444,7 @@ void TabPrint::build()
         optgroup->append_single_option_line("mkp_surface_speed_min");
         optgroup->append_single_option_line("mkp_surface_speed_max");
         optgroup->append_single_option_line("mkp_surface_inner_walls");
+        optgroup->append_single_option_line("mkp_surface_travel_z_hop");
         optgroup->append_single_option_line("mkp_surface_pattern");
         optgroup->append_single_option_line("mkp_surface_line_spacing");
 
@@ -3456,7 +3457,8 @@ void TabPrint::build()
         optgroup->append_single_option_line("mkp_inkjet_flush_interval");
         optgroup->append_single_option_line("mkp_inkjet_repeat");
         optgroup->append_single_option_line("mkp_inkjet_dry_time");
-        optgroup->append_single_option_line("mkp_inkjet_wall_band");
+        optgroup->append_single_option_line("mkp_inkjet_wall_band_inner");
+        optgroup->append_single_option_line("mkp_inkjet_wall_band_outer");
 
         optgroup = page->new_optgroup(from_u8("封墨"), L"param_special");
         optgroup->append_single_option_line("mkp_ink_seal_enabled");

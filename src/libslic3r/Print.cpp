@@ -279,10 +279,13 @@ bool Print::invalidate_state_by_config_options(const ConfigOptionResolver & /* n
         "mkp_surface_speed_min",
         "mkp_surface_speed_max",
         "mkp_surface_inner_walls",
+        "mkp_surface_travel_z_hop",
         "mkp_inkjet_retract_length",
         "mkp_inkjet_recovery_length",
         "mkp_inkjet_flush_mode",
         "mkp_inkjet_flush_interval",
+        "mkp_inkjet_wall_band_inner",
+        "mkp_inkjet_wall_band_outer",
         "mkp_ink_seal_enabled",
         "mkp_ink_seal_height",
         "mkp_ink_seal_speed",
@@ -5261,7 +5264,17 @@ bool Print::enable_timelapse_print() const
 }
 
 
-void Print::_make_wipe_tower()
+void Print::plan_ink_seal_tools(const InkSealTools &seal_tools)
+{
+    if (this->has_wipe_tower())
+        this->_make_wipe_tower(seal_tools);
+    else if (m_config.print_sequence != PrintSequence::ByObject) {
+        m_tool_ordering = ToolOrdering(*this, unsigned(-1), false);
+        m_tool_ordering.sort_and_build_data(*this, unsigned(-1), false, seal_tools);
+    }
+}
+
+void Print::_make_wipe_tower(const InkSealTools &seal_tools)
 {
     m_wipe_tower_data.clear();
 
@@ -5271,7 +5284,7 @@ void Print::_make_wipe_tower()
     const bool is_wipe_tower_type2 = this->wipe_tower_type() == WipeTowerType::Type2;
     // Let the ToolOrdering class know there will be initial priming extrusions at the start of the print.
     m_wipe_tower_data.tool_ordering = ToolOrdering(*this, (unsigned int) -1, is_wipe_tower_type2);
-    m_wipe_tower_data.tool_ordering.sort_and_build_data(*this, (unsigned int)-1, is_wipe_tower_type2);
+    m_wipe_tower_data.tool_ordering.sort_and_build_data(*this, (unsigned int)-1, is_wipe_tower_type2, seal_tools);
 
     if (!m_wipe_tower_data.tool_ordering.has_wipe_tower())
         // Don't generate any wipe tower.
@@ -5402,7 +5415,9 @@ void Print::_make_wipe_tower()
 
             used_filament_ids.insert(layer_tools.extruders.begin(), layer_tools.extruders.end());
 
-            for (const auto filament_id : layer_tools.extruders) {
+            size_t tool_visit = 0;
+            for (const auto filament_id : layer_tools.extrusion_sequence()) {
+                const bool sealing = tool_visit++ >= layer_tools.extruders.size();
                 if (filament_id == current_filament_id)
                     continue;
 
@@ -5424,8 +5439,10 @@ void Print::_make_wipe_tower()
                                 ? m_config.flush_multiplier_fast.get_at(extruder_id)
                                 : m_config.flush_multiplier.get_at(extruder_id);
                             volume_to_purge *= flush_multiplier;
-                            volume_to_purge = layer_tools.wiping_extrusions().mark_wiping_extrusions(
-                                *this, current_filament_id, filament_id, volume_to_purge);
+                            // Post-ink seal changes cannot purge into model paths already printed.
+                            if (!sealing)
+                                volume_to_purge = layer_tools.wiping_extrusions().mark_wiping_extrusions(
+                                    *this, current_filament_id, filament_id, volume_to_purge);
                         }
                         nozzle_recorder.set_nozzle_status(nozzle_id, filament_id, extruder_id);
                     }
@@ -5563,7 +5580,9 @@ void Print::_make_wipe_tower()
                 bool first_layer = &layer_tools == &m_wipe_tower_data.tool_ordering.front();
                 wipe_tower.plan_toolchange((float) layer_tools.print_z, (float) layer_tools.wipe_tower_layer_height, current_extruder_id,
                                            current_extruder_id, false);
-                for (const auto extruder_id : layer_tools.extruders) {
+                size_t tool_visit = 0;
+                for (const auto extruder_id : layer_tools.extrusion_sequence()) {
+                    const bool sealing = tool_visit++ >= layer_tools.extruders.size();
                     if ((first_layer && extruder_id == m_wipe_tower_data.tool_ordering.all_extruders().back()) || extruder_id !=
                         current_extruder_id) {
                         float volume_to_wipe = m_config.prime_volume;
@@ -5574,8 +5593,9 @@ void Print::_make_wipe_tower()
                             volume_to_wipe -= (float) m_config.filament_minimal_purge_on_wipe_tower.get_at(extruder_id);
 
                             // try to assign some infills/objects for the wiping:
-                            volume_to_wipe = layer_tools.wiping_extrusions().mark_wiping_extrusions(*this, current_extruder_id, extruder_id,
-                                                                                                    volume_to_wipe);
+                            if (!sealing)
+                                volume_to_wipe = layer_tools.wiping_extrusions().mark_wiping_extrusions(*this, current_extruder_id, extruder_id,
+                                                                                                        volume_to_wipe);
 
                             // add back the minimal amount toforce on the wipe tower:
                             volume_to_wipe += (float) m_config.filament_minimal_purge_on_wipe_tower.get_at(extruder_id);

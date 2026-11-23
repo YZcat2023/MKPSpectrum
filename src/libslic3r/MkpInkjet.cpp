@@ -22,6 +22,8 @@
 #include <boost/log/trivial.hpp>
 
 #include "BoundingBox.hpp"
+#include "ClipperUtils.hpp"
+#include "ExtrusionEntityCollection.hpp"
 #include "Layer.hpp"
 #include "MkpMbd.hpp"
 #include "Model.hpp"
@@ -192,7 +194,7 @@ void clip_to_plane(std::vector<PolyVertex> &poly, const float plane_z, const boo
 
 // One pixel, shaded from the surface point under it. Nothing but white is recorded when the texture
 // has no colour there, because white is what the head prints as "not here".
-void shade_pixel(Raster &raster, const int x, const int y, const Vec3f &position, const Vec3f &normal,
+bool shade_pixel(Raster &raster, const int x, const int y, const Vec3f &position, const Vec3f &normal,
                  const PaintedSurface &surface, const Vec2f *model_uv)
 {
     Vec3f color;
@@ -217,7 +219,7 @@ void shade_pixel(Raster &raster, const int x, const int y, const Vec3f &position
                                      surface.patch_center, surface.patch_axis, surface.use_lscm_uv ? model_uv : nullptr);
     }
     if (! sampled)
-        return;
+        return false;
     // Composite sampled RGB, including white, before deciding which pixels carry ink.
     // Dropping white here would let an earlier wall colour show through a later surface.
     const size_t index = size_t(y) * size_t(raster.width) + size_t(x);
@@ -225,12 +227,15 @@ void shade_pixel(Raster &raster, const int x, const int y, const Vec3f &position
     raster.rgb[index * 3]     = uint8_t(std::min(255, std::max(0, int(color.x() * 255.f + 0.5f))));
     raster.rgb[index * 3 + 1] = uint8_t(std::min(255, std::max(0, int(color.y() * 255.f + 0.5f))));
     raster.rgb[index * 3 + 2] = uint8_t(std::min(255, std::max(0, int(color.z() * 255.f + 0.5f))));
+    return true;
 }
 
 void rasterize_triangle(Raster &raster, const Vec3f &a, const Vec3f &b, const Vec3f &c, const Vec3f &normal,
                          const Vec2f (&uv)[3], const PaintedSurface &surface,
                          const std::array<PolyVertex, 2> *sample_segment = nullptr,
-                         const std::vector<uint8_t> *area_mask = nullptr)
+                         const std::vector<uint8_t> *area_mask = nullptr,
+                         std::vector<float> *wall_distance = nullptr,
+                         std::vector<float> *area_depth = nullptr)
 {
     const double area2 = double(b.x() - a.x()) * double(c.y() - a.y()) - double(b.y() - a.y()) * double(c.x() - a.x());
     // Seen edge-on from above, a face covers no pixel. A vertical wall is in this class, and that is
@@ -300,8 +305,12 @@ void rasterize_triangle(Raster &raster, const Vec3f &a, const Vec3f &b, const Ve
             // The face is planar, so the 3D point is affine in xy: this interpolates the point on the
             // surface itself, which is where the colour is sampled from.
             Vec3f position = a * float(w0) + b * float(w1) + c * float(w2);
+            if (area_depth != nullptr &&
+                position.z() < (*area_depth)[size_t(py) * size_t(raster.width) + size_t(px)])
+                continue;
             // Affine in xy exactly as the position is, so this is the uv of the point on the face.
             Vec2f model_uv(uv[0] * float(w0) + uv[1] * float(w1) + uv[2] * float(w2));
+            float distance = 0.f;
             if (sample_segment != nullptr) {
                 const PolyVertex &start = (*sample_segment)[0];
                 const PolyVertex &end   = (*sample_segment)[1];
@@ -310,66 +319,146 @@ void rasterize_triangle(Raster &raster, const Vec3f &a, const Vec3f &b, const Ve
                      (y - double(start.pos.y())) * sample_dy) / sample_length2, 0., 1.));
                 position = start.pos + (end.pos - start.pos) * t;
                 model_uv = start.uv + (end.uv - start.uv) * t;
+                if (wall_distance != nullptr) {
+                    // Thick strips overlap at short mesh edges, concavities and neighbouring
+                    // contours. Triangle order is not visibility: the closest contour owns
+                    // the colour, rather than a distant facet painting over this wall.
+                    distance = float((x - position.x()) * (x - position.x()) +
+                                     (y - position.y()) * (y - position.y()));
+                    const float previous = (*wall_distance)[size_t(py) * size_t(raster.width) + size_t(px)];
+                    // Coincident paint layers still composite in their original order.
+                    if (distance > previous + 1e-10f)
+                        continue;
+                }
             }
-            shade_pixel(raster, px, py, position, normal, surface, &model_uv);
+            if (shade_pixel(raster, px, py, position, normal, surface, &model_uv)) {
+                const size_t index = size_t(py) * size_t(raster.width) + size_t(px);
+                if (wall_distance != nullptr)
+                    (*wall_distance)[index] = distance;
+                if (area_depth != nullptr)
+                    (*area_depth)[index] = position.z();
+            }
         }
     }
 }
 
 void rasterize_polygon(Raster &raster, const std::vector<PolyVertex> &poly, const Vec3f &normal,
-                       const PaintedSurface &surface, const std::vector<uint8_t> &area_mask)
+                       const PaintedSurface &surface, const std::vector<uint8_t> &area_mask,
+                       std::vector<float> &area_depth)
 {
     // A triangle cut by two parallel planes stays convex, so a fan from its first vertex covers it.
     for (size_t i = 1; i + 1 < poly.size(); ++i) {
         const Vec2f uv[3] = { poly[0].uv, poly[i].uv, poly[i + 1].uv };
         rasterize_triangle(raster, poly[0].pos, poly[i].pos, poly[i + 1].pos, normal, uv, surface,
-                           nullptr, &area_mask);
+                           nullptr, &area_mask, nullptr, &area_depth);
     }
 }
 
-// Side-wall triangles also project to an area when clipped to a finite-height slab.
-// That projection is not a top/bottom surface and must not overwrite the wall's texture row.
-// Build one scanline mask from Orca's actual external fill surfaces, including their holes.
-std::vector<uint8_t> external_surface_mask(const Layer &layer, const Raster &raster)
+// Rasterise native polygon coverage, preserving holes and the head pixel grid.
+std::vector<uint8_t> polygon_mask(const ExPolygons &polygons, const Raster &raster)
 {
     std::vector<uint8_t> mask(size_t(raster.width) * size_t(raster.height), uint8_t(0));
     std::vector<double> crossings;
-    for (const LayerRegion *region : layer.regions()) {
-        for (const Surface &surface : region->fill_surfaces.surfaces) {
-            if (!surface.is_external() || surface.expolygon.empty())
-                continue;
-            const ExPolygon &expolygon = surface.expolygon;
-            for (int py = 0; py < raster.height; ++py) {
-                raster.check_cancel();
-                const double y = double(raster.origin.y()) + (py + 0.5) * MM_PER_PX;
-                crossings.clear();
-                auto intersect_ring = [&](const Polygon &ring) {
-                    if (ring.points.empty())
-                        return;
-                    for (size_t i = 0, j = ring.points.size() - 1; i < ring.points.size(); j = i++) {
-                        const Vec2d a = unscale(ring.points[j]);
-                        const Vec2d b = unscale(ring.points[i]);
-                        if ((a.y() > y) != (b.y() > y))
-                            crossings.push_back(a.x() + (y - a.y()) * (b.x() - a.x()) / (b.y() - a.y()));
-                    }
-                };
-                intersect_ring(expolygon.contour);
-                for (const Polygon &hole : expolygon.holes)
-                    intersect_ring(hole);
-                std::sort(crossings.begin(), crossings.end());
-                for (size_t i = 0; i + 1 < crossings.size(); i += 2) {
-                    const int x0 = std::max(0, int(std::ceil(
-                        (crossings[i] - double(raster.origin.x())) / MM_PER_PX - 0.5)));
-                    const int x1 = std::min(raster.width, int(std::ceil(
-                        (crossings[i + 1] - double(raster.origin.x())) / MM_PER_PX - 0.5)));
-                    if (x1 > x0)
-                        std::fill(mask.begin() + size_t(py) * size_t(raster.width) + size_t(x0),
-                                  mask.begin() + size_t(py) * size_t(raster.width) + size_t(x1), uint8_t(1));
+    for (const ExPolygon &expolygon : polygons) {
+        if (expolygon.empty())
+            continue;
+        const BoundingBox box(expolygon.contour.points);
+        const int first_row = std::max(0, int(std::ceil(
+            (unscale<double>(box.min.y()) - double(raster.origin.y())) / MM_PER_PX - 0.5)));
+        const int last_row = std::min(raster.height, int(std::ceil(
+            (unscale<double>(box.max.y()) - double(raster.origin.y())) / MM_PER_PX - 0.5)));
+        for (int py = first_row; py < last_row; ++py) {
+            raster.check_cancel();
+            const double y = double(raster.origin.y()) + (py + 0.5) * MM_PER_PX;
+            crossings.clear();
+            auto intersect_ring = [&](const Polygon &ring) {
+                if (ring.points.empty())
+                    return;
+                for (size_t i = 0, j = ring.points.size() - 1; i < ring.points.size(); j = i++) {
+                    const Vec2d a = unscale(ring.points[j]);
+                    const Vec2d b = unscale(ring.points[i]);
+                    if ((a.y() > y) != (b.y() > y))
+                        crossings.push_back(a.x() + (y - a.y()) * (b.x() - a.x()) / (b.y() - a.y()));
                 }
+            };
+            intersect_ring(expolygon.contour);
+            for (const Polygon &hole : expolygon.holes)
+                intersect_ring(hole);
+            std::sort(crossings.begin(), crossings.end());
+            for (size_t i = 0; i + 1 < crossings.size(); i += 2) {
+                const int x0 = std::max(0, int(std::ceil(
+                    (crossings[i] - double(raster.origin.x())) / MM_PER_PX - 0.5)));
+                const int x1 = std::min(raster.width, int(std::ceil(
+                    (crossings[i + 1] - double(raster.origin.x())) / MM_PER_PX - 0.5)));
+                if (x1 > x0)
+                    std::fill(mask.begin() + size_t(py) * size_t(raster.width) + size_t(x0),
+                              mask.begin() + size_t(py) * size_t(raster.width) + size_t(x1), uint8_t(1));
             }
         }
     }
     return mask;
+}
+
+// Slab projections of side walls must not overwrite actual top/bottom surfaces.
+std::vector<uint8_t> external_surface_mask(const Layer &layer, const Raster &raster)
+{
+    ExPolygons polygons;
+    for (const LayerRegion *region : layer.regions())
+        for (const Surface &surface : region->fill_surfaces.surfaces)
+            if (surface.is_external())
+                polygons.push_back(surface.expolygon);
+    return polygon_mask(polygons, raster);
+}
+
+std::vector<uint8_t> wall_band_mask(const Layer &layer, const Raster &raster,
+                                   const float inner_mm, const float outer_mm)
+{
+    Polygons polygons;
+    for (const LayerRegion *region : layer.regions())
+        for (const Surface &surface : region->slices.surfaces)
+            append(polygons, to_polygons(surface.expolygon));
+    if (polygons.empty())
+        polygons = to_polygons(layer.lslices);
+    // Standalone image-only callers can supply layers without native slices.
+    if (polygons.empty())
+        return {};
+    ExPolygons section = union_ex(polygons);
+    if (section.size() > 1 && layer.has_extrusions()) {
+        // Native perimeter generation can discard a sub-width island entirely.
+        // It must not leave a floating ink ring where no material is printed.
+        // Assign actual path anchors to islands; do not trim valid wall bands to
+        // individual extrusion widths (the inward band is deliberately wider).
+        Points anchors;
+        std::vector<const ExtrusionEntity *> pending;
+        for (const LayerRegion *region : layer.regions()) {
+            pending.push_back(&region->perimeters);
+            pending.push_back(&region->fills);
+        }
+        while (!pending.empty()) {
+            const ExtrusionEntity *entity = pending.back();
+            pending.pop_back();
+            if (entity->is_collection()) {
+                for (const ExtrusionEntity *child :
+                     static_cast<const ExtrusionEntityCollection *>(entity)->entities)
+                    pending.push_back(child);
+            } else {
+                anchors.push_back(entity->first_point());
+            }
+        }
+        section.erase(std::remove_if(section.begin(), section.end(), [&](const ExPolygon &island) {
+            const BoundingBox box(island.contour.points);
+            return std::none_of(anchors.begin(), anchors.end(), [&](const Point &point) {
+                return box.contains(point) && island.contains(point);
+            });
+        }), section.end());
+    }
+    // A band is the difference of two offsets of the WHOLE section. Offsetting
+    // each painted edge independently lets its inward strip pass through a thin
+    // wall and emerge outside the opposite edge, exceeding the outward width.
+    // Native slices also keep holes and merged/compensated model boundaries.
+    return polygon_mask(diff_ex(
+        offset_ex(section, scaled<float>(outer_mm), jtMiter, 2.),
+        offset_ex(section, -scaled<float>(inner_mm), jtMiter, 2.)), raster);
 }
 
 // Walls are seen edge-on from above and cover no pixel, but the section contour is still sprayed:
@@ -379,7 +468,6 @@ std::vector<uint8_t> external_surface_mask(const Layer &layer, const Raster &ras
 // slice_standalone.py sized its nib from the canvas, not from the model: line_width =
 // max(2, img_size * 12 / 4000) px on a 270 mm bed, i.e. 12 px at 4000 px, which is 0.81 mm
 // of ink with the contour in the middle of it.
-constexpr double DEFAULT_WALL_BAND_MM = 30.0 * MM_PER_PX;  // 30 px of ink: 0.627 mm at 684 rows / 14.29 mm
 
 struct WallSegment
 {
@@ -390,17 +478,15 @@ struct WallSegment
 };
 
 void collect_wall_segment(std::vector<WallSegment> &segments, const std::vector<PolyVertex> &poly,
-                          const Vec3f &normal, const PaintedSurface &surface)
+                          const Vec3f &normal, const PaintedSurface &surface, const float z_cut)
 {
     if (poly.size() < 3)
         return;
 
-    // Which row of the texture this layer's ink comes from. An upright wall seen from above projects
-    // onto a line, so every edge of the clipped polygon lies on that same line and "the longest
-    // edge" was a coin flip between the slab's bottom row and its top row: half the layers then read
-    // the texture a whole layer lower than the plane the picture is laid on, which is the one layer
-    // step the preview showed. Cutting the polygon with the horizontal plane at the top of whatever
-    // survived the slab gives one definite row instead.
+    // All facets must intersect the SAME plane as the native model slice. Taking
+    // each clipped facet's own highest Z mixes several contours: facets ending
+    // inside the slab add spurs, their neighbours no longer join, and wide strips
+    // turn those spurs into folded patches of unrelated texture.
     float z_lo = poly[0].pos.z();
     float z_hi = poly[0].pos.z();
     for (const PolyVertex &v : poly) {
@@ -410,10 +496,8 @@ void collect_wall_segment(std::vector<WallSegment> &segments, const std::vector<
     // A coplanar horizontal face has area, not a wall intersection. Treating its
     // vertices as a row strokes an internal triangulation edge across the top.
     // Its colour is still composited by rasterize_polygon() after the walls.
-    if (z_hi == z_lo)
+    if (z_hi == z_lo || z_cut < z_lo || z_cut >= z_hi)
         return;
-    const float z_cut = std::min(z_hi - std::min(1e-4f, (z_hi - z_lo) * 0.05f),
-                                 std::nextafter(z_hi, z_lo));
 
     std::vector<PolyVertex> row;
     row.reserve(4);
@@ -467,12 +551,30 @@ void collect_wall_segment(std::vector<WallSegment> &segments, const std::vector<
     segments.push_back(WallSegment{ row[i0], row[i1], normal, n_out, &surface });
 }
 
-void rasterize_wall_segments(Raster &raster, const std::vector<WallSegment> &segments, const float half_mm)
+void rasterize_wall_segments(Raster &raster, const Layer &layer, std::vector<WallSegment> &segments,
+                             const float inner_mm, const float outer_mm)
 {
+    // At a shared endpoint several segments have exactly the same nearest
+    // point. Resolve that tie geometrically, not by mesh triangle storage order.
+    // Keep distinct painted surfaces in their original compositing order.
+    std::sort(segments.begin(), segments.end(), [](const WallSegment &a, const WallSegment &b) {
+        if (a.surface != b.surface)
+            return a.surface < b.surface;
+        const auto key = [](const WallSegment &s) {
+            return std::array<float, 13>{s.a.pos.x(), s.a.pos.y(), s.a.pos.z(),
+                s.b.pos.x(), s.b.pos.y(), s.b.pos.z(), s.a.uv.x(), s.a.uv.y(),
+                s.b.uv.x(), s.b.uv.y(), s.normal.x(), s.normal.y(), s.normal.z()};
+        };
+        return key(a) < key(b);
+    });
     // Join geometry, not texture coordinates. Neighbouring faces may have a UV seam, and averaging
     // those UVs would sample unrelated texels. Both faces share the same miter cross-section instead.
     constexpr double join_mm = 0.0002;
     constexpr float miter_limit = 2.f;
+    std::vector<float> wall_distance(size_t(raster.width) * size_t(raster.height),
+                                     std::numeric_limits<float>::max());
+    const std::vector<uint8_t> band_mask = wall_band_mask(layer, raster, inner_mm, outer_mm);
+    const auto *coverage = band_mask.empty() ? nullptr : &band_mask;
     using Cell = std::pair<int64_t, int64_t>;
     using End = std::pair<size_t, size_t>;
     std::map<Cell, std::vector<End>> endpoints;
@@ -484,7 +586,7 @@ void rasterize_wall_segments(Raster &raster, const std::vector<WallSegment> &seg
     for (size_t i = 0; i < segments.size(); ++i) {
         raster.check_cancel();
         centers[i] = { Vec2f(segments[i].a.pos.head<2>()), Vec2f(segments[i].b.pos.head<2>()) };
-        offsets[i] = { Vec2f(segments[i].outside * half_mm), Vec2f(segments[i].outside * half_mm) };
+        offsets[i] = { segments[i].outside, segments[i].outside };
         for (size_t end = 0; end < 2; ++end)
             endpoints[cell(centers[i][end])].emplace_back(i, end);
     }
@@ -524,7 +626,7 @@ void rasterize_wall_segments(Raster &raster, const std::vector<WallSegment> &seg
             // For unit normals, |m / denominator|^2 = 2 / denominator.
             // Near a reversal an unlimited miter paints a long spike into the ink raster.
             if (denominator >= 2.f / (miter_limit * miter_limit)) {
-                const Vec2f offset = m * (half_mm / denominator);
+                const Vec2f offset = m / denominator;
                 offsets[i][end] = offsets[neighbor.first][neighbor.second] = offset;
             } else {
                 const WallSegment &s = segments[i];
@@ -532,15 +634,18 @@ void rasterize_wall_segments(Raster &raster, const std::vector<WallSegment> &seg
                 const PolyVertex &w = neighbor.second == 0 ? other.a : other.b;
                 // Retain the perpendicular strip ends and fill their gap with a bevel.
                 // Each half samples its own endpoint, including across UV seams.
-                for (float side : {-1.f, 1.f}) {
-                    const Vec2f a = center + side * half_mm * s.outside;
-                    const Vec2f b = center + side * half_mm * other.outside;
+                for (float distance : {-inner_mm, outer_mm}) {
+                    if (distance == 0.f)
+                        continue;
+                    const Vec2f a = center + distance * s.outside;
+                    const Vec2f b = center + distance * other.outside;
                     const Vec2f mid = (a + b) * 0.5f;
                     const auto at = [](const Vec2f &point, float z) { return Vec3f(point.x(), point.y(), z); };
+                    const std::array<PolyVertex, 2> source_v = {v, v}, source_w = {w, w};
                     rasterize_triangle(raster, at(center, v.pos.z()), at(a, v.pos.z()), at(mid, v.pos.z()),
-                                       s.normal, {v.uv, v.uv, v.uv}, *s.surface);
+                                       s.normal, {v.uv, v.uv, v.uv}, *s.surface, &source_v, coverage, &wall_distance);
                     rasterize_triangle(raster, at(center, w.pos.z()), at(mid, w.pos.z()), at(b, w.pos.z()),
-                                       other.normal, {w.uv, w.uv, w.uv}, *other.surface);
+                                       other.normal, {w.uv, w.uv, w.uv}, *other.surface, &source_w, coverage, &wall_distance);
                 }
             }
         }
@@ -550,15 +655,15 @@ void rasterize_wall_segments(Raster &raster, const std::vector<WallSegment> &seg
         const WallSegment &s = segments[i];
         const Vec2f a = centers[i][0], b = centers[i][1];
         const Vec2f na = offsets[i][0], nb = offsets[i][1];
-        const Vec3f p0(a.x() + na.x(), a.y() + na.y(), s.a.pos.z());
-        const Vec3f p1(a.x() - na.x(), a.y() - na.y(), s.a.pos.z());
-        const Vec3f p2(b.x() + nb.x(), b.y() + nb.y(), s.b.pos.z());
-        const Vec3f p3(b.x() - nb.x(), b.y() - nb.y(), s.b.pos.z());
+        const Vec3f p0(a.x() + outer_mm * na.x(), a.y() + outer_mm * na.y(), s.a.pos.z());
+        const Vec3f p1(a.x() - inner_mm * na.x(), a.y() - inner_mm * na.y(), s.a.pos.z());
+        const Vec3f p2(b.x() + outer_mm * nb.x(), b.y() + outer_mm * nb.y(), s.b.pos.z());
+        const Vec3f p3(b.x() - inner_mm * nb.x(), b.y() - inner_mm * nb.y(), s.b.pos.z());
         const Vec2f t0[3] = { s.a.uv, s.a.uv, s.b.uv };
         const Vec2f t1[3] = { s.a.uv, s.b.uv, s.b.uv };
         const std::array<PolyVertex, 2> source = { s.a, s.b };
-        rasterize_triangle(raster, p0, p1, p3, s.normal, t0, *s.surface, &source);
-        rasterize_triangle(raster, p0, p3, p2, s.normal, t1, *s.surface, &source);
+        rasterize_triangle(raster, p0, p1, p3, s.normal, t0, *s.surface, &source, coverage, &wall_distance);
+        rasterize_triangle(raster, p0, p3, p2, s.normal, t1, *s.surface, &source, coverage, &wall_distance);
     }
 }
 
@@ -880,8 +985,11 @@ std::map<const Layer *, InkLayer> build_inkjet_layers(const PrintObject &object,
     // read detail from. The canvas keeps the strips' own pixel size (25.4 / 0.0209 = 1215 dpi), so it
     // is far past the 300 dpi a review picture needs, and only shrinks if a model is so large that
     // the picture would be uselessly heavy to hand to the UI.
-    const float          half_band     = float(0.5 * std::max(0.05, params.wall_band_mm));
-    const double         PREVIEW_PAD_MM = double(half_band) + 2. * MM_PER_PX;
+    const float inner_band = float(std::max(0., params.wall_band_inner_mm));
+    const float outer_band = float(std::max(0., params.wall_band_outer_mm));
+    // Match the join's miter limit so corners are not clipped by raster bounds.
+    const float band_margin = 2.f * std::max(inner_band, outer_band);
+    const double PREVIEW_PAD_MM = double(band_margin) + 2. * MM_PER_PX;
     int                  preview_x0 = 0, preview_y0 = 0, preview_w = 0, preview_h = 0, preview_step = 1;
     // Where each written picture belongs in Z, so the 3D preview can lay the cross-section on
     // the model at the height it was cut at instead of guessing.
@@ -911,13 +1019,14 @@ std::map<const Layer *, InkLayer> build_inkjet_layers(const PrintObject &object,
     // The PNG writer retains one row and its coordinate maps, not a full
     // preview. PNG and MBD scratch do not overlap in lifetime.
     std::vector<BoundingBoxf> layer_bounds;
-    double full_width = std::ceil((bounds.max.x() - bounds.min.x() + 2. * half_band) / MM_PER_PX) + 4.;
-    double full_height = std::ceil((bounds.max.y() - bounds.min.y() + 2. * half_band) / MM_PER_PX) + 4.;
+    double full_width = std::ceil((bounds.max.x() - bounds.min.x() + 2. * band_margin) / MM_PER_PX) + 4.;
+    double full_height = std::ceil((bounds.max.y() - bounds.min.y() + 2. * band_margin) / MM_PER_PX) + 4.;
     double max_pixels = std::min(double(MAX_RASTER_PIXELS), full_width * full_height);
     const auto working_bytes = [&](double pixels, double width) {
         const double preview_bytes = double(preview_w) * 4. + double(preview_h) * sizeof(std::pair<int, int>) +
             width * sizeof(int);
-        return pixels * 5. + std::max(preview_bytes, width * MBD_STRIP_ROWS * 12. + 2. * 1024. * 1024.);
+        return pixels * 6. + std::max({pixels * sizeof(float), preview_bytes,
+                                      width * MBD_STRIP_ROWS * 12. + 2. * 1024. * 1024.});
     };
     // Small parts already reach the concurrency cap. An extrema sweep cannot
     // improve their allocation, so keep their existing per-layer bounds scan.
@@ -955,10 +1064,10 @@ std::map<const Layer *, InkLayer> build_inkjet_layers(const PrintObject &object,
             auto& slab = layer_bounds[li];
             slab = BoundingBoxf(Vec2d(*extrema[0].begin(), *extrema[2].begin()),
                                 Vec2d(*extrema[1].rbegin(), *extrema[3].rbegin()));
-            const Vec2f origin(float(slab.min.x()) - half_band - float(MM_PER_PX),
-                               float(slab.min.y()) - half_band - float(MM_PER_PX));
-            const double width = std::max(1., std::ceil((slab.max.x() + half_band - double(origin.x())) / MM_PER_PX) + 2.);
-            const double height = std::max(1., std::ceil((slab.max.y() + half_band - double(origin.y())) / MM_PER_PX) + 2.);
+            const Vec2f origin(float(slab.min.x()) - band_margin - float(MM_PER_PX),
+                               float(slab.min.y()) - band_margin - float(MM_PER_PX));
+            const double width = std::max(1., std::ceil((slab.max.x() + band_margin - double(origin.x())) / MM_PER_PX) + 2.);
+            const double height = std::max(1., std::ceil((slab.max.y() + band_margin - double(origin.y())) / MM_PER_PX) + 2.);
             if (width * height <= MAX_RASTER_PIXELS) {
                 max_pixels = std::max(max_pixels, width * height);
                 full_width = std::max(full_width, width);
@@ -1018,10 +1127,10 @@ std::map<const Layer *, InkLayer> build_inkjet_layers(const PrintObject &object,
             if (! slab.defined)
                 continue;
 
-            raster.origin = Vec2f(float(slab.min.x()) - half_band - float(MM_PER_PX),
-                                 float(slab.min.y()) - half_band - float(MM_PER_PX));
-            raster.width  = std::max(1, int(std::ceil((slab.max.x() + half_band - double(raster.origin.x())) / MM_PER_PX)) + 2);
-            raster.height = std::max(1, int(std::ceil((slab.max.y() + half_band - double(raster.origin.y())) / MM_PER_PX)) + 2);
+            raster.origin = Vec2f(float(slab.min.x()) - band_margin - float(MM_PER_PX),
+                                 float(slab.min.y()) - band_margin - float(MM_PER_PX));
+            raster.width  = std::max(1, int(std::ceil((slab.max.x() + band_margin - double(raster.origin.x())) / MM_PER_PX)) + 2);
+            raster.height = std::max(1, int(std::ceil((slab.max.y() + band_margin - double(raster.origin.y())) / MM_PER_PX)) + 2);
             if (size_t(raster.width) * size_t(raster.height) > MAX_RASTER_PIXELS) {
                 BOOST_LOG_TRIVIAL(warning) << "MKP: layer " << layer->id() << " is too large to spray, skipped";
                 continue;
@@ -1061,17 +1170,22 @@ std::map<const Layer *, InkLayer> build_inkjet_layers(const PrintObject &object,
                     }
                     // The ring goes down first and the area fill on top of it, so a top or bottom
                     // surface covers the inner half of the ring instead of being eaten by it.
-                    collect_wall_segment(wall_segments, poly, triangle.normal, surface);
+                    collect_wall_segment(wall_segments, poly, triangle.normal, surface, float(layer->slice_z));
                     if (body > double(MM_PER_PX) * double(MM_PER_PX))
                         area_fills.push_back(AreaFill{ poly, &triangle, &surface });
                 }
             }
 
-            rasterize_wall_segments(raster, wall_segments, half_band);
+            rasterize_wall_segments(raster, *layer, wall_segments, inner_band, outer_band);
             if (!area_fills.empty()) {
                 const std::vector<uint8_t> area_mask = external_surface_mask(*layer, raster);
+                // Projected faces can overlap too. Only the topmost surface at
+                // this pixel may replace a wall colour; a later lower triangle
+                // must not punch a different coloured shard through it.
+                std::vector<float> area_depth(size_t(raster.width) * size_t(raster.height),
+                                               std::numeric_limits<float>::lowest());
                 for (const AreaFill &fill : area_fills)
-                    rasterize_polygon(raster, fill.polygon, fill.triangle->normal, *fill.surface, area_mask);
+                    rasterize_polygon(raster, fill.polygon, fill.triangle->normal, *fill.surface, area_mask, area_depth);
             }
 
             // The colour knobs act on the ink of this layer once, on the raster. Both the strips and

@@ -1189,6 +1189,8 @@ public:
     bool                        has_belt_purge_tower() const;
     const WipeTowerData&        wipe_tower_data(size_t filaments_cnt = 0) const;
     const ToolOrdering& 		tool_ordering() const { return m_tool_ordering; }
+    // Re-plan native tower transitions once the actual inked exposed tops are known.
+    void                        plan_ink_seal_tools(const InkSealTools &seal_tools);
 
     void update_filament_maps_to_config(std::vector<int> f_maps, std::vector<int> f_volume_maps = std::vector<int>{}, std::vector<int> f_nozzle_maps = std::vector<int>{});
     // Write-back for a selector (per-layer planned) grouping result. When a filament actually
@@ -1466,7 +1468,7 @@ private:
     bool                invalidate_state_by_config_options(const ConfigOptionResolver &new_config, const std::vector<t_config_option_key> &opt_keys);
 
     void                _make_skirt();
-    void                _make_wipe_tower();
+    void                _make_wipe_tower(const InkSealTools &seal_tools = {});
     // Belt mode: route filament-change purging into the belt purge prism
     // (flush-into-objects) without generating a classic wipe tower.
     void                _plan_belt_purge();

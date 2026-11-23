@@ -1730,6 +1730,8 @@ PRINT_CONFIG_CLASS_DEFINE(
 PRINT_CONFIG_CLASS_DEFINE(
     GCodeConfig,
 
+    ((ConfigOptionFloat,              mkp_inkjet_wall_band_inner))
+    ((ConfigOptionFloat,              mkp_inkjet_wall_band_outer))
     ((ConfigOptionBool,               mkp_outer_wall_linear_speed))
     ((ConfigOptionFloat,              mkp_outer_wall_speed_min))
     ((ConfigOptionString,              before_layer_change_gcode))
@@ -1833,6 +1835,7 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionFloatsNullable,      retraction_distances_when_ec))
     ((ConfigOptionBoolsNullable,       long_retractions_when_ec))
     ((ConfigOptionFloats,              z_hop))
+    ((ConfigOptionBool,                mkp_surface_travel_z_hop))
     // BBS
     ((ConfigOptionEnumsGeneric,        z_hop_types))
     ((ConfigOptionFloats,              travel_slope))

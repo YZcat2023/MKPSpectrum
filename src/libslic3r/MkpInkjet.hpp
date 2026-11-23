@@ -48,9 +48,8 @@ struct InkLayer {
 // painted faces with that layer's slab, project the result from above, sample the texture's colour
 // on it, and encode one .mbd strip per ink pass into `zip` as "<prefix>layer_XXXX/XXXXX.mbd".
 // Returns where the head has to travel; the strips it refers to are already in the archive.
-// `wall_band_mm` is the band an ink pass lays along an upright face: such a face projects to a
-// line with no area to fill, so its contour is drawn with a band of that total width, centred on
-// it, 35% of that width outside the silhouette and 65% inside. 30 px of ink, i.e. 0.627 mm.
+// Upright faces project to lines. Draw their bands with independent inward and outward
+// widths in model millimetres; the outward width controls ink bleeding onto the bed.
 // Everything the ink itself is made of. These used to be UI-only: the controls existed, the values
 // were saved, and nothing downstream ever read them, so moving a slider changed the print by nothing
 // at all. Each one is now consumed here, by the strip that is encoded.
@@ -67,7 +66,8 @@ struct InkjetParams
     // Head skew compensation: how far the top row of a strip sits to the right of its bottom row.
     double shear_mm   = 0.0;
     // Band an ink pass lays along an upright face (see below).
-    double wall_band_mm = 0.62675;
+    double wall_band_inner_mm = 0.6;
+    double wall_band_outer_mm = 0.15;
     bool surface_tone = false;
     // Printing-speed modulation also needs the tone map when no inkjet pass is requested.
     bool encode_strips = true;

@@ -37,6 +37,41 @@
 using namespace Slic3r;
 using namespace Slic3r::Test;
 
+TEST_CASE("Post-ink sealing plans its return tool without repeating model extrusion", "[WipeTower][Regression]")
+{
+    const auto config = multifilament_config(2, {
+        {"layer_height", "0.2"}, {"initial_layer_print_height", "0.2"},
+        {"enable_prime_tower", "1"}, {"mkp_full_height_prime_tower", "1"},
+        {"prime_volume", "20"}, {"prime_tower_width", "40"}
+    });
+    Print print;
+    Model model;
+    std::vector<std::vector<ConfigBase::SetDeserializeItem>> overrides = {
+        {{"extruder", "1"}}, {{"extruder", "2"}}
+    };
+    init_print({make_cube(8., 8., .6), make_cube(8., 8., .6)}, print, model, config, &overrides);
+    print.process();
+    const LayerTools before = print.tool_ordering().layer_tools().at(1);
+    REQUIRE(before.extruders.size() == 2);
+    const unsigned int seal_tool = before.extruders.front();
+    const InkSealTools seals = {{before.print_z, {seal_tool}}};
+    print.plan_ink_seal_tools(seals);
+    const LayerTools &after = print.tool_ordering().tools_for_layer(before.print_z);
+    CHECK(after.extruders == before.extruders);
+    CHECK(after.extrusion_sequence().size() == before.extruders.size() + 1);
+    CHECK(after.extrusion_sequence().back() == seal_tool);
+    const auto &tower = print.wipe_tower_data().tool_changes.at(1);
+    REQUIRE_FALSE(tower.empty());
+    CHECK(tower.back().new_tool == seal_tool);
+
+    // Exporting the same Print again with no seals must discard the extra transition.
+    print.plan_ink_seal_tools({});
+    const LayerTools &restored = print.tool_ordering().tools_for_layer(before.print_z);
+    CHECK(restored.extruders == before.extruders);
+    CHECK(restored.ink_seal_extruders.empty());
+    CHECK(restored.extrusion_sequence() == before.extruders);
+}
+
 // Taken from the config enum map rather than hand-listed, so a flavor added to GCodeFlavor later
 // is covered here without editing this file.
 static std::vector<GCodeFlavor> non_klipper_flavors()

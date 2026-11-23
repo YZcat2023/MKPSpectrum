@@ -35,6 +35,9 @@ class LayerTools;
 namespace CustomGCode { struct Item; }
 class PrintRegion;
 
+// Actual post-ink sealing tools, resolved after texture slicing. IDs are zero based.
+using InkSealTools = std::map<coordf_t, std::vector<unsigned int>>;
+
 // Object of this class holds information about whether an extrusion is printed immediately
 // after a toolchange (as part of infill/perimeter wiping) or not. One extrusion can be a part
 // of several copies - this has to be taken into account.
@@ -173,6 +176,14 @@ public:
     bool						has_support = false;
     // Zero based extruder IDs, ordered to minimize tool switches.
     std::vector<unsigned int> 	extruders;
+    std::vector<unsigned int> ink_seal_extruders;
+    std::vector<unsigned int> extrusion_sequence() const {
+        std::vector<unsigned int> sequence = extruders;
+        for (unsigned int tool : ink_seal_extruders)
+            if (sequence.empty() || sequence.back() != tool)
+                sequence.push_back(tool);
+        return sequence;
+    }
     // If per layer extruder switches are inserted by the G-code preview slider, this value contains the new (1 based) extruder, with which the whole object layer is being printed with.
     // If not overriden, it is set to 0.
     unsigned int 				extruder_override = 0;
@@ -280,8 +291,10 @@ public:
     void handle_dontcare_extruder(const std::vector<unsigned int>& first_layer_tool_order);
     void handle_dontcare_extruder(unsigned int first_extruder);
 
-    void sort_and_build_data(const PrintObject &object, unsigned int first_extruder, bool prime_multi_material = false);
-    void sort_and_build_data(const Print& print, unsigned int first_extruder, bool prime_multi_material = false);
+    void sort_and_build_data(const PrintObject &object, unsigned int first_extruder, bool prime_multi_material = false,
+                             const InkSealTools &seal_tools = {});
+    void sort_and_build_data(const Print& print, unsigned int first_extruder, bool prime_multi_material = false,
+                             const InkSealTools &seal_tools = {});
 
     void    clear() {
         m_layer_tools.clear();
@@ -373,6 +386,7 @@ public:
     bool                is_last_extrusion_layer(coordf_t print_z, unsigned int extruder_id) const;
 
 private:
+    void                assign_ink_seal_tools(const InkSealTools &seal_tools);
     void				initialize_layers(std::vector<coordf_t> &zs);
     void 				collect_extruders(const PrintObject &object, const std::vector<std::pair<double, unsigned int>> &per_layer_extruder_switches);
     void 				fill_wipe_tower_partitions(const PrintConfig &config, coordf_t object_bottom_z, coordf_t max_layer_height);

@@ -2119,7 +2119,7 @@ static std::vector<Vec2d> get_path_of_change_filament(const Print& print)
         return gcode;
     }
 
-    std::string WipeTowerIntegration::tool_change(GCode &gcodegen, int extruder_id, bool finish_layer)
+    std::string WipeTowerIntegration::tool_change(GCode &gcodegen, int extruder_id, bool finish_layer, double layer_z)
     {
         std::string gcode;
 
@@ -2134,7 +2134,7 @@ static std::vector<Vec2d> get_path_of_change_filament(const Print& print)
 
                     // Calculate where the wipe tower layer will be printed. -1 means that print z will not change,
                     // resulting in a wipe tower with sparse layers.
-                    double wipe_tower_z  = -1;
+                    double wipe_tower_z  = layer_z;
                     // Folded into a later, thicker layer that prints at its own z: nothing to emit.
                     bool   ignore_sparse = wipe_tower_layer_is_combined_away(m_tool_changes[m_layer_idx]);
                     if (m_sparse_layers_skipped) {
@@ -2153,7 +2153,7 @@ static std::vector<Vec2d> get_path_of_change_filament(const Print& print)
         } else {
             // Calculate where the wipe tower layer will be printed. -1 means that print z will not change,
             // resulting in a wipe tower with sparse layers.
-            double wipe_tower_z  = -1;
+            double wipe_tower_z  = layer_z;
             // Folded into a later, thicker layer that prints at its own z: nothing to emit.
             bool   ignore_sparse = wipe_tower_layer_is_combined_away(m_tool_changes[m_layer_idx]);
             if (m_sparse_layers_skipped) {
@@ -2909,6 +2909,11 @@ static void set_mass_locator(GCodeProcessor &processor, const Print &print)
     processor.set_mass_locator(std::move(locate), std::move(object_masses));
 }
 
+namespace {
+using InkSealRegions = std::vector<std::pair<const PrintRegion *, std::vector<ExtrusionPath>>>;
+InkSealRegions mkp_ink_seal_paths(const Layer &layer, const PrintConfig &config);
+}
+
 void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* result, ThumbnailsGeneratorCallback thumbnail_cb)
 {
     PROFILE_CLEAR();
@@ -2971,6 +2976,8 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
     };
 
     m_mkp_ink.clear();
+    m_mkp_seals.clear();
+    m_mkp_seal_tools.clear();
     m_mkp_ink_prefix.clear();
     m_mkp_inkjet_started = false;
     m_mkp_tower_recovery_pending = false;
@@ -3069,7 +3076,8 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
                 ink_params.brightness   = cfg.mkp_inkjet_brightness.value;
                 ink_params.contrast     = cfg.mkp_inkjet_contrast.value;
                 ink_params.shear_mm     = cfg.mkp_inkjet_shear.value;
-                ink_params.wall_band_mm = cfg.mkp_inkjet_wall_band.value;
+                ink_params.wall_band_inner_mm = cfg.mkp_inkjet_wall_band_inner.value;
+                ink_params.wall_band_outer_mm = cfg.mkp_inkjet_wall_band_outer.value;
                 ink_params.surface_tone = (cfg.mkp_surface_enabled.value && cfg.mkp_surface_linear_speed.value) ||
                                           cfg.mkp_outer_wall_linear_speed.value;
                 ink_params.encode_strips = cfg.mkp_surface_enabled.value;
@@ -3077,7 +3085,8 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
                     << " c=" << ink_params.c << " m=" << ink_params.m << " y=" << ink_params.y
                     << " sat=" << ink_params.saturation << " bri=" << ink_params.brightness
                     << " con=" << ink_params.contrast << " shear=" << ink_params.shear_mm
-                    << " band=" << ink_params.wall_band_mm
+                    << " band_inner=" << ink_params.wall_band_inner_mm
+                    << " band_outer=" << ink_params.wall_band_outer_mm
                     << " speed=" << cfg.mkp_inkjet_speed.value
                     << " repeat=" << cfg.mkp_inkjet_repeat.value
                     << " dry=" << cfg.mkp_inkjet_dry_time.value
@@ -3115,6 +3124,45 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
         boost::system::error_code no_ink_ec;
         fs::remove(mkp_inkjet_zip_path(), no_ink_ec);
     }
+
+    // Texture slicing tells us exactly which exposed tops need sealing. Plan their
+    // native tool changes before exporting, including tower purge and next-layer tool state.
+    InkSealTools seal_tools;
+    if (print->config().mkp_surface_enabled && print->config().mkp_ink_seal_enabled) {
+        for (const auto &[object, ink_layers] : m_mkp_ink) {
+            ToolOrdering object_ordering;
+            const ToolOrdering *ordering = &print->tool_ordering();
+            if (print->config().print_sequence == PrintSequence::ByObject) {
+                object_ordering = ToolOrdering(*object, unsigned(-1));
+                object_ordering.sort_and_build_data(*object, unsigned(-1));
+                ordering = &object_ordering;
+            }
+            for (const auto &[layer, ink] : ink_layers) {
+                if (ink.empty())
+                    continue;
+                const LayerTools &tools = ordering->tools_for_layer(layer->print_z);
+                for (auto &[region, paths] : mkp_ink_seal_paths(*layer, print->config())) {
+                    if (paths.empty())
+                        continue;
+                    const unsigned int tool = tools.resolve_mixed(
+                        (tools.extruder_override ? tools.extruder_override : region->config().top_surface_filament_id.value) - 1);
+                    m_mkp_seals[layer].emplace_back(tool, std::move(paths));
+                    m_mkp_seal_tools[object][layer->print_z].push_back(tool);
+                    seal_tools[layer->print_z].push_back(tool);
+                }
+            }
+        }
+        for (auto &[z, tools] : seal_tools)
+            sort_remove_duplicates(tools);
+        for (auto &[object, by_z] : m_mkp_seal_tools)
+            for (auto &[z, tools] : by_z)
+                sort_remove_duplicates(tools);
+    }
+    // Rebuild even when empty: a second export may have disabled sealing since
+    // the previous one. Do not retain that export's extra tower transitions.
+    if (!seal_tools.empty() || std::any_of(print->tool_ordering().begin(), print->tool_ordering().end(),
+                                         [](const LayerTools &lt) { return !lt.ink_seal_extruders.empty(); }))
+        print->plan_ink_seal_tools(seal_tools);
 
     print->set_status(print->config().mkp_surface_enabled.value ? 90 : 80, _u8L("Generating G-code"));
 
@@ -3423,7 +3471,7 @@ namespace DoExport {
         int changes = 0;
         int last    = -1;
         for (const LayerTools &lt : tool_ordering)
-            for (unsigned int extruder : lt.extruders) {
+            for (unsigned int extruder : lt.extrusion_sequence()) {
                 if (last >= 0 && int(extruder) != last)
                     ++ changes;
                 last = int(extruder);
@@ -3821,7 +3869,9 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
     // fresh construction here would re-plan from a different seed. Static sequential prints keep
     // the fresh per-object construction (byte-identical output).
     const auto &seq_dynamic_orderings   = print.sequential_dynamic_orderings();
-    const bool  use_seq_dynamic_cache   = print.is_dynamic_group_reorder() && !seq_dynamic_orderings.empty();
+    // The slicing-time cache predates texture-dependent sealing tool returns.
+    const bool  use_seq_dynamic_cache   = print.is_dynamic_group_reorder() && !seq_dynamic_orderings.empty() &&
+                                         m_mkp_seal_tools.empty();
     if (print.config().print_sequence == PrintSequence::ByObject) {
         // Order object instances for sequential print.
         print_object_instances_ordering = sort_object_instances_by_model_order(print);
@@ -3836,7 +3886,8 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
                 tool_ordering = cached_ordering->second;
             } else {
                 tool_ordering = ToolOrdering(*(*print_object_instance_sequential_active)->print_object, initial_extruder_id);
-                tool_ordering.sort_and_build_data(*(*print_object_instance_sequential_active)->print_object,initial_extruder_id);
+                tool_ordering.sort_and_build_data(*(*print_object_instance_sequential_active)->print_object, initial_extruder_id,
+                    false, m_mkp_seal_tools[(*print_object_instance_sequential_active)->print_object]);
             }
             float temp_max_additional_fan = tool_ordering.cal_max_additional_fan(print.config());
             if(temp_max_additional_fan > max_additional_fan )
@@ -4883,7 +4934,7 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
                         tool_ordering = cached_ordering->second;
                     } else {
                         tool_ordering = ToolOrdering(object, final_extruder_id);
-                        tool_ordering.sort_and_build_data(object, final_extruder_id);
+                        tool_ordering.sort_and_build_data(object, final_extruder_id, false, m_mkp_seal_tools[&object]);
                     }
                     unsigned int new_extruder_id = tool_ordering.first_extruder();
                     if (new_extruder_id == (unsigned int)-1)
@@ -7065,12 +7116,12 @@ ExPolygons mkp_top_bottom_surfaces(const Layer &layer)
 
 // The same exposed-top classification used by native ironing, including the
 // perimeter area. Internal solid infill and bottom faces are not exposed tops.
-std::vector<ExtrusionPath> mkp_ink_seal_paths(const Layer &layer, const PrintConfig &config)
+InkSealRegions mkp_ink_seal_paths(const Layer &layer, const PrintConfig &config)
 {
-    std::vector<ExtrusionPath> paths;
+    InkSealRegions result;
     if (!config.mkp_ink_seal_enabled.value || config.mkp_ink_seal_height.value <= 0. ||
         config.mkp_ink_seal_flow.value <= 0. || config.mkp_ink_seal_width.value <= 0.)
-        return paths;
+        return result;
 
     const double height = config.mkp_ink_seal_height.value;
     Polygons covered;
@@ -7080,6 +7131,7 @@ std::vector<ExtrusionPath> mkp_ink_seal_paths(const Layer &layer, const PrintCon
          upper = upper->upper_layer)
         polygons_append(covered, upper->lslices);
     for (const LayerRegion *region : layer.regions()) {
+        std::vector<ExtrusionPath> paths;
         if (region->region().config().top_shell_layers.value <= 0)
             continue;
         Polygons tops;
@@ -7124,19 +7176,21 @@ std::vector<ExtrusionPath> mkp_ink_seal_paths(const Layer &layer, const PrintCon
                 paths.emplace_back(std::move(path));
             }
         }
+        if (!paths.empty())
+            result.emplace_back(&region->region(), std::move(paths));
     }
-    return paths;
+    return result;
 }
 
 // Emit the strokes as non-extruding moves at the surface-treatment speed. dE is zero on purpose: the
 // inkjet head only has to follow the path, and the brush does not deposit filament.
-// work_z is where the tool reaches the surface, safe_z is where it may travel: hopping between two
-// contours at work_z would rake the tool over everything standing in between, so each hop is raised
-// to safe_z and only the contour itself runs at work_z.
+// work_z is where the tool reaches the surface. Inter-stroke travel may stay at work_z when
+// explicitly requested; entry from the dock and final departure always retain safe_z.
 void mkp_emit_strokes(std::string &gcode, GCodeWriter &writer, const Vec2d &origin, const Polylines &lines,
                       double speed_mm_s, coordf_t work_z, coordf_t safe_z,
                       const std::string &role_pass, const std::string &role_reset,
-                      const mkp::SurfaceTone *tone, double speed_min, double speed_max)
+                      const mkp::SurfaceTone *tone, double speed_min, double speed_max, bool travel_z_hop,
+                      bool &at_work_height)
 {
     if (lines.empty())
         return;
@@ -7148,10 +7202,14 @@ void mkp_emit_strokes(std::string &gcode, GCodeWriter &writer, const Vec2d &orig
         // every jump from one contour to the next. Emitting them under the surface role made the
         // preview draw a long stroke through thin air between the outline and a hole; the moves have
         // to be tagged as travel so only the actual contour is a surface treatment path.
-        mkp_z(gcode, writer, safe_z);
+        const bool lift_for_travel = travel_z_hop || !at_work_height;
+        if (lift_for_travel)
+            mkp_z(gcode, writer, safe_z);
         gcode += role_reset;
         gcode += writer.travel_to_xy(unscale(polyline.points.front()) + origin);
-        mkp_z(gcode, writer, work_z, "F600");
+        if (lift_for_travel)
+            mkp_z(gcode, writer, work_z, "F600");
+        at_work_height = true;
         gcode += role_pass;
         if (!tone && f > 0.)
             writer.set_speed(gcode, f);
@@ -7177,7 +7235,6 @@ void mkp_emit_strokes(std::string &gcode, GCodeWriter &writer, const Vec2d &orig
             writer.extrude_to_xy(gcode, end + origin, 0., std::string(), true);
         }
     }
-    mkp_z(gcode, writer, safe_z);
 }
 
 // The head's own geometry - the 14.29 mm bar, the 9.99 mm step, the 20 mm merge gap and the 7 mm
@@ -7265,12 +7322,15 @@ std::string mkp_surface_block(GCodeWriter &writer, const FullPrintConfig &config
             gcode += writer.travel_to_z(origin_z + std::max<coordf_t>(config.z_hop.get_at(0), 2.), "clearance lift before dock travel");
             mkp_emit_macro(gcode, writer, brush_grab);
             mkp_force_z(gcode, writer, brush_safe);
+            bool brush_at_work_height = false;
             mkp_emit_strokes(gcode, writer, brush_origin, walls,
                              wall_speed, brush_work, brush_safe,
-                             role_tag + "Surface treatment\n", role_reset, tone, min_speed, max_speed);
+                             role_tag + "Surface treatment\n", role_reset, tone, min_speed, max_speed,
+                             config.mkp_surface_travel_z_hop.value, brush_at_work_height);
             mkp_emit_strokes(gcode, writer, brush_origin, brush,
                              fill_speed, brush_work, brush_safe,
-                             role_tag + "Surface treatment\n", role_reset, tone, min_speed, max_speed);
+                             role_tag + "Surface treatment\n", role_reset, tone, min_speed, max_speed,
+                             config.mkp_surface_travel_z_hop.value, brush_at_work_height);
             gcode += role_reset;
             // The way back to the dock is a travel as well: start it clear, the macro lowers the
             // brush into the dock on its own.
@@ -8282,6 +8342,7 @@ LayerResult GCode::process_layer(
         return this->emit_belt_brim_bands(print, layers, single_object_instance_idx, extruder_id);
     };
 
+    const bool has_seal_tool_changes = layer_tools.extrusion_sequence().size() > layer_tools.extruders.size();
     for (unsigned int extruder_id : layer_tools.extruders)
     {
         if (print.config().skirt_type == stCombined && !print.skirt_brim_groups().empty()) {
@@ -8327,7 +8388,7 @@ LayerResult GCode::process_layer(
 
         std::string gcode_toolchange;
         if (has_wipe_tower) {
-            if (!m_wipe_tower->is_empty_wipe_tower_gcode(*this, extruder_id, extruder_id == layer_tools.extruders.back())) {
+            if (!m_wipe_tower->is_empty_wipe_tower_gcode(*this, extruder_id, extruder_id == layer_tools.extruders.back() && !has_seal_tool_changes)) {
                 if (need_insert_timelapse_gcode_for_traditional && !has_insert_timelapse_gcode
                     && !(m_farthest_point_timelapse.enabled && m_farthest_point_timelapse.farthest_is_photo_head)) {
                     bool should_insert = true;
@@ -8355,7 +8416,7 @@ LayerResult GCode::process_layer(
                     gcode += insert_wrapping_detection_gcode();
                     has_insert_wrapping_detection_gcode = true;
                 }
-                gcode_toolchange = m_wipe_tower->tool_change(*this, extruder_id, extruder_id == layer_tools.extruders.back());
+                gcode_toolchange = m_wipe_tower->tool_change(*this, extruder_id, extruder_id == layer_tools.extruders.back() && !has_seal_tool_changes);
             }
         } else {
             // Same case-A/case-B split for the non-wipe-tower path. With the subsystem off,
@@ -9064,7 +9125,7 @@ LayerResult GCode::process_layer(
         struct InkSealTask {
             const Layer *layer;
             Vec2d origin;
-            std::vector<ExtrusionPath> paths;
+            const std::vector<std::pair<unsigned int, std::vector<ExtrusionPath>>> *regions;
         };
         std::vector<InkSealTask> seal_tasks;
         for (const LayerToPrint &ltp : layers) {
@@ -9122,9 +9183,9 @@ LayerResult GCode::process_layer(
                     surface_gcode += block;
                     m_wipe.reset_path();
                     this->set_last_pos(this->gcode_to_point(m_writer.get_position().head<2>()));
-                    auto paths = mkp_ink_seal_paths(*ltp_layer, m_config);
-                    if (!paths.empty())
-                        seal_tasks.push_back({ltp_layer, m_origin, std::move(paths)});
+                    auto seals = m_mkp_seals.find(ltp_layer);
+                    if (seals != m_mkp_seals.end())
+                        seal_tasks.push_back({ltp_layer, m_origin, &seals->second});
                 }
             }
         }
@@ -9145,17 +9206,32 @@ LayerResult GCode::process_layer(
             // These are extra paths of the existing layer, not change_layer():
             // no layer counter, Z tag, layer-change macro or extra tower layer.
             m_mkp_sealing = true;
-            for (const InkSealTask &task : seal_tasks) {
-                this->set_origin(task.origin);
-                m_layer = task.layer;
-                m_avoid_crossing_perimeters.init_layer(*m_layer);
-                m_nominal_z = saved_z + m_config.mkp_ink_seal_height.value;
-                m_max_layer_z = std::max(m_max_layer_z, float(m_nominal_z));
-                m_need_change_layer_lift_z = true;
-                gcode += ";MKP_INK_SEAL_START\n";
-                for (const ExtrusionPath &path : task.paths)
-                    gcode += this->extrude_path(path, "ink seal", m_config.mkp_ink_seal_speed.value);
-                gcode += ";MKP_INK_SEAL_END\n";
+            for (unsigned int tool : layer_tools.ink_seal_extruders) {
+                m_nominal_z = saved_z;
+                // A previous seal may be above nominal Z. Keep that physical clearance
+                // for the native tower transition, then print the next seal at its own Z.
+                if (m_wipe_tower) {
+                    const bool finish = has_seal_tool_changes && tool == layer_tools.ink_seal_extruders.back();
+                    if (!m_wipe_tower->is_empty_wipe_tower_gcode(*this, tool, finish))
+                        gcode += m_wipe_tower->tool_change(*this, tool, finish, saved_z);
+                } else
+                    gcode += this->set_extruder(tool, saved_z);
+                for (const InkSealTask &task : seal_tasks) {
+                    this->set_origin(task.origin);
+                    m_layer = task.layer;
+                    m_avoid_crossing_perimeters.init_layer(*m_layer);
+                    m_nominal_z = saved_z + m_config.mkp_ink_seal_height.value;
+                    m_max_layer_z = std::max(m_max_layer_z, float(m_nominal_z));
+                    m_need_change_layer_lift_z = true;
+                    for (const auto &[region_tool, paths] : *task.regions) {
+                        if (region_tool != tool)
+                            continue;
+                        gcode += ";MKP_INK_SEAL_START\n";
+                        for (const ExtrusionPath &path : paths)
+                            gcode += this->extrude_path(path, "ink seal", m_config.mkp_ink_seal_speed.value);
+                        gcode += ";MKP_INK_SEAL_END\n";
+                    }
+                }
             }
             m_mkp_sealing = false;
             m_layer = saved_layer;

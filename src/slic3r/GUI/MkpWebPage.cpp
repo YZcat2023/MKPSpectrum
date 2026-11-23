@@ -226,6 +226,7 @@ const char *const kMkpMachineKeys[] = {
 };
 
 const char *const kMkpProcessKeys[] = {
+    "mkp_surface_travel_z_hop",
     "mkp_surface_enabled", "mkp_surface_speed", "mkp_surface_wall_speed", "mkp_surface_inner_walls", "mkp_surface_pattern", "mkp_surface_line_spacing",
     "mkp_inkjet_density", "mkp_inkjet_speed", "mkp_inkjet_repeat", "mkp_inkjet_dry_time",
     "mkp_inkjet_flush_mode", "mkp_inkjet_flush_interval",
@@ -233,6 +234,8 @@ const char *const kMkpProcessKeys[] = {
     "mkp_inkjet_c", "mkp_inkjet_m", "mkp_inkjet_y",
     "mkp_inkjet_saturation", "mkp_inkjet_brightness", "mkp_inkjet_contrast", "mkp_inkjet_shear",
     "mkp_inkjet_wall_band",
+    "mkp_inkjet_wall_band_inner",
+    "mkp_inkjet_wall_band_outer",
     "mkp_full_height_prime_tower",
 };
 
